@@ -9,9 +9,10 @@ export interface GpuInfo {
 }
 
 export interface DiskInfo {
-  fs: string;
-  mount: string;
-  size: number;
+  device: string;
+  name: string;
+  type: string;
+  totalSize: number;
   used: number;
   usePercent: number;
 }
@@ -89,20 +90,76 @@ async function getGpuStats(): Promise<GpuInfo | null> {
   }
 }
 
+function getDiskKey(partition: string): string {
+  return partition.replace("/dev/", "").replace(/p?\d+$/, "");
+}
+
 async function getDiskStats() {
-  const [fsSize, disksIO] = await Promise.all([
+  const [fsSize, diskLayout, disksIO] = await Promise.all([
     si.fsSize(),
+    si.diskLayout().catch(() => []),
     si.disksIO().catch(() => null),
   ]);
+
+  const diskMap = new Map<string, {
+    device: string;
+    name: string;
+    type: string;
+    used: number;
+    totalSize: number;
+  }>();
+
+  for (const disk of diskLayout) {
+    const key = disk.device.replace("/dev/", "");
+    diskMap.set(key, {
+      device: key,
+      name: disk.name || key,
+      type: disk.type || "Unknown",
+      used: 0,
+      totalSize: disk.size,
+    });
+  }
+
+  for (const fs of fsSize) {
+    if (!fs.fs.startsWith("/dev/") || fs.size <= 0) continue;
+
+    let matchedKey = "";
+
+    for (const key of diskMap.keys()) {
+      if (fs.fs.startsWith(`/dev/${key}`)) {
+        matchedKey = key;
+        break;
+      }
+    }
+
+    if (!matchedKey) {
+      matchedKey = getDiskKey(fs.fs);
+    }
+
+    const entry = diskMap.get(matchedKey);
+    if (entry) {
+      entry.used += fs.used;
+    } else {
+      diskMap.set(matchedKey, {
+        device: matchedKey,
+        name: matchedKey,
+        type: "Unknown",
+        used: fs.used,
+        totalSize: fs.size,
+      });
+    }
+  }
+
   return {
-    disks: fsSize
-      .filter((fs) => fs.fs.startsWith("/dev/") && fs.size > 0)
-      .map((fs) => ({
-        fs: fs.fs,
-        mount: fs.mount,
-        size: Math.round((fs.size / 1024 / 1024 / 1024) * 10) / 10,
-        used: Math.round((fs.used / 1024 / 1024 / 1024) * 10) / 10,
-        usePercent: Math.round(fs.use),
+    disks: Array.from(diskMap.values())
+      .filter((d) => d.totalSize > 0)
+      .map((d) => ({
+        device: d.device,
+        name: d.name,
+        type: d.type,
+        totalSize: Math.round((d.totalSize / 1024 / 1024 / 1024) * 10) / 10,
+        used: Math.round((d.used / 1024 / 1024 / 1024) * 10) / 10,
+        usePercent: Math.min(Math.round((d.used / d.totalSize) * 100), 100),
       })),
     diskIO: disksIO
       ? {

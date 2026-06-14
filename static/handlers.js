@@ -73,8 +73,8 @@
     if (fill) fill.setAttribute('d', svgFillPath(data, max));
   }
 
-  function sanitizeMount(mount) {
-    return 'disk-' + mount.replace(/[^a-zA-Z0-9]/g, '_');
+  function createDiskId(device) {
+    return 'disk-' + device.replace(/[^a-zA-Z0-9]/g, '_');
   }
 
   function createDiskCard(id, disk) {
@@ -87,13 +87,14 @@
       '<div class="card-body">' +
         '<div class="flex items-center gap-2 mb-2">' +
           '<div class="w-3 h-3 rounded-full bg-info animate-pulse"></div>' +
-          '<h2 class="card-title text-lg truncate" title="' + disk.fs + '">' + disk.mount + '</h2>' +
-          '<span class="text-xs text-base-content/40 ml-auto truncate" title="' + disk.fs + '">' + disk.fs.replace('/dev/', '') + '</span>' +
+          '<h2 class="card-title text-lg truncate" title="' + (disk.name || disk.device) + '">' + (disk.name || disk.device) + '</h2>' +
+          '<span class="text-xs text-base-content/40 ml-auto">' + disk.device + '</span>' +
         '</div>' +
         '<div id="' + id + '-info">' +
           '<div class="text-4xl font-bold text-info" id="' + id + '-percent">' + disk.usePercent + '%</div>' +
           '<div class="text-sm text-base-content/60 mt-1">' +
-            '<span id="' + id + '-used">' + disk.used + '</span> GB / <span id="' + id + '-size">' + disk.size + '</span> GB' +
+            '<span id="' + id + '-used">' + disk.used + '</span> GB / <span id="' + id + '-size">' + disk.totalSize + '</span> GB' +
+            '<span class="ml-2 text-base-content/30">' + (disk.type || '') + '</span>' +
           '</div>' +
           '<div class="h-3 bg-base-300 rounded-full mt-2 overflow-hidden">' +
             '<div id="' + id + '-bar" class="h-full bg-info rounded-full transition-all duration-500" style="width: ' + disk.usePercent + '%"></div>' +
@@ -172,11 +173,11 @@
       pushData(ramData, data.ram.used);
       updateChart('ram-chart', ramData, ramTotal);
 
-      if (data.disks) {
-        var seenMounts = {};
+      if (data.disks && data.disks.length) {
+        var seenDisks = {};
         data.disks.forEach(function(disk) {
-          var id = sanitizeMount(disk.mount);
-          seenMounts[id] = true;
+          var id = createDiskId(disk.device);
+          seenDisks[id] = true;
           var card = document.getElementById(id);
           if (!card) card = createDiskCard(id, disk);
           if (!card) return;
@@ -186,19 +187,19 @@
           var bar = document.getElementById(id + '-bar');
           if (pct) pct.textContent = disk.usePercent + '%';
           if (used) used.textContent = disk.used;
-          if (size) size.textContent = disk.size;
+          if (size) size.textContent = disk.totalSize;
           if (bar) bar.style.width = disk.usePercent + '%';
         });
         var container = document.getElementById('disks-container');
         if (container) {
           var cards = container.children;
           for (var i = cards.length - 1; i >= 0; i--) {
-            if (!seenMounts[cards[i].id]) cards[i].remove();
+            if (!seenDisks[cards[i].id]) cards[i].remove();
           }
         }
       }
 
-      if (data.diskIO) {
+      if (data.diskIO && data.disks && data.disks.length) {
         pushData(diskIOData, data.diskIO.totalIO_sec);
         var maxIO = 1;
         for (var i = 0; i < diskIOData.length; i++) {
@@ -206,7 +207,7 @@
         }
         maxIO = Math.ceil(maxIO * 1.2) || 1;
         data.disks.forEach(function(disk) {
-          var id = sanitizeMount(disk.mount);
+          var id = createDiskId(disk.device);
           var yl0 = document.getElementById(id + '-yl0');
           var yl1 = document.getElementById(id + '-yl1');
           if (yl0) yl0.textContent = formatIO(maxIO);
