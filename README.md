@@ -1,4 +1,4 @@
-# basho
+# Basho
 
 Local-first server dashboard for monitoring system resources and discovering local web services.
 
@@ -11,7 +11,7 @@ Local-first server dashboard for monitoring system resources and discovering loc
 | Frontend | [HTMX](https://htmx.org) + Server-Sent Events |
 | Styling | [Tailwind CSS v4](https://tailwindcss.com) + [DaisyUI 5](https://daisyui.com) |
 | Templates | Hono JSX |
-| Monitoring | [systeminformation](https://systeminformation.io) + nvidia-smi |
+| Monitoring | [systeminformation](https://systeminformation.io) + `nvidia-smi` |
 | Bundler | Bun (native) |
 
 ## Setup
@@ -43,17 +43,11 @@ Edit `config/services.json` to define static service entries:
 ]
 ```
 
-Service scanning is automatic — any service listening on localhost:1-9999 is auto-discovered.
+Service scanning is automatic — any service listening on `localhost:1-9999` is auto-discovered and merged with the static list.
 
 ### Building CSS
 
 The project uses Tailwind CSS v4 with DaisyUI. The CSS must be built before running:
-
-```bash
-./build-css.sh
-```
-
-Or use the npm script:
 
 ```bash
 bun run build:css
@@ -73,18 +67,26 @@ bun run start
 
 The server starts at **http://0.0.0.0:6969**.
 
-### Environment
+### Available Scripts
 
-- Port: `6969` (hardcoded)
-- Host: `0.0.0.0` (all interfaces)
-- GPU monitoring: NVIDIA GPU via nvidia-smi (fallback after systeminformation)
-- Service scan: TCP probes to ports 1-9999 on localhost
+| Script | Command | Description |
+|--------|---------|-------------|
+| `dev` | `bun run dev` | Hot-reload development server |
+| `start` | `bun run start` | Production server |
+| `build:css` | `bun run build:css` | Compile Tailwind + DaisyUI into `static/style.css` |
+
+## Environment
+
+- **Port:** `6969` (hardcoded)
+- **Host:** `0.0.0.0` (all interfaces)
+- **GPU monitoring:** NVIDIA GPU via `nvidia-smi` (fallback after `systeminformation`)
+- **Service scan:** TCP probes to ports `1-9999` on `localhost`
 
 ## Features
 
 - **Resource Monitor** — Real-time CPU, RAM, and GPU utilization with live charts
 - **Service Discovery** — Automatic scanning of localhost services (TCP 1-9999)
-- **Live Updates** — SSE-based push every 2s (CPU/RAM) with chart history
+- **Live Updates** — SSE-based push every 2s for CPU/RAM, 5s for GPU
 - **Theme Toggle** — Dracula (dark) / Bumblebee (light) with session persistence
 - **Collapsible Sidebar** — Mobile-friendly responsive layout
 
@@ -111,5 +113,7 @@ config/
   services.json    — Static service definitions
 static/
   style.css        — Built CSS (generated)
-  handlers.js      — HTMX SSE handlers, chart rendering, theme
+  handlers.js      — HTMX SSE handlers, chart rendering, theme toggle
+  htmx.min.js      — HTMX runtime
+  htmx-ext-sse.min.js — HTMX SSE extension
 ```
