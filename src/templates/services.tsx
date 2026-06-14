@@ -1,4 +1,5 @@
 import type { ServiceEntry } from "../services/registry";
+import { html } from "hono/html";
 
 export const Services = ({ services }: { services: ServiceEntry[] }) => (
   <div class="space-y-4">
@@ -15,7 +16,10 @@ export const Services = ({ services }: { services: ServiceEntry[] }) => (
     )}
     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
       {services.map((svc) => (
-        <div class="card bg-base-200/60 backdrop-blur-sm border border-base-300/50 shadow-xl hover:shadow-2xl transition-shadow">
+        <div
+          class="card bg-base-200/60 backdrop-blur-sm border border-base-300/50 shadow-xl hover:shadow-2xl transition-shadow cursor-pointer"
+          onclick={"window.open('" + svc.url + "', '_blank')"}
+        >
           <div class="card-body">
             <div class="flex items-center gap-3">
               <span class="text-2xl">{svc.icon || "🔌"}</span>
@@ -30,27 +34,28 @@ export const Services = ({ services }: { services: ServiceEntry[] }) => (
               />
             </div>
             <div class="card-actions justify-end mt-2">
-              <a
-                href={svc.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                class="btn btn-ghost btn-sm"
-              >
-                Open →
-              </a>
+              <span class="text-sm text-base-content/40">Click to open →</span>
             </div>
           </div>
         </div>
       ))}
     </div>
-    <script data-services={JSON.stringify(services)}>{`
-      setTimeout(function() {
-        var el = document.currentScript || document.querySelector('script[data-services]');
-        if (el) {
-          var svcs = JSON.parse(el.getAttribute('data-services'));
-          window.checkServices(svcs);
-        }
-      }, 100);
-    `}</script>
+    {html`
+      <div
+        id="services-data"
+        data-services="${Buffer.from(JSON.stringify(services)).toString("base64")}"
+      ></div>
+      <script>
+        setTimeout(function() {
+          var el = document.getElementById('services-data');
+          if (el) {
+            var raw = el.getAttribute('data-services');
+            var json = atob(raw);
+            var svcs = JSON.parse(json);
+            window.checkServices(svcs);
+          }
+        }, 100);
+      </script>
+    `}
   </div>
 );
