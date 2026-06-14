@@ -5,6 +5,7 @@ export interface GpuInfo {
   memoryUsed: number;
   memoryTotal: number;
   temperature: number;
+  fanSpeed: number | null;
 }
 
 export interface SystemStats {
@@ -14,18 +15,10 @@ export interface SystemStats {
 }
 
 export namespace SystemMonitor {
-  async function getCpuStats(): Promise<{
-    cores: { usage: number }[];
-    average: number;
-    count: number;
-  }> {
+  async function getCpuStats() {
     const load = await si.currentLoad();
-    const cores = load.cpus.map((c) => ({
-      usage: Math.round(c.load),
-    }));
-
     return {
-      cores,
+      cores: load.cpus.map((c) => ({ usage: Math.round(c.load) })),
       average: Math.round(load.currentLoad),
       count: load.cpus.length,
     };
@@ -54,26 +47,24 @@ export namespace SystemMonitor {
         memoryUsed: mu,
         memoryTotal: ctrl.memoryTotal ?? 0,
         temperature: ctrl.temperatureGpu ?? 0,
+        fanSpeed: ctrl.fanSpeed ?? null,
       };
     } catch {
       try {
         const proc = Bun.spawnSync([
           "nvidia-smi",
-          "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+          "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed",
           "--format=csv,noheader,nounits",
         ]);
         if (proc.exitCode !== 0) return null;
-        const parts = proc.stdout
-          .toString()
-          .trim()
-          .split(",")
-          .map((s) => parseFloat(s.trim()));
+        const parts = proc.stdout.toString().trim().split(",").map((s) => parseFloat(s.trim()));
         if (parts.length >= 4) {
           return {
             utilization: parts[0]!,
             memoryUsed: parts[1]!,
             memoryTotal: parts[2]!,
             temperature: parts[3]!,
+            fanSpeed: parts[4] ?? null,
           };
         }
         return null;
@@ -89,7 +80,6 @@ export namespace SystemMonitor {
       getRamStats(),
       getGpuStats(),
     ]);
-
     return { cpu, ram, gpu };
   }
 }

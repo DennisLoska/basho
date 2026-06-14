@@ -1,4 +1,11 @@
 (function() {
+  var MAX_POINTS = 60;
+  var cpuData = [];
+  var ramData = [];
+  var gpuData = [];
+  var ramTotal = 0;
+  var gpuTotal = 0;
+
   function init() {
     var html = document.documentElement;
     var sunIcon = document.getElementById('theme-icon-sun');
@@ -34,40 +41,69 @@
     }
   }
 
-  function ensureCoreBars(count) {
-    var container = document.getElementById('cpu-core-bars');
-    if (!container) return;
-    if (container.children.length === count) return;
-    container.innerHTML = '';
-    for (var i = 0; i < count; i++) {
-      var wrapper = document.createElement('div');
-      wrapper.className = 'flex items-center gap-2 text-xs';
-      wrapper.innerHTML =
-        '<span class="w-8 text-right text-base-content/40 shrink-0">c' + i + '</span>' +
-        '<div class="flex-1 h-2 bg-base-300 rounded-full overflow-hidden">' +
-          '<div id="cpu-core-' + i + '" class="h-full bg-accent rounded-full transition-all duration-500" style="width:0%"></div>' +
-        '</div>' +
-        '<span id="cpu-core-label-' + i + '" class="w-10 text-right text-base-content/60 shrink-0">0%</span>';
-      container.appendChild(wrapper);
+  function pushData(arr, val) {
+    arr.push(val);
+    if (arr.length > MAX_POINTS) arr.shift();
+  }
+
+  var CX0 = 22, CX1 = 143, CY0 = 3, CY1 = 40;
+  var CW = CX1 - CX0, CH = CY1 - CY0;
+
+  function svgPath(data, max) {
+    if (data.length < 2) return '';
+    var parts = [];
+    for (var i = 0; i < data.length; i++) {
+      var x = CX0 + (i / (data.length - 1)) * CW;
+      var y = CY1 - (data[i] / max) * CH;
+      parts.push((i === 0 ? 'M' : 'L') + x.toFixed(1) + ' ' + y.toFixed(1));
+    }
+    return parts.join('');
+  }
+
+  function svgFillPath(data, max) {
+    if (data.length < 2) return '';
+    return svgPath(data, max) + ' L' + CX1.toFixed(1) + ' ' + CY1 + ' L' + CX0.toFixed(1) + ' ' + CY1 + ' Z';
+  }
+
+  function updateChart(id, data, max) {
+    var line = document.getElementById(id + '-line');
+    var fill = document.getElementById(id + '-fill');
+    if (line) line.setAttribute('d', svgPath(data, max));
+    if (fill) fill.setAttribute('d', svgFillPath(data, max));
+  }
+
+  function setAxisLabels(id, max, unit) {
+    var vals = [max, Math.round(max / 2), 0];
+    for (var i = 0; i < 3; i++) {
+      var el = document.getElementById(id + '-yl-' + i);
+      if (el) el.textContent = vals[i] + (i < 2 && unit ? unit : '');
     }
   }
+
+  document.addEventListener('htmx:beforeSwap', function() {
+    cpuData = [];
+    ramData = [];
+    gpuData = [];
+    ramTotal = 0;
+    gpuTotal = 0;
+  });
 
   document.addEventListener('htmx:sseBeforeMessage', function(evt) {
     evt.preventDefault();
     try {
       var data = JSON.parse(evt.detail.data);
       if (data.type !== 'system') return;
+
       var avg = document.getElementById('cpu-average');
       var count = document.getElementById('cpu-count');
+      var cbar = document.getElementById('cpu-bar');
       if (avg) avg.textContent = data.cpu.average + '%';
       if (count) count.textContent = data.cpu.count + ' logical';
-      ensureCoreBars(data.cpu.count);
-      data.cpu.cores.forEach(function(core, i) {
-        var bar = document.getElementById('cpu-core-' + i);
-        var label = document.getElementById('cpu-core-label-' + i);
-        if (bar) bar.style.width = core.usage + '%';
-        if (label) label.textContent = core.usage + '%';
-      });
+      if (cbar) cbar.style.width = data.cpu.average + '%';
+      pushData(cpuData, data.cpu.average);
+      setAxisLabels('cpu-chart', 100, '%');
+      updateChart('cpu-chart', cpuData, 100);
+
       var rp = document.getElementById('ram-percent');
       var ru = document.getElementById('ram-used');
       var rt = document.getElementById('ram-total');
@@ -75,23 +111,41 @@
       var rb = document.getElementById('ram-bar');
       if (rp) rp.textContent = data.ram.percent + '%';
       if (ru) ru.textContent = data.ram.used;
-      if (rt) rt.textContent = data.ram.total;
+      if (rt) { rt.textContent = data.ram.total; ramTotal = data.ram.total; }
       if (rc) rc.textContent = data.ram.cached;
       if (rb) rb.style.width = data.ram.percent + '%';
+      pushData(ramData, data.ram.used);
+      setAxisLabels('ram-chart', Math.round(ramTotal), 'GB');
+      updateChart('ram-chart', ramData, ramTotal);
+
       if (!data.gpu) return;
       var gu = document.getElementById('gpu-util');
       var gt = document.getElementById('gpu-temp');
       var gvu = document.getElementById('gpu-vram-used');
       var gvt = document.getElementById('gpu-vram-total');
       var gb = document.getElementById('gpu-bar');
+      var gf = document.getElementById('gpu-fan');
+      var gfs = document.getElementById('gpu-fan-speed');
       var vramPct = data.gpu.memoryTotal > 0
         ? Math.round((data.gpu.memoryUsed / data.gpu.memoryTotal) * 100)
         : 0;
       if (gu) gu.textContent = data.gpu.utilization + '%';
       if (gt) gt.textContent = data.gpu.temperature;
       if (gvu) gvu.textContent = data.gpu.memoryUsed;
-      if (gvt) gvt.textContent = data.gpu.memoryTotal;
+      if (gvt) { gvt.textContent = data.gpu.memoryTotal; gpuTotal = Math.round(data.gpu.memoryTotal / 1024); }
       if (gb) gb.style.width = vramPct + '%';
+      if (gf && gfs) {
+        if (data.gpu.fanSpeed != null) {
+          gf.classList.remove('hidden');
+          gfs.textContent = data.gpu.fanSpeed;
+        } else {
+          gf.classList.add('hidden');
+        }
+      }
+      var vramGb = data.gpu.memoryTotal > 0 ? Math.round(data.gpu.memoryUsed / 1024) : 0;
+      pushData(gpuData, vramGb);
+      setAxisLabels('gpu-chart', gpuTotal, 'GB');
+      updateChart('gpu-chart', gpuData, gpuTotal);
     } catch(e) {}
   }, true);
 

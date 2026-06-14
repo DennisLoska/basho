@@ -7,7 +7,7 @@ import { ServiceRegistry } from "../services/registry";
 import { ServiceScanner } from "../services/scanner";
 
 const PAGE_TITLES: Record<string, string> = {
-  dashboard: "Dashboard",
+  dashboard: "Resources",
   services: "Services",
 };
 
