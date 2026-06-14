@@ -2,6 +2,8 @@
 
 Local-first server dashboard for monitoring system resources and discovering local web services.
 
+<img width="2560" height="1440" alt="screenshot-2026-06-14_16-50-37" src="https://github.com/user-attachments/assets/d39ae90b-45c3-42be-9040-40126e571b04" />
+
 ## Stack
 
 | Layer | Technology |
