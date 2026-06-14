@@ -1,0 +1,22 @@
+@import "tailwindcss";
+@plugin "daisyui" {
+  themes: light --default, dark --prefersdark, dracula, bumblebee, cupcake;
+}
+
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+.htmx-request .htmx-indicator,
+button.htmx-request .htmx-indicator {
+  display: inline-block;
+}
+
+.card {
+  transition: all 0.3s ease;
+}
