@@ -2,9 +2,9 @@ import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import pages from "./routes/pages";
 import sse from "./routes/sse";
-import { ServiceRegistry } from "./services/registry";
+import { loadServices } from "./services/registry";
 
-await ServiceRegistry.load();
+await loadServices();
 
 const app = new Hono();
 

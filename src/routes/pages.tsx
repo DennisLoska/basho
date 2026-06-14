@@ -3,19 +3,12 @@ import { Layout } from "../templates/layout";
 import { App } from "../templates/app";
 import { Dashboard } from "../templates/dashboard";
 import { Services } from "../templates/services";
-import { ServiceRegistry } from "../services/registry";
-import { ServiceScanner } from "../services/scanner";
-
-const PAGE_TITLES: Record<string, string> = {
-  dashboard: "Resources",
-  services: "Services",
-};
+import { getAllServices } from "../services/registry";
+import { scan } from "../services/scanner";
 
 const app = new Hono();
 
-function renderPage(c: Context, Page: () => any, page = "") {
-  const title = PAGE_TITLES[page] || "Basho";
-
+function renderPage(c: Context, Page: () => any, title = "Basho") {
   if (c.req.header("HX-Request")) {
     return c.html(
       <>
@@ -28,18 +21,18 @@ function renderPage(c: Context, Page: () => any, page = "") {
   }
   return c.html(
     <Layout>
-      <App page={page}>
+      <App title={title}>
         <Page />
       </App>
     </Layout>,
   );
 }
 
-app.get("/", (c) => renderPage(c, Dashboard, "dashboard"));
+app.get("/", (c) => renderPage(c, Dashboard, "Resources"));
 
 app.get("/services", async (c) => {
-  const staticServices = ServiceRegistry.getAll();
-  const scanned = await ServiceScanner.scan();
+  const staticServices = getAllServices();
+  const scanned = await scan();
 
   const knownUrls = new Set(staticServices.map((s) => s.url));
   const uniqueScanned = scanned.filter((s) => !knownUrls.has(s.url));
@@ -49,7 +42,7 @@ app.get("/services", async (c) => {
   return renderPage(
     c,
     () => <Services services={services} />,
-    "services",
+    "Services",
   );
 });
 

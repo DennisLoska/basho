@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { SystemMonitor } from "../monitors/system";
+import { getStats } from "../monitors/system";
 
 const encoder = new TextEncoder();
 const app = new Hono();
@@ -17,7 +17,7 @@ app.get("/system-stats", (c) => {
       };
 
       cpuInterval = setInterval(async () => {
-        const stats = await SystemMonitor.getStats();
+        const stats = await getStats();
         send(JSON.stringify({ type: "system", ...stats }));
       }, 2000);
 

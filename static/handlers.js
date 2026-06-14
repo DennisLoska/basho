@@ -46,7 +46,7 @@
     if (arr.length > MAX_POINTS) arr.shift();
   }
 
-  var CX0 = 22, CX1 = 143, CY0 = 3, CY1 = 40;
+  var CX0 = 14, CX1 = 135, CY0 = 3, CY1 = 40;
   var CW = CX1 - CX0, CH = CY1 - CY0;
 
   function svgPath(data, max) {
@@ -72,14 +72,6 @@
     if (fill) fill.setAttribute('d', svgFillPath(data, max));
   }
 
-  function setAxisLabels(id, max, unit) {
-    var vals = [max, Math.round(max / 2), 0];
-    for (var i = 0; i < 3; i++) {
-      var el = document.getElementById(id + '-yl-' + i);
-      if (el) el.textContent = vals[i] + (i < 2 && unit ? unit : '');
-    }
-  }
-
   document.addEventListener('htmx:beforeSwap', function() {
     cpuData = [];
     ramData = [];
@@ -100,8 +92,11 @@
       if (avg) avg.textContent = data.cpu.average + '%';
       if (count) count.textContent = data.cpu.count + ' logical';
       if (cbar) cbar.style.width = data.cpu.average + '%';
+      var cy0 = document.getElementById('cpu-yl-0');
+      var cy1 = document.getElementById('cpu-yl-1');
+      if (cy0) cy0.textContent = '100%';
+      if (cy1) cy1.textContent = '50%';
       pushData(cpuData, data.cpu.average);
-      setAxisLabels('cpu-chart', 100, '%');
       updateChart('cpu-chart', cpuData, 100);
 
       var rp = document.getElementById('ram-percent');
@@ -114,8 +109,11 @@
       if (rt) { rt.textContent = data.ram.total; ramTotal = data.ram.total; }
       if (rc) rc.textContent = data.ram.cached;
       if (rb) rb.style.width = data.ram.percent + '%';
+      var ry0 = document.getElementById('ram-yl-0');
+      var ry1 = document.getElementById('ram-yl-1');
+      if (ry0) ry0.textContent = Math.round(ramTotal) + 'GB';
+      if (ry1) ry1.textContent = Math.round(ramTotal / 2) + 'GB';
       pushData(ramData, data.ram.used);
-      setAxisLabels('ram-chart', Math.round(ramTotal), 'GB');
       updateChart('ram-chart', ramData, ramTotal);
 
       if (!data.gpu) return;
@@ -143,8 +141,11 @@
         }
       }
       var vramGb = data.gpu.memoryTotal > 0 ? Math.round(data.gpu.memoryUsed / 1024) : 0;
+      var gy0 = document.getElementById('gpu-yl-0');
+      var gy1 = document.getElementById('gpu-yl-1');
+      if (gy0) gy0.textContent = gpuTotal + 'GB';
+      if (gy1) gy1.textContent = Math.round(gpuTotal / 2) + 'GB';
       pushData(gpuData, vramGb);
-      setAxisLabels('gpu-chart', gpuTotal, 'GB');
       updateChart('gpu-chart', gpuData, gpuTotal);
     } catch(e) {}
   }, true);
