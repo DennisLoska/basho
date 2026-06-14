@@ -17,7 +17,7 @@ export const App = ({ children, page }: AppProps) => (
             </label>
           </div>
           <div className="flex-1">
-            <h1 className="text-xl font-bold">
+            <h1 id="header-title" className="text-xl font-bold">
               {page === "dashboard" && "Dashboard"}
               {page === "services" && "Services"}
               {!page && "Basho"}

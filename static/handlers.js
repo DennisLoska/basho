@@ -27,7 +27,8 @@
     }
   }
 
-  document.body.addEventListener('htmx:sseBeforeMessage', function(evt) {
+  document.addEventListener('htmx:sseBeforeMessage', function(evt) {
+    evt.preventDefault();
     try {
       var data = JSON.parse(evt.detail.data);
       if (data.type === 'system') {
@@ -61,7 +62,7 @@
         }
       }
     } catch(e) {}
-  });
+  }, true);
 
   window.checkServices = function(services) {
     services.forEach(function(svc) {
@@ -70,11 +71,11 @@
       if (!dot) return;
       fetch(svc.url, { mode: 'no-cors' })
         .then(function() {
-          dot.className = 'w-3 h-3 rounded-full bg-success shadow-lg shadow-success/50';
+          dot.className = 'w-3.5 h-3.5 rounded-full bg-success shadow-lg shadow-success/50';
           dot.title = 'Online';
         })
         .catch(function() {
-          dot.className = 'w-3 h-3 rounded-full bg-error shadow-lg shadow-error/50';
+          dot.className = 'w-3.5 h-3.5 rounded-full bg-error shadow-lg shadow-error/50';
           dot.title = 'Offline';
         });
     });
