@@ -100,7 +100,7 @@
           '</div>' +
         '</div>' +
         '<div class="mt-auto pt-3">' +
-          '<svg class="w-full h-24" id="' + id + '-chart" viewBox="0 0 137 45" preserveAspectRatio="none">' +
+          '<svg class="w-full h-48" id="' + id + '-chart" viewBox="0 0 137 45" preserveAspectRatio="none">' +
             '<defs>' +
               '<linearGradient id="' + id + '-grad" x1="0" y1="0" x2="0" y2="1">' +
                 '<stop offset="0%" stop-color="var(--color-info)" stop-opacity="0.3"></stop>' +
