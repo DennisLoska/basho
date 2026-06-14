@@ -1,7 +1,10 @@
 import type { ServiceEntry } from "./registry";
 
+const HOSTS = ["localhost", "127.0.0.1", "0.0.0.0"];
+
 const COMMON_PORTS = [
-  80, 443, 3000, 3001, 4321, 5000, 5173, 6969, 7000, 8000, 8080, 8443, 9000,
+  80, 443, 3000, 3001, 4000, 4200, 4321, 5000, 5173, 5555, 6666, 6969, 7000,
+  8000, 8080, 8443, 8888, 9000,
 ];
 
 const PORT_NAMES: Record<number, string> = {
@@ -9,14 +12,19 @@ const PORT_NAMES: Record<number, string> = {
   443: "HTTPS Server",
   3000: "Web Dev Server",
   3001: "Web Dev Server",
+  4000: "Web Server",
+  4200: "Angular Dev Server",
   4321: "Web Server",
-  5000: "Web Server",
+  5000: "Flask Server",
   5173: "Vite Dev Server",
+  5555: "Web Server",
+  6666: "Web Server",
   6969: "Basho",
   7000: "Web Server",
   8000: "Web Server",
   8080: "HTTP Alternative",
   8443: "HTTPS Alternative",
+  8888: "Jupyter Server",
   9000: "Web Server",
 };
 
@@ -44,13 +52,14 @@ export namespace ServiceScanner {
 
   export async function scan(): Promise<ServiceEntry[]> {
     const results: ServiceEntry[] = [];
+    const seen = new Set<number>();
 
-    const scanPort = async (port: number): Promise<ScanResult | null> => {
+    const scanHost = async (host: string, port: number): Promise<ScanResult | null> => {
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 800);
+        const timeout = setTimeout(() => controller.abort(), 500);
 
-        const res = await fetch(`http://localhost:${port}`, {
+        const res = await fetch(`http://${host}:${port}`, {
           signal: controller.signal,
         });
         clearTimeout(timeout);
@@ -76,13 +85,16 @@ export namespace ServiceScanner {
       }
     };
 
+    const tasks = COMMON_PORTS.flatMap((p) => HOSTS.map((h) => ({ host: h, port: p })));
     const scanResults = await Promise.allSettled(
-      COMMON_PORTS.map((p) => scanPort(p)),
+      tasks.map((t) => scanHost(t.host, t.port)),
     );
 
     for (const result of scanResults) {
       if (result.status === "fulfilled" && result.value) {
         const svc = result.value;
+        if (seen.has(svc.port)) continue;
+        seen.add(svc.port);
         results.push({
           name: svc.name,
           url: svc.url,
