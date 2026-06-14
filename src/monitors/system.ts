@@ -96,7 +96,7 @@ function getDiskKey(partition: string): string {
 
 async function getDiskStats() {
   const [fsSize, diskLayout, disksIO] = await Promise.all([
-    si.fsSize(),
+    si.fsSize().catch(() => []),
     si.diskLayout().catch(() => []),
     si.disksIO().catch(() => null),
   ]);
@@ -178,11 +178,14 @@ async function getDiskStats() {
 }
 
 export async function getStats(): Promise<SystemStats> {
-  const [cpu, ram, gpu, { disks, diskIO }] = await Promise.all([
+  const [cpu, ram, gpu, diskData] = await Promise.all([
     getCpuStats(),
     getRamStats(),
     getGpuStats(),
-    getDiskStats(),
+    getDiskStats().catch(() => ({
+      disks: [] as DiskInfo[],
+      diskIO: { totalIO_sec: 0, readIO_sec: 0, writeIO_sec: 0 } as DiskIOInfo,
+    })),
   ]);
-  return { cpu, ram, gpu, disks, diskIO };
+  return { cpu, ram, gpu, ...diskData };
 }
