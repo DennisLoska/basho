@@ -124,7 +124,8 @@ async function getDiskStats() {
   }
 
   for (const fs of fsSize) {
-    if (!fs.fs.startsWith("/dev/") || fs.size <= 0) continue;
+    if (!fs.fs.startsWith("/dev/") || fs.size <= 0
+      || fs.fs.startsWith("/dev/mapper/") || fs.fs.startsWith("/dev/dm-")) continue;
 
     let matchedKey = "";
 

@@ -5,7 +5,6 @@
   var gpuData = [];
   var ramTotal = 0;
   var gpuTotal = 0;
-  var diskIOData = [];
 
   function init() {
     var html = document.documentElement;
@@ -98,39 +97,15 @@
             '<div id="' + id + '-bar" class="h-full bg-info rounded-full transition-all duration-500" style="width: ' + disk.usePercent + '%"></div>' +
           '</div>' +
         '</div>' +
-        '<div class="mt-auto pt-3">' +
-          '<svg class="w-full h-24" id="' + id + '-chart" viewBox="0 0 137 45" preserveAspectRatio="none">' +
-            '<defs>' +
-              '<linearGradient id="' + id + '-grad" x1="0" y1="0" x2="0" y2="1">' +
-                '<stop offset="0%" stop-color="var(--color-info)" stop-opacity="0.3"></stop>' +
-                '<stop offset="100%" stop-color="var(--color-info)" stop-opacity="0.02"></stop>' +
-              '</linearGradient>' +
-            '</defs>' +
-            '<line x1="14" y1="3" x2="14" y2="40" stroke="var(--color-base-content)" stroke-opacity="0.12" stroke-width="1"></line>' +
-            '<line x1="14" y1="21.5" x2="135" y2="21.5" stroke="var(--color-base-content)" stroke-opacity="0.08" stroke-width="0.5" stroke-dasharray="2,2"></line>' +
-            '<line x1="14" y1="40" x2="135" y2="40" stroke="var(--color-base-content)" stroke-opacity="0.12" stroke-width="0.5"></line>' +
-            '<text id="' + id + '-yl0" x="12" y="6" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">0</text>' +
-            '<text id="' + id + '-yl1" x="12" y="24.5" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">0</text>' +
-            '<text id="' + id + '-yl2" x="12" y="43" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">0</text>' +
-            '<path id="' + id + '-fill" fill="url(#' + id + '-grad)" d=""></path>' +
-            '<path id="' + id + '-line" fill="none" stroke="var(--color-info)" stroke-width="1.5" d=""></path>' +
-          '</svg>' +
-        '</div>' +
       '</div>';
     container.appendChild(card);
     return card;
-  }
-
-  function formatIO(val) {
-    if (val >= 1000) return (val / 1000).toFixed(1) + 'K';
-    return Math.round(val) + '';
   }
 
   document.addEventListener('htmx:beforeSwap', function() {
     cpuData = [];
     ramData = [];
     gpuData = [];
-    diskIOData = [];
     ramTotal = 0;
     gpuTotal = 0;
   });
@@ -195,23 +170,6 @@
             if (!seenDisks[cards[i].id]) cards[i].remove();
           }
         }
-      }
-
-      if (data.diskIO && data.disks && data.disks.length) {
-        pushData(diskIOData, data.diskIO.totalIO_sec);
-        var maxIO = 1;
-        for (var i = 0; i < diskIOData.length; i++) {
-          if (diskIOData[i] > maxIO) maxIO = diskIOData[i];
-        }
-        maxIO = Math.ceil(maxIO * 1.2) || 1;
-        data.disks.forEach(function(disk) {
-          var id = createDiskId(disk.device);
-          var yl0 = document.getElementById(id + '-yl0');
-          var yl1 = document.getElementById(id + '-yl1');
-          if (yl0) yl0.textContent = formatIO(maxIO);
-          if (yl1) yl1.textContent = formatIO(Math.round(maxIO / 2));
-          updateChart(id, diskIOData, maxIO);
-        });
       }
 
       if (!data.gpu) return;
