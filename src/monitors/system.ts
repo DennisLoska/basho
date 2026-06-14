@@ -109,8 +109,11 @@ async function getDiskStats() {
     totalSize: number;
   }>();
 
+  const layoutKeys = new Set<string>();
+
   for (const disk of diskLayout) {
     const key = disk.device.replace("/dev/", "");
+    layoutKeys.add(key);
     diskMap.set(key, {
       device: key,
       name: disk.name || key,
@@ -139,6 +142,9 @@ async function getDiskStats() {
     const entry = diskMap.get(matchedKey);
     if (entry) {
       entry.used += fs.used;
+      if (!layoutKeys.has(matchedKey)) {
+        entry.totalSize += fs.size;
+      }
     } else {
       diskMap.set(matchedKey, {
         device: matchedKey,

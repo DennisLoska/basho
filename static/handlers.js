@@ -109,8 +109,8 @@
             '<line x1="14" y1="3" x2="14" y2="40" stroke="var(--color-base-content)" stroke-opacity="0.12" stroke-width="1"></line>' +
             '<line x1="14" y1="21.5" x2="135" y2="21.5" stroke="var(--color-base-content)" stroke-opacity="0.08" stroke-width="0.5" stroke-dasharray="2,2"></line>' +
             '<line x1="14" y1="40" x2="135" y2="40" stroke="var(--color-base-content)" stroke-opacity="0.12" stroke-width="0.5"></line>' +
-            '<text id="' + id + '-yl0" x="12" y="6" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">IO</text>' +
-            '<text id="' + id + '-yl1" x="12" y="24.5" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace"></text>' +
+            '<text id="' + id + '-yl0" x="12" y="6" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">0</text>' +
+            '<text id="' + id + '-yl1" x="12" y="24.5" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">0</text>' +
             '<text id="' + id + '-yl2" x="12" y="43" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">0</text>' +
             '<path id="' + id + '-fill" fill="url(#' + id + '-grad)" d=""></path>' +
             '<path id="' + id + '-line" fill="none" stroke="var(--color-info)" stroke-width="1.5" d=""></path>' +
