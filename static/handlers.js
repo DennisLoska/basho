@@ -46,7 +46,7 @@
     if (arr.length > MAX_POINTS) arr.shift();
   }
 
-  var CX0 = 22, CX1 = 143, CY0 = 3, CY1 = 40;
+  var CX0 = 14, CX1 = 135, CY0 = 3, CY1 = 40;
   var CW = CX1 - CX0, CH = CY1 - CY0;
 
   function svgPath(data, max) {

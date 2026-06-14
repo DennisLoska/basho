@@ -1,6 +1,6 @@
 function ChartSVG(id: string, colorVar: string, gradientId: string) {
   return (
-    <svg class="w-full h-16" id={`${id}-chart`} viewBox="0 0 145 45" preserveAspectRatio="none">
+    <svg class="w-full h-16" id={`${id}-chart`} viewBox="0 0 137 45" preserveAspectRatio="none">
       <defs>
         <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stop-color={colorVar} stop-opacity="0.3" />
@@ -8,8 +8,8 @@ function ChartSVG(id: string, colorVar: string, gradientId: string) {
         </linearGradient>
       </defs>
       <line x1="14" y1="3" x2="14" y2="40" stroke="var(--color-base-content)" stroke-opacity="0.12" stroke-width="1" />
-      <line x1="14" y1="21.5" x2="143" y2="21.5" stroke="var(--color-base-content)" stroke-opacity="0.08" stroke-width="0.5" stroke-dasharray="2,2" />
-      <line x1="14" y1="40" x2="143" y2="40" stroke="var(--color-base-content)" stroke-opacity="0.12" stroke-width="0.5" />
+      <line x1="14" y1="21.5" x2="135" y2="21.5" stroke="var(--color-base-content)" stroke-opacity="0.08" stroke-width="0.5" stroke-dasharray="2,2" />
+      <line x1="14" y1="40" x2="135" y2="40" stroke="var(--color-base-content)" stroke-opacity="0.12" stroke-width="0.5" />
       <text id={`${id}-yl-0`} x="12" y="6" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">100</text>
       <text id={`${id}-yl-1`} x="12" y="24.5" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">50</text>
       <text id={`${id}-yl-2`} x="12" y="43" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">0</text>
