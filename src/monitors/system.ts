@@ -94,6 +94,12 @@ function getDiskKey(partition: string): string {
   return partition.replace("/dev/", "").replace(/p?\d+$/, "");
 }
 
+const genericDiskNames = new Set(["generic", "unknown", "ata"]);
+
+function isRealModelName(name: string): boolean {
+  return name.length > 1 && !genericDiskNames.has(name.trim().toLowerCase());
+}
+
 async function getDiskStats() {
   const [fsSize, diskLayout, disksIO] = await Promise.all([
     si.fsSize().catch(() => []),
@@ -116,7 +122,7 @@ async function getDiskStats() {
     layoutKeys.add(key);
     diskMap.set(key, {
       device: key,
-      name: (disk.name && disk.name !== "Generic") ? disk.name : key,
+      name: isRealModelName(disk.name) ? disk.name : key,
       type: disk.type || "Unknown",
       used: 0,
       totalSize: disk.size,
