@@ -123,9 +123,15 @@ async function getDiskStats() {
     });
   }
 
+  let lvmUsePercent = 0;
+
   for (const fs of fsSize) {
-    if (!fs.fs.startsWith("/dev/") || fs.size <= 0
-      || fs.fs.startsWith("/dev/mapper/") || fs.fs.startsWith("/dev/dm-")) continue;
+    if (!fs.fs.startsWith("/dev/") || fs.size <= 0) continue;
+
+    if (fs.fs.startsWith("/dev/mapper/") || fs.fs.startsWith("/dev/dm-")) {
+      if (fs.use > lvmUsePercent) lvmUsePercent = fs.use;
+      continue;
+    }
 
     let matchedKey = "";
 
@@ -157,16 +163,26 @@ async function getDiskStats() {
     }
   }
 
+  if (lvmUsePercent > 0) {
+    for (const [, entry] of diskMap) {
+      if (layoutKeys.has(entry.device)) {
+        entry.used = (lvmUsePercent / 100) * entry.totalSize;
+      }
+    }
+  }
+
   return {
     disks: Array.from(diskMap.values())
-      .filter((d) => d.totalSize > 0)
+      .filter((d) => d.totalSize > 0 && layoutKeys.has(d.device))
       .map((d) => ({
         device: d.device,
         name: d.name,
         type: d.type,
         totalSize: Math.round((d.totalSize / 1024 / 1024 / 1024) * 10) / 10,
         used: Math.round((d.used / 1024 / 1024 / 1024) * 10) / 10,
-        usePercent: Math.min(Math.round((d.used / d.totalSize) * 100), 100),
+        usePercent: lvmUsePercent > 0
+          ? Math.round(lvmUsePercent)
+          : Math.min(Math.round((d.used / d.totalSize) * 100), 100),
       })),
     diskIO: disksIO
       ? {
