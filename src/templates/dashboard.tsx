@@ -13,13 +13,11 @@ export const Dashboard = () => (
             <h2 class="card-title text-lg">CPU</h2>
             <span class="text-xs text-base-content/40 ml-auto" id="cpu-count" />
           </div>
-          <div id="cpu-cores" class="space-y-2">
-            <div class="text-4xl font-bold text-accent" id="cpu-average">
-              0%
-            </div>
-            <div class="text-sm text-base-content/60">Average</div>
-            <div id="cpu-core-bars" class="space-y-1 mt-3" />
+          <div class="text-4xl font-bold text-accent" id="cpu-average">
+            0%
           </div>
+          <div class="text-sm text-base-content/60">Average</div>
+          <div id="cpu-core-bars" class="space-y-1 mt-3" />
         </div>
       </div>
 

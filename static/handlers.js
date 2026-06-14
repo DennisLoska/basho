@@ -27,6 +27,10 @@
     }
   }
 
+  window.toggleSidebar = function() {
+    document.getElementById('sidebar').classList.toggle('collapsed');
+  };
+
   function ensureCoreBars(count) {
     var container = document.getElementById('cpu-core-bars');
     var existing = container.children.length;

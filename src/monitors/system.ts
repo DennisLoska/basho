@@ -14,16 +14,12 @@ export interface SystemStats {
 }
 
 export namespace SystemMonitor {
-  let prevCpuLoad: si.Systeminformation.CurrentLoadData | null = null;
-
   async function getCpuStats(): Promise<{
     cores: { usage: number }[];
     average: number;
     count: number;
   }> {
     const load = await si.currentLoad();
-    prevCpuLoad = load;
-
     const cores = load.cpus.map((c) => ({
       usage: Math.round(c.load),
     }));
