@@ -1,5 +1,5 @@
 import type { ServiceEntry } from "../services/registry";
-import { html } from "hono/html";
+import { html, raw } from "hono/html";
 
 export const Services = ({ services }: { services: ServiceEntry[] }) => (
   <div class="space-y-4">
@@ -17,15 +17,15 @@ export const Services = ({ services }: { services: ServiceEntry[] }) => (
     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
       {services.map((svc) => (
         <div
-          class="card bg-base-200/60 backdrop-blur-sm border border-base-300/50 shadow-xl hover:shadow-2xl transition-shadow cursor-pointer relative"
+          class="card bg-base-200/60 backdrop-blur-sm border border-base-300/50 shadow-xl hover:shadow-2xl transition-shadow cursor-pointer"
           onclick={"window.open('" + svc.url + "', '_blank')"}
         >
-          <div
-            class="w-3.5 h-3.5 rounded-full absolute top-3 right-3"
-            id={"status-" + svc.name.replace(/\s+/g, "-")}
-            title="Checking..."
-          />
-          <div class="card-body">
+          <div class="card-body pt-3">
+            <div
+              class="w-3 h-3 rounded-full bg-neutral absolute top-3 right-3 ring-2 ring-base-100"
+              id={"status-" + svc.name.replace(/\s+/g, "-")}
+              title="Checking..."
+            />
             <div class="flex items-center gap-3">
               <span class="text-2xl">{svc.icon || "🔌"}</span>
               <div class="flex-1 min-w-0">
@@ -41,20 +41,12 @@ export const Services = ({ services }: { services: ServiceEntry[] }) => (
       ))}
     </div>
     {html`
-      <div
-        id="services-data"
-        data-services="${Buffer.from(JSON.stringify(services)).toString("base64")}"
-      ></div>
       <script>
-        setTimeout(function() {
-          var el = document.getElementById('services-data');
-          if (el) {
-            var raw = el.getAttribute('data-services');
-            var json = atob(raw);
-            var svcs = JSON.parse(json);
-            window.checkServices(svcs);
-          }
-        }, 100);
+        (function() {
+          var svcs = ${raw(JSON.stringify(services))};
+          function run() { if (window.checkServices) window.checkServices(svcs); else setTimeout(run, 10); }
+          run();
+        })();
       </script>
     `}
   </div>

@@ -1,7 +1,5 @@
 import type { ServiceEntry } from "./registry";
 
-const HOSTS = ["localhost", "127.0.0.1", "0.0.0.0"];
-
 const PORT_NAMES: Record<number, string> = {
   80: "HTTP Server",
   443: "HTTPS Server",
@@ -45,6 +43,10 @@ interface OpenPort {
   host: string;
   port: number;
 }
+
+let cachedResult: ServiceEntry[] | null = null;
+let lastScan = 0;
+const SCAN_TTL = 30_000;
 
 export namespace ServiceScanner {
   function guessName(port: number, title?: string): string {
@@ -95,7 +97,7 @@ export namespace ServiceScanner {
   async function fetchTitle(host: string, port: number): Promise<string | null> {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 500);
+      const timeout = setTimeout(() => controller.abort(), 300);
       const res = await fetch(`http://${host}:${port}`, { signal: controller.signal });
       clearTimeout(timeout);
       const text = await res.clone().text();
@@ -108,41 +110,59 @@ export namespace ServiceScanner {
 
   async function scanHost(host: string, ports: number[]): Promise<OpenPort[]> {
     const open: OpenPort[] = [];
-    for (let i = 0; i < ports.length; i += CONCURRENCY) {
-      const batch = ports.slice(i, i + CONCURRENCY);
-      const results = await Promise.allSettled(
-        batch.map((port) =>
-          probeTCP(host, port).then((ok) => (ok ? { host, port } : null)),
-        ),
-      );
+    const n = ports.length;
+    for (let i = 0; i < n; i += CONCURRENCY) {
+      const end = Math.min(i + CONCURRENCY, n);
+      const batch: Promise<OpenPort | null>[] = [];
+      for (let j = i; j < end; j++) {
+        const port = ports[j]!;
+        batch.push(probeTCP(host, port).then((ok) => (ok ? { host, port } : null)));
+      }
+      const results = await Promise.allSettled(batch);
       for (const r of results) {
-        if (r.status === "fulfilled" && r.value) {
-          open.push(r.value);
-        }
+        if (r.status === "fulfilled" && r.value) open.push(r.value);
       }
     }
     return open;
   }
 
+  async function fetchAllTitles(
+    openPorts: { host: string; port: number }[],
+  ): Promise<(string | null)[]> {
+    const titles: (string | null)[] = new Array(openPorts.length);
+    const n = openPorts.length;
+    for (let i = 0; i < n; i += CONCURRENCY) {
+      const end = Math.min(i + CONCURRENCY, n);
+      const batch: Promise<[number, string | null]>[] = [];
+      for (let j = i; j < end; j++) {
+        const { host, port } = openPorts[j]!;
+        batch.push(fetchTitle(host, port).then((t) => [j, t]));
+      }
+      const results = await Promise.allSettled(batch);
+      for (const r of results) {
+        if (r.status === "fulfilled") {
+          const [idx, title] = r.value;
+          titles[idx] = title;
+        }
+      }
+    }
+    return titles;
+  }
+
   export async function scan(): Promise<ServiceEntry[]> {
+    const now = Date.now();
+    if (cachedResult && now - lastScan < SCAN_TTL) {
+      return cachedResult;
+    }
+
     const allPorts = Array.from({ length: 9999 }, (_, i) => i + 1);
-
-    const [localhostOpen, local127Open, local0Open] = await Promise.all([
-      scanHost("localhost", allPorts),
-      scanHost("127.0.0.1", allPorts),
-      scanHost("0.0.0.0", allPorts),
-    ]);
-
-    const seen = new Set<number>();
+    const openPorts = await scanHost("localhost", allPorts);
     const entries: ServiceEntry[] = [];
 
-    const allOpen = [...localhostOpen, ...local127Open, ...local0Open];
-
-    for (const { host, port } of allOpen) {
-      if (seen.has(port)) continue;
-      seen.add(port);
-
-      const title = await fetchTitle(host, port);
+    const titles = await fetchAllTitles(openPorts);
+    for (let i = 0; i < openPorts.length; i++) {
+      const { host, port } = openPorts[i]!;
+      const title = titles[i];
       entries.push({
         name: guessName(port, title ?? undefined),
         url: `http://localhost:${port}`,
@@ -151,6 +171,8 @@ export namespace ServiceScanner {
       });
     }
 
+    cachedResult = entries;
+    lastScan = now;
     return entries;
   }
 }
