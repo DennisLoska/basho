@@ -116,7 +116,7 @@ async function getDiskStats() {
     layoutKeys.add(key);
     diskMap.set(key, {
       device: key,
-      name: disk.name || key,
+      name: (disk.name && disk.name !== "Generic") ? disk.name : key,
       type: disk.type || "Unknown",
       used: 0,
       totalSize: disk.size,
