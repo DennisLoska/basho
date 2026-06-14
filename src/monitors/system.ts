@@ -8,10 +8,27 @@ export interface GpuInfo {
   fanSpeed: number | null;
 }
 
+export interface DiskInfo {
+  device: string;
+  name: string;
+  type: string;
+  totalSize: number;
+  used: number;
+  usePercent: number;
+}
+
+export interface DiskIOInfo {
+  totalIO_sec: number;
+  readIO_sec: number;
+  writeIO_sec: number;
+}
+
 export interface SystemStats {
   cpu: { cores: { usage: number }[]; average: number; count: number };
   ram: { used: number; total: number; percent: number; cached: number };
   gpu: GpuInfo | null;
+  disks: DiskInfo[];
+  diskIO: DiskIOInfo;
 }
 
 async function getCpuStats() {
@@ -73,11 +90,125 @@ async function getGpuStats(): Promise<GpuInfo | null> {
   }
 }
 
+function getDiskKey(partition: string): string {
+  return partition.replace("/dev/", "").replace(/p?\d+$/, "");
+}
+
+const genericDiskNames = new Set(["generic", "unknown", "ata"]);
+
+function isRealModelName(name: string): boolean {
+  return name.length > 1 && !genericDiskNames.has(name.trim().toLowerCase());
+}
+
+async function getDiskStats() {
+  const [fsSize, diskLayout, disksIO] = await Promise.all([
+    si.fsSize().catch(() => []),
+    si.diskLayout().catch(() => []),
+    si.disksIO().catch(() => null),
+  ]);
+
+  const diskMap = new Map<string, {
+    device: string;
+    name: string;
+    type: string;
+    used: number;
+    totalSize: number;
+  }>();
+
+  const layoutKeys = new Set<string>();
+
+  for (const disk of diskLayout) {
+    const key = disk.device.replace("/dev/", "");
+    layoutKeys.add(key);
+    diskMap.set(key, {
+      device: key,
+      name: isRealModelName(disk.name) ? disk.name : key,
+      type: disk.type || "Unknown",
+      used: 0,
+      totalSize: disk.size,
+    });
+  }
+
+  let lvmUsePercent = 0;
+
+  for (const fs of fsSize) {
+    if (!fs.fs.startsWith("/dev/") || fs.size <= 0) continue;
+
+    if (fs.fs.startsWith("/dev/mapper/") || fs.fs.startsWith("/dev/dm-")) {
+      if (fs.use > lvmUsePercent) lvmUsePercent = fs.use;
+      continue;
+    }
+
+    let matchedKey = "";
+
+    for (const key of diskMap.keys()) {
+      if (fs.fs.startsWith(`/dev/${key}`)) {
+        matchedKey = key;
+        break;
+      }
+    }
+
+    if (!matchedKey) {
+      matchedKey = getDiskKey(fs.fs);
+    }
+
+    const entry = diskMap.get(matchedKey);
+    if (entry) {
+      entry.used += fs.used;
+      if (!layoutKeys.has(matchedKey)) {
+        entry.totalSize += fs.size;
+      }
+    } else {
+      diskMap.set(matchedKey, {
+        device: matchedKey,
+        name: matchedKey,
+        type: "Unknown",
+        used: fs.used,
+        totalSize: fs.size,
+      });
+    }
+  }
+
+  if (lvmUsePercent > 0) {
+    for (const [, entry] of diskMap) {
+      if (layoutKeys.has(entry.device)) {
+        entry.used = (lvmUsePercent / 100) * entry.totalSize;
+      }
+    }
+  }
+
+  return {
+    disks: Array.from(diskMap.values())
+      .filter((d) => d.totalSize > 0 && layoutKeys.has(d.device))
+      .map((d) => ({
+        device: d.device,
+        name: d.name,
+        type: d.type,
+        totalSize: Math.round((d.totalSize / 1024 / 1024 / 1024) * 10) / 10,
+        used: Math.round((d.used / 1024 / 1024 / 1024) * 10) / 10,
+        usePercent: lvmUsePercent > 0
+          ? Math.round(lvmUsePercent)
+          : Math.min(Math.round((d.used / d.totalSize) * 100), 100),
+      })),
+    diskIO: disksIO
+      ? {
+          totalIO_sec: Math.round(disksIO.tIO_sec ?? 0),
+          readIO_sec: Math.round(disksIO.rIO_sec ?? 0),
+          writeIO_sec: Math.round(disksIO.wIO_sec ?? 0),
+        }
+      : { totalIO_sec: 0, readIO_sec: 0, writeIO_sec: 0 },
+  };
+}
+
 export async function getStats(): Promise<SystemStats> {
-  const [cpu, ram, gpu] = await Promise.all([
+  const [cpu, ram, gpu, diskData] = await Promise.all([
     getCpuStats(),
     getRamStats(),
     getGpuStats(),
+    getDiskStats().catch(() => ({
+      disks: [] as DiskInfo[],
+      diskIO: { totalIO_sec: 0, readIO_sec: 0, writeIO_sec: 0 } as DiskIOInfo,
+    })),
   ]);
-  return { cpu, ram, gpu };
+  return { cpu, ram, gpu, ...diskData };
 }
