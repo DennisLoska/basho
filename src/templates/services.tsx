@@ -3,7 +3,6 @@ import { html, raw } from "hono/html";
 
 export const Services = ({ services }: { services: ServiceEntry[] }) => (
   <div class="space-y-4">
-    <h2 class="text-2xl font-bold mb-4">Services</h2>
     {services.length === 0 && (
       <div class="card bg-base-200/60 backdrop-blur-sm border border-base-300/50 shadow-xl">
         <div class="card-body text-center text-base-content/60 py-12">
