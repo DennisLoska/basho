@@ -11,32 +11,14 @@ export const Dashboard = () => (
           <div class="flex items-center gap-2 mb-2">
             <div class="w-3 h-3 rounded-full bg-accent animate-pulse" />
             <h2 class="card-title text-lg">CPU</h2>
+            <span class="text-xs text-base-content/40 ml-auto" id="cpu-count" />
           </div>
           <div id="cpu-cores" class="space-y-2">
             <div class="text-4xl font-bold text-accent" id="cpu-average">
               0%
             </div>
             <div class="text-sm text-base-content/60">Average</div>
-            <div class="space-y-1 mt-3">
-              {Array.from({ length: 8 }, (_, i) => (
-                <div key={i} class="flex items-center gap-2">
-                  <span class="text-xs w-4 text-base-content/60">C{i}</span>
-                  <div class="flex-1 h-2 bg-base-300 rounded-full overflow-hidden">
-                    <div
-                      id={`cpu-core-${i}`}
-                      class="h-full bg-accent rounded-full transition-all duration-500"
-                      style="width: 0%"
-                    />
-                  </div>
-                  <span
-                    class="text-xs w-8 text-right"
-                    id={`cpu-core-label-${i}`}
-                  >
-                    0%
-                  </span>
-                </div>
-              ))}
-            </div>
+            <div id="cpu-core-bars" class="space-y-1 mt-3" />
           </div>
         </div>
       </div>
@@ -55,7 +37,10 @@ export const Dashboard = () => (
               <span id="ram-used">0.0</span> GB /{" "}
               <span id="ram-total">0.0</span> GB
             </div>
-            <div class="h-3 bg-base-300 rounded-full mt-3 overflow-hidden">
+            <div class="text-xs text-base-content/40 mt-0.5">
+              Cache: <span id="ram-cached">0.0</span> GB
+            </div>
+            <div class="h-3 bg-base-300 rounded-full mt-2 overflow-hidden">
               <div
                 id="ram-bar"
                 class="h-full bg-primary rounded-full transition-all duration-500"
@@ -77,7 +62,7 @@ export const Dashboard = () => (
               N/A
             </div>
             <div class="text-sm text-base-content/60 mt-1">
-              <span id="gpu-temp">--</span>°C
+              <span id="gpu-temp">--</span>°C &middot; Util
             </div>
             <div class="text-sm text-base-content/60">
               VRAM: <span id="gpu-vram-used">0</span> /{" "}
@@ -89,6 +74,9 @@ export const Dashboard = () => (
                 class="h-full bg-secondary rounded-full transition-all duration-500"
                 style="width: 0%"
               />
+            </div>
+            <div class="text-xs text-base-content/40 mt-0.5">
+              VRAM usage
             </div>
           </div>
         </div>
