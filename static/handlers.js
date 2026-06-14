@@ -87,14 +87,12 @@
       '<div class="card-body">' +
         '<div class="flex items-center gap-2 mb-2">' +
           '<div class="w-3 h-3 rounded-full bg-info animate-pulse"></div>' +
-          '<h2 class="card-title text-lg truncate" title="' + (disk.name || disk.device) + '">' + (disk.name || disk.device) + '</h2>' +
-          '<span class="text-xs text-base-content/40 ml-auto">' + disk.device + '</span>' +
+          '<h2 class="card-title text-lg truncate">' + (disk.name || disk.device) + '</h2>' +
         '</div>' +
         '<div id="' + id + '-info">' +
           '<div class="text-4xl font-bold text-info" id="' + id + '-percent">' + disk.usePercent + '%</div>' +
           '<div class="text-sm text-base-content/60 mt-1">' +
             '<span id="' + id + '-used">' + disk.used + '</span> GB / <span id="' + id + '-size">' + disk.totalSize + '</span> GB' +
-            '<span class="ml-2 text-base-content/30">' + (disk.type || '') + '</span>' +
           '</div>' +
           '<div class="h-3 bg-base-300 rounded-full mt-2 overflow-hidden">' +
             '<div id="' + id + '-bar" class="h-full bg-info rounded-full transition-all duration-500" style="width: ' + disk.usePercent + '%"></div>' +
