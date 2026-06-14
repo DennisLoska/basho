@@ -2,10 +2,10 @@ import type { Child } from "hono/jsx";
 
 interface AppProps {
   children: Child;
-  page?: string;
+  title?: string;
 }
 
-export const App = ({ children, page }: AppProps) => (
+export const App = ({ children, title }: AppProps) => (
   <div className="min-h-screen bg-base-100 flex">
     <aside id="sidebar" className="bg-base-200 border-r border-base-300 flex flex-col min-h-screen w-64 shrink-0 overflow-hidden transition-all duration-300 z-30">
       <a
@@ -52,11 +52,7 @@ export const App = ({ children, page }: AppProps) => (
           </button>
         </div>
         <div className="flex-1">
-          <h1 id="header-title" className="text-xl font-bold">
-            {page === "dashboard" && "Resources"}
-            {page === "services" && "Services"}
-            {!page && "Basho"}
-          </h1>
+          <h1 id="header-title" className="text-xl font-bold">{title}</h1>
         </div>
         <div className="flex-none">
           <button id="theme-toggle" className="btn btn-ghost btn-circle btn-sm" onclick="toggleTheme()">
