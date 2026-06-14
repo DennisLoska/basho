@@ -8,10 +8,26 @@ export interface GpuInfo {
   fanSpeed: number | null;
 }
 
+export interface DiskInfo {
+  fs: string;
+  mount: string;
+  size: number;
+  used: number;
+  usePercent: number;
+}
+
+export interface DiskIOInfo {
+  totalIO_sec: number;
+  readIO_sec: number;
+  writeIO_sec: number;
+}
+
 export interface SystemStats {
   cpu: { cores: { usage: number }[]; average: number; count: number };
   ram: { used: number; total: number; percent: number; cached: number };
   gpu: GpuInfo | null;
+  disks: DiskInfo[];
+  diskIO: DiskIOInfo;
 }
 
 async function getCpuStats() {
@@ -73,11 +89,37 @@ async function getGpuStats(): Promise<GpuInfo | null> {
   }
 }
 
+async function getDiskStats() {
+  const [fsSize, disksIO] = await Promise.all([
+    si.fsSize(),
+    si.disksIO().catch(() => null),
+  ]);
+  return {
+    disks: fsSize
+      .filter((fs) => fs.fs.startsWith("/dev/") && fs.size > 0)
+      .map((fs) => ({
+        fs: fs.fs,
+        mount: fs.mount,
+        size: Math.round((fs.size / 1024 / 1024 / 1024) * 10) / 10,
+        used: Math.round((fs.used / 1024 / 1024 / 1024) * 10) / 10,
+        usePercent: Math.round(fs.use),
+      })),
+    diskIO: disksIO
+      ? {
+          totalIO_sec: Math.round(disksIO.tIO_sec ?? 0),
+          readIO_sec: Math.round(disksIO.rIO_sec ?? 0),
+          writeIO_sec: Math.round(disksIO.wIO_sec ?? 0),
+        }
+      : { totalIO_sec: 0, readIO_sec: 0, writeIO_sec: 0 },
+  };
+}
+
 export async function getStats(): Promise<SystemStats> {
-  const [cpu, ram, gpu] = await Promise.all([
+  const [cpu, ram, gpu, { disks, diskIO }] = await Promise.all([
     getCpuStats(),
     getRamStats(),
     getGpuStats(),
+    getDiskStats(),
   ]);
-  return { cpu, ram, gpu };
+  return { cpu, ram, gpu, disks, diskIO };
 }

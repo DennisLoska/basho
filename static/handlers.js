@@ -5,6 +5,7 @@
   var gpuData = [];
   var ramTotal = 0;
   var gpuTotal = 0;
+  var diskIOData = [];
 
   function init() {
     var html = document.documentElement;
@@ -72,10 +73,65 @@
     if (fill) fill.setAttribute('d', svgFillPath(data, max));
   }
 
+  function sanitizeMount(mount) {
+    return 'disk-' + mount.replace(/[^a-zA-Z0-9]/g, '_');
+  }
+
+  function createDiskCard(id, disk) {
+    var container = document.getElementById('disks-container');
+    if (!container) return null;
+    var card = document.createElement('div');
+    card.className = 'card bg-base-200/60 backdrop-blur-sm border border-base-300/50 shadow-xl';
+    card.id = id;
+    card.innerHTML =
+      '<div class="card-body">' +
+        '<div class="flex items-center gap-2 mb-2">' +
+          '<div class="w-3 h-3 rounded-full bg-info animate-pulse"></div>' +
+          '<h2 class="card-title text-lg truncate" title="' + disk.fs + '">' + disk.mount + '</h2>' +
+          '<span class="text-xs text-base-content/40 ml-auto truncate" title="' + disk.fs + '">' + disk.fs.replace('/dev/', '') + '</span>' +
+        '</div>' +
+        '<div id="' + id + '-info">' +
+          '<div class="text-4xl font-bold text-info" id="' + id + '-percent">' + disk.usePercent + '%</div>' +
+          '<div class="text-sm text-base-content/60 mt-1">' +
+            '<span id="' + id + '-used">' + disk.used + '</span> GB / <span id="' + id + '-size">' + disk.size + '</span> GB' +
+          '</div>' +
+          '<div class="h-3 bg-base-300 rounded-full mt-2 overflow-hidden">' +
+            '<div id="' + id + '-bar" class="h-full bg-info rounded-full transition-all duration-500" style="width: ' + disk.usePercent + '%"></div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="mt-auto pt-3">' +
+          '<svg class="w-full h-24" id="' + id + '-chart" viewBox="0 0 137 45" preserveAspectRatio="none">' +
+            '<defs>' +
+              '<linearGradient id="' + id + '-grad" x1="0" y1="0" x2="0" y2="1">' +
+                '<stop offset="0%" stop-color="var(--color-info)" stop-opacity="0.3"></stop>' +
+                '<stop offset="100%" stop-color="var(--color-info)" stop-opacity="0.02"></stop>' +
+              '</linearGradient>' +
+            '</defs>' +
+            '<line x1="14" y1="3" x2="14" y2="40" stroke="var(--color-base-content)" stroke-opacity="0.12" stroke-width="1"></line>' +
+            '<line x1="14" y1="21.5" x2="135" y2="21.5" stroke="var(--color-base-content)" stroke-opacity="0.08" stroke-width="0.5" stroke-dasharray="2,2"></line>' +
+            '<line x1="14" y1="40" x2="135" y2="40" stroke="var(--color-base-content)" stroke-opacity="0.12" stroke-width="0.5"></line>' +
+            '<text id="' + id + '-yl0" x="12" y="6" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">IO</text>' +
+            '<text id="' + id + '-yl1" x="12" y="24.5" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace"></text>' +
+            '<text id="' + id + '-yl2" x="12" y="43" text-anchor="end" fill="var(--color-base-content)" fill-opacity="0.25" font-size="3.5" font-family="monospace">0</text>' +
+            '<path id="' + id + '-fill" fill="url(#' + id + '-grad)" d=""></path>' +
+            '<path id="' + id + '-line" fill="none" stroke="var(--color-info)" stroke-width="1.5" d=""></path>' +
+          '</svg>' +
+        '</div>' +
+      '</div>';
+    container.appendChild(card);
+    return card;
+  }
+
+  function formatIO(val) {
+    if (val >= 1000) return (val / 1000).toFixed(1) + 'K';
+    return Math.round(val) + '';
+  }
+
   document.addEventListener('htmx:beforeSwap', function() {
     cpuData = [];
     ramData = [];
     gpuData = [];
+    diskIOData = [];
     ramTotal = 0;
     gpuTotal = 0;
   });
@@ -115,6 +171,49 @@
       if (ry1) ry1.textContent = Math.round(ramTotal / 2) + 'GB';
       pushData(ramData, data.ram.used);
       updateChart('ram-chart', ramData, ramTotal);
+
+      if (data.disks) {
+        var seenMounts = {};
+        data.disks.forEach(function(disk) {
+          var id = sanitizeMount(disk.mount);
+          seenMounts[id] = true;
+          var card = document.getElementById(id);
+          if (!card) card = createDiskCard(id, disk);
+          if (!card) return;
+          var pct = document.getElementById(id + '-percent');
+          var used = document.getElementById(id + '-used');
+          var size = document.getElementById(id + '-size');
+          var bar = document.getElementById(id + '-bar');
+          if (pct) pct.textContent = disk.usePercent + '%';
+          if (used) used.textContent = disk.used;
+          if (size) size.textContent = disk.size;
+          if (bar) bar.style.width = disk.usePercent + '%';
+        });
+        var container = document.getElementById('disks-container');
+        if (container) {
+          var cards = container.children;
+          for (var i = cards.length - 1; i >= 0; i--) {
+            if (!seenMounts[cards[i].id]) cards[i].remove();
+          }
+        }
+      }
+
+      if (data.diskIO) {
+        pushData(diskIOData, data.diskIO.totalIO_sec);
+        var maxIO = 1;
+        for (var i = 0; i < diskIOData.length; i++) {
+          if (diskIOData[i] > maxIO) maxIO = diskIOData[i];
+        }
+        maxIO = Math.ceil(maxIO * 1.2) || 1;
+        data.disks.forEach(function(disk) {
+          var id = sanitizeMount(disk.mount);
+          var yl0 = document.getElementById(id + '-yl0');
+          var yl1 = document.getElementById(id + '-yl1');
+          if (yl0) yl0.textContent = formatIO(maxIO);
+          if (yl1) yl1.textContent = formatIO(Math.round(maxIO / 2));
+          updateChart(id, diskIOData, maxIO);
+        });
+      }
 
       if (!data.gpu) return;
       var gu = document.getElementById('gpu-util');
