@@ -13,17 +13,26 @@ app.get("/system-stats", (c) => {
 
       const send = (data: string) => {
         if (closed) return;
-        controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+        try {
+          controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+        } catch {}
       };
 
-      cpuInterval = setInterval(async () => {
+      const pushStats = async () => {
+        if (closed) return;
         const stats = await getStats();
         send(JSON.stringify({ type: "system", ...stats }));
-      }, 2000);
+      };
+
+      pushStats();
+
+      cpuInterval = setInterval(pushStats, 2000);
 
       keepAliveInterval = setInterval(() => {
         if (closed) return;
-        controller.enqueue(encoder.encode(": keep-alive\n\n"));
+        try {
+          controller.enqueue(encoder.encode(": keep-alive\n\n"));
+        } catch {}
       }, 15000);
 
       c.req.raw.signal.addEventListener("abort", () => {
