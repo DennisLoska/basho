@@ -99,3 +99,15 @@ _Avoid_: Target string, shell argument, arbitrary host resource
 **EvidenceTool**:
 An allowlisted read-only investigation operation (`read_posture_detail`, `read_listener_detail`, `read_recent_events`, `read_process_summary`, or `read_unit_status`) invoked by the AI analyst and recorded in the `InvestigationTrail`.
 _Avoid_: Arbitrary tool call, shell command, raw query
+
+**AiAnalyst**:
+The bounded AI investigation orchestrator that runs read-only evidence-tool turns under strict time, call, token, and backoff limits, validates final JSON verdicts, findings, and `ProposalDraft` records against issued scan evidence, and degrades cleanly when unconfigured or offline.
+_Avoid_: Autonomous agent, AI engine, chatbot
+
+**EvidenceBroker**:
+The per-scan trust-boundary adapter that exposes closed-schema read-only `EvidenceTool` definitions, validates arguments locally, strips sensitive host fields, caps tool payloads, and tracks issued `Evidence` IDs eligible for citation.
+_Avoid_: Tool runner, log proxy, evidence dump
+
+**ProposalDraft**:
+An unpersisted, locally validated containment candidate produced by `AiAnalyst` pairing a strict `ContainmentTarget` with issued `Evidence` IDs, before policy evaluation or persistence as a `LockdownProposal`.
+_Avoid_: Approved action, LockdownProposal, raw recommendation
