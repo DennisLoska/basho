@@ -654,6 +654,18 @@ describe("EvidenceBroker tool dispatch", () => {
     const result = await new AiAnalyst({ client, clock: clockAt(NOW) }).investigate(
       "scan-1",
       makeBroker({
+        evidence: [
+          {
+            id: "unit-sshd",
+            kind: "unit",
+            facts: { unitName: "sshd.service", scope: "system" },
+          },
+          {
+            id: "unit-demo-timer",
+            kind: "unit",
+            facts: { unitName: "demo-app.timer", scope: "user" },
+          },
+        ],
         unitStatus: async (name, scope) => {
           unitCalls.push([name, scope]);
           return {
@@ -685,6 +697,51 @@ describe("EvidenceBroker tool dispatch", () => {
     expect(raw).not.toContain("hunter2");
 
     expect(rejectedSteps(result)).toHaveLength(4);
+  });
+
+  test("read_unit_status rejects undiscovered units and scope mismatches before calling unitStatus", async () => {
+    const unitCalls: [string, "system" | "user"][] = [];
+    const requests: AiTurnRequest[] = [];
+    const client = scriptedClient(
+      [
+        () => ({
+          calls: [
+            call("c1", "read_unit_status", { unitName: "cron.service", scope: "system" }),
+            call("c2", "read_unit_status", { unitName: "sshd.service", scope: "user" }),
+            call("c3", "read_unit_status", { unitName: "sshd.service", scope: "system" }),
+          ],
+        }),
+        () => finalTurn(),
+      ],
+      requests,
+    );
+
+    const result = await new AiAnalyst({ client, clock: clockAt(NOW) }).investigate(
+      "scan-1",
+      makeBroker({
+        evidence: [
+          {
+            id: "unit-sshd",
+            kind: "unit",
+            facts: { unitName: "sshd.service", scope: "system" },
+          },
+        ],
+        unitStatus: async (name, scope) => {
+          unitCalls.push([name, scope]);
+          return {
+            ActiveState: "active",
+            SubState: "running",
+            Result: "success",
+            ExecMainStatus: 0,
+          };
+        },
+      }),
+    );
+
+    expect(unitCalls).toEqual([["sshd.service", "system"]]);
+    expect(rejectedSteps(result)).toHaveLength(2);
+    expect(rejectedSteps(result).every((step) => step.tool === "read_unit_status")).toBe(true);
+    expect(JSON.stringify(requests[1]!.messages)).not.toContain("cron.service");
   });
 
   test("unknown tools, malformed JSON and extra arguments are rejected and never echoed back", async () => {
@@ -799,7 +856,6 @@ describe("AiAnalyst investigation", () => {
           verdict: { kind: "warn", confidence: 0.82, summary: "SSH hardening drift detected" },
           findings: [
             {
-              id: "model-supplied-id",
               severity: "warning",
               summary: "SSH password authentication is enabled",
               evidenceIds: ["ev-1"],
@@ -828,7 +884,116 @@ describe("AiAnalyst investigation", () => {
     expect(finding.evidenceIds).toEqual(["ev-1"]);
     expect(typeof finding.id).toBe("string");
     expect(finding.id.length).toBeGreaterThan(0);
-    expect(finding.id).not.toBe("model-supplied-id");
+  });
+
+  test("rejects findings containing extra keys such as id or source", async () => {
+    const client = scriptedClient([
+      () =>
+        finalTurn({
+          verdict: { kind: "warn", confidence: 0.82, summary: "SSH hardening drift detected" },
+          findings: [
+            {
+              id: "model-supplied-id",
+              severity: "warning",
+              summary: "Extra id key must be rejected",
+              evidenceIds: ["ev-1"],
+            },
+            {
+              source: "deterministic",
+              severity: "warning",
+              summary: "Extra source key must be rejected",
+              evidenceIds: ["ev-1"],
+            },
+            {
+              extra: "unexpected",
+              severity: "warning",
+              summary: "Arbitrary extra key must be rejected",
+              evidenceIds: ["ev-1"],
+            },
+            {
+              severity: "warning",
+              summary: "Exact schema finding is accepted",
+              evidenceIds: ["ev-1"],
+            },
+          ],
+          proposals: [],
+        }),
+    ]);
+
+    const result = await new AiAnalyst({ client, clock: clockAt(NOW) }).investigate(
+      "scan-1",
+      makeBroker({ evidence: postureEvidence() }),
+    );
+
+    expect(result.status).toBe("ready");
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]!.summary).toBe("Exact schema finding is accepted");
+    expect(result.findings[0]!.source).toBe("ai");
+    expect(rejectedSteps(result)).toHaveLength(3);
+  });
+
+  test("always finishes with a dedicated tool-free final turn even when a tool turn returns no calls", async () => {
+    const requests: AiTurnRequest[] = [];
+    const client = scriptedClient(
+      [
+        () =>
+          finalTurn({
+            verdict: { kind: "breach", confidence: 1, summary: "Premature tool-turn verdict" },
+            findings: [],
+            proposals: [],
+          }),
+        () =>
+          finalTurn({
+            verdict: { kind: "healthy", confidence: 0.91, summary: "Final tool-free verdict" },
+            findings: [],
+            proposals: [],
+          }),
+      ],
+      requests,
+    );
+
+    const result = await new AiAnalyst({ client, clock: clockAt(NOW) }).investigate(
+      "scan-1",
+      makeBroker({ evidence: postureEvidence() }),
+    );
+
+    expect(requests).toHaveLength(2);
+    expect(requests[0]!.tools).toHaveLength(evidenceTools.length);
+    expect(requests[1]!.tools).toEqual([]);
+    expect(result.status).toBe("ready");
+    expect(result.verdict).toEqual({
+      kind: "healthy",
+      confidence: 0.91,
+      summary: "Final tool-free verdict",
+    });
+  });
+
+  test("tool results stay bounded and invented evidence cannot support a finding", async () => {
+    const broker = new EvidenceBroker({
+      evidence: [{ id: "ev-1", kind: "criterion", facts: { criterionId: "ssh_hardening", status: "warn" } }],
+      recentEvents: () => [],
+    });
+    const requests: AiTurnRequest[] = [];
+    const analyst = new AiAnalyst({
+      clock: { now: () => 100 },
+      client: { async complete(request) {
+        requests.push(request);
+        if (requests.length === 1) return { calls: [
+          { id: "call-1", name: "read_posture_detail", arguments: '{"criterionId":"ssh_hardening"}' },
+          { id: "call-2", name: "read_process_summary", arguments: '{"pid":99,"file":"/etc/shadow"}' },
+        ] };
+        return { calls: [], content: JSON.stringify({
+          verdict: { kind: "warn", confidence: 0.9, summary: "SSH posture warning" },
+          findings: [{ severity: "warning", summary: "Unsupported", evidenceIds: ["invented"] }],
+          proposals: [],
+        }) };
+      } },
+    });
+    const result = await analyst.investigate("scan-1", broker);
+    expect(result.findings).toEqual([]);
+    expect(result.trail.steps.map((step) => step.outcome)).toContain("rejected");
+    expect(requests.at(-1)!.tools).toEqual([]);
+    expect(JSON.stringify(requests.at(-1))).not.toContain("/etc/shadow");
   });
 
   test("discards findings that cite invented evidence ids and records rejected steps", async () => {

@@ -313,7 +313,7 @@ function sanitizeEvidenceForPrompt(evidence: Evidence): {
       return {
         id: evidence.id,
         kind: evidence.kind,
-        facts: pickFacts(evidence.facts, ["unitName", "scope", ...UNIT_STATUS_KEYS]),
+        facts: pickFacts(evidence.facts, ["unitName", "unit", "scope", ...UNIT_STATUS_KEYS]),
       };
     case "listener":
       return {
@@ -699,9 +699,22 @@ export class EvidenceBroker {
   private readonly listenerEvidence = new Map<string, Evidence>();
   private readonly processEvidenceByPid = new Map<number, Evidence>();
   private readonly unitEvidence = new Map<string, Evidence>();
+  private readonly discoveredUnits = new Set<string>();
   private readonly issuedEvidenceIds = new Set<string>();
   private readonly recentEventsFn: EvidenceBrokerOptions["recentEvents"];
   private readonly unitStatusFn?: EvidenceBrokerOptions["unitStatus"];
+
+  private registerDiscoveredUnit(unitName: unknown, scope: unknown): string | undefined {
+    if (typeof unitName !== "string" || !isValidSystemdUnitName(unitName)) {
+      return undefined;
+    }
+    const key =
+      typeof scope === "string" && UNIT_SCOPE_SET.has(scope)
+        ? `${scope}:${unitName}`
+        : `*:${unitName}`;
+    this.discoveredUnits.add(key);
+    return key;
+  }
 
   constructor(options: EvidenceBrokerOptions) {
     this.recentEventsFn = options.recentEvents;
@@ -727,14 +740,18 @@ export class EvidenceBroker {
           this.processEvidenceByPid.set(pid, item);
         }
       } else if (item.kind === "unit") {
-        const unitName = item.facts.unitName;
-        const scope = item.facts.scope;
-        if (typeof unitName === "string") {
-          const key =
-            typeof scope === "string" && UNIT_SCOPE_SET.has(scope)
-              ? `${scope}:${unitName}`
-              : `*:${unitName}`;
+        const unitName = item.facts.unitName ?? item.facts.unit;
+        const key = this.registerDiscoveredUnit(unitName, item.facts.scope);
+        if (key) {
           this.unitEvidence.set(key, item);
+        }
+      }
+
+      if (item.kind !== "unit") {
+        this.registerDiscoveredUnit(item.facts.unitName, item.facts.scope);
+        this.registerDiscoveredUnit(item.facts.unit, item.facts.scope);
+        if (item.kind === "event" && item.facts.category === "units") {
+          this.registerDiscoveredUnit(item.facts.target, undefined);
         }
       }
     }
@@ -1031,6 +1048,9 @@ export class EvidenceBroker {
       usedBytes += entryBytes;
       this.issuedEvidenceIds.add(event.id);
       registeredIds.push(event.id);
+      if (event.category === "units") {
+        this.registerDiscoveredUnit(event.target, undefined);
+      }
     }
 
     const payload = {
@@ -1121,6 +1141,20 @@ export class EvidenceBroker {
 
     const unitName = args.unitName;
     const scope = args.scope as "system" | "user";
+    const isDiscovered =
+      this.discoveredUnits.has(`${scope}:${unitName}`) ||
+      this.discoveredUnits.has(`*:${unitName}`);
+    if (!isDiscovered) {
+      return {
+        knownTool: true,
+        tool: "read_unit_status",
+        outcome: "rejected",
+        reason: "Rejected unit outside current scan registry",
+        evidenceIds: [],
+        content: '{"error":"unknown_unit"}',
+      };
+    }
+
     const existingEvidence =
       this.unitEvidence.get(`${scope}:${unitName}`) ??
       this.unitEvidence.get(`*:${unitName}`);
@@ -1268,17 +1302,7 @@ function validateFinding(
   localId: string,
 ): SecurityFinding | null {
   if (!isPlainObject(value)) return null;
-  for (const key of Object.keys(value)) {
-    if (
-      key !== "severity" &&
-      key !== "summary" &&
-      key !== "evidenceIds" &&
-      key !== "id" &&
-      key !== "source"
-    ) {
-      return null;
-    }
-  }
+  if (!hasExactKeys(value, ["severity", "summary", "evidenceIds"])) return null;
   const { severity, summary, evidenceIds } = value;
   if (typeof severity !== "string" || !SEVERITY_SET.has(severity)) return null;
   if (typeof summary !== "string") return null;
@@ -1470,38 +1494,25 @@ export class AiAnalyst {
     try {
       let toolRoundsUsed = 0;
       let toolCallsUsed = 0;
-      let finalContent: string | undefined;
 
-      for (;;) {
+      while (
+        toolRoundsUsed < MAX_TOOL_ROUNDS &&
+        toolCallsUsed < MAX_TOOL_CALLS &&
+        estimateInputTokens(messages, tools) <= MAX_INPUT_TOKENS
+      ) {
         if (deadlineExpired || controller.signal.aborted) {
           throw new AiProviderError("timeout", "AI provider request timed out");
         }
 
-        const canUseTools =
-          toolRoundsUsed < MAX_TOOL_ROUNDS &&
-          toolCallsUsed < MAX_TOOL_CALLS &&
-          estimateInputTokens(messages, tools) <= MAX_INPUT_TOKENS;
-
-        const turnTools = canUseTools ? tools : [];
-        const turnMessages =
-          turnTools.length === 0 ? trimMessagesForBudget(messages) : messages;
-
         const response = await this.client.complete({
           scanId,
-          messages: turnMessages,
-          tools: turnTools,
+          messages,
+          tools,
           signal: controller.signal,
         });
 
         const calls = response.calls ?? [];
         if (calls.length === 0) {
-          finalContent = response.content;
-          break;
-        }
-
-        if (turnTools.length === 0) {
-          // Model attempted tool calls on the final tool-free turn.
-          finalContent = undefined;
           break;
         }
 
@@ -1557,6 +1568,21 @@ export class AiAnalyst {
         });
         messages.push(...toolResults);
       }
+
+      if (deadlineExpired || controller.signal.aborted) {
+        throw new AiProviderError("timeout", "AI provider request timed out");
+      }
+
+      const finalResponse = await this.client.complete({
+        scanId,
+        messages: trimMessagesForBudget(messages),
+        tools: [],
+        signal: controller.signal,
+      });
+
+      const finalCalls = finalResponse.calls ?? [];
+      const finalContent =
+        finalCalls.length === 0 ? finalResponse.content : undefined;
 
       this.resetProviderBackoff();
       return this.parseFinalResponse(scanId, finalContent, broker, trail);
