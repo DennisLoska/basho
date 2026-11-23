@@ -112,7 +112,7 @@ function lstatIfExists(path: string): Stats | null {
   }
 }
 
-function ensurePrivateDatabasePath(dbPath: string): void {
+function ensurePrivateDatabasePath(dbPath: string): string {
   const resolvedDbPath = resolve(dbPath);
   const parentDir = dirname(resolvedDbPath);
   const dirsToCreate: string[] = [];
@@ -208,6 +208,8 @@ function ensurePrivateDatabasePath(dbPath: string): void {
       );
     }
   }
+
+  return resolvedDbPath;
 }
 
 interface ScanRow {
@@ -324,18 +326,16 @@ export class SecurityStore implements SecurityStoreContract {
   private readonly db: Database;
 
   constructor(dbPath?: string) {
-    const resolvedPath = dbPath ?? (process.env.BASHO_SECURITY_DB?.trim() || DEFAULT_DB_PATH);
-    const isMemory = resolvedPath === ":memory:";
-    if (!isMemory) {
-      ensurePrivateDatabasePath(resolvedPath);
-    }
+    const configuredPath = dbPath ?? (process.env.BASHO_SECURITY_DB?.trim() || DEFAULT_DB_PATH);
+    const isMemory = configuredPath === ":memory:";
+    const targetPath = isMemory ? ":memory:" : ensurePrivateDatabasePath(configuredPath);
 
-    this.db = new Database(resolvedPath, { create: true });
+    this.db = new Database(targetPath, { create: true });
     this.db.run(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     this.db.run("PRAGMA foreign_keys = ON");
     if (!isMemory) {
       this.db.run("PRAGMA journal_mode = WAL");
-      this.db.run("PRAGMA synchronous = NORMAL");
+      this.db.run("PRAGMA synchronous = FULL");
     }
 
     this.applyMigrations();
@@ -855,10 +855,11 @@ export class SecurityStore implements SecurityStoreContract {
       }
 
       const insertObservation = this.db.query(
-        `INSERT OR IGNORE INTO security_events (
+        `INSERT INTO security_events (
           row_kind, observation_id, event_id, source, category, severity,
           rule, target, first_at, last_at, hour_bucket, count, is_noise, payload_json
-        ) VALUES ('observation', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES ('observation', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(observation_id) DO NOTHING`,
       );
 
       const findAggregates = this.db.query(
@@ -893,11 +894,32 @@ export class SecurityStore implements SecurityStoreContract {
         ) VALUES ('aggregate', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
 
+      if (!Number.isFinite(batch.burstWindowMs)) {
+        throw new RangeError(
+          `EventBatch burstWindowMs must be finite: ${batch.burstWindowMs}`,
+        );
+      }
       const burstWindowMs = Math.max(0, batch.burstWindowMs);
 
       for (const event of batch.events) {
+        if (!Number.isInteger(event.count) || event.count < 1) {
+          throw new RangeError(
+            `SecurityEvent count must be a finite positive integer: ${event.count}`,
+          );
+        }
+        if (!Number.isFinite(event.firstAt) || !Number.isFinite(event.lastAt)) {
+          throw new RangeError(
+            `SecurityEvent timestamps must be finite: firstAt=${event.firstAt}, lastAt=${event.lastAt}`,
+          );
+        }
+        if (event.firstAt > event.lastAt) {
+          throw new RangeError(
+            `SecurityEvent firstAt (${event.firstAt}) must not exceed lastAt (${event.lastAt})`,
+          );
+        }
+
         const isNoiseInt = event.isNoise ? 1 : 0;
-        const eventCount = Math.max(1, event.count);
+        const eventCount = event.count;
         const hourBucket = Math.floor(event.lastAt / HOUR_MS) * HOUR_MS;
         const payloadJson = JSON.stringify({ summary: event.summary });
 
@@ -1558,7 +1580,29 @@ export class SecurityStore implements SecurityStoreContract {
 
       const eventCutoff = now - EVENT_RETENTION_DAYS * DAY_MS;
       this.db
-        .query("DELETE FROM security_events WHERE last_at < ?")
+        .query(
+          `DELETE FROM security_events
+           WHERE row_kind = 'aggregate' AND last_at < ?`,
+        )
+        .run(eventCutoff);
+      this.db
+        .query(
+          `DELETE FROM security_events
+           WHERE row_kind = 'observation'
+             AND last_at < ?
+             AND NOT EXISTS (
+               SELECT 1
+               FROM security_events AS agg
+               WHERE agg.row_kind = 'aggregate'
+                 AND agg.source = security_events.source
+                 AND agg.category = security_events.category
+                 AND agg.rule = security_events.rule
+                 AND agg.target = security_events.target
+                 AND agg.is_noise = security_events.is_noise
+                 AND agg.first_at <= security_events.first_at
+                 AND agg.last_at >= security_events.last_at
+             )`,
+        )
         .run(eventCutoff);
 
       const actionCutoff = now - ACTION_RETENTION_DAYS * DAY_MS;

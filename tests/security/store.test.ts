@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { SecurityStore } from "../../src/security/store";
 import type {
   Evidence,
@@ -1748,5 +1748,333 @@ test("file-backed store rejects symlinked or unsafe -journal sidecar before open
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test("file-backed store configures PRAGMA synchronous = FULL and opens the validated absolute path", () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-sync-full-"));
+  const subDir = join(root, "private");
+  const unnormalizedPath = join(subDir, "nested", "..", "durable.db");
+  const expectedResolvedPath = resolve(unnormalizedPath);
+  const relPath = relative(process.cwd(), unnormalizedPath);
+
+  try {
+    const store = new SecurityStore(relPath);
+    try {
+      const internalDb = (store as unknown as { db: Database }).db;
+      const syncRow = internalDb.query("PRAGMA synchronous").get() as { synchronous: number } | null;
+      expect(syncRow?.synchronous).toBe(2); // 2 = FULL
+      expect(internalDb.filename).toBe(expectedResolvedPath);
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("commitEventBatch fails and rolls back cursor and batch on invalid observations", () => {
+  const store = memoryStore();
+  try {
+    expect(
+      store.commitEventBatch({
+        events: [eventFixture("valid-initial", 1_000)],
+        cursor: { source: "journal", expected: null, next: "c-1" },
+        burstWindowMs: 1_000,
+      }),
+    ).toBe(true);
+
+    // Invalid NaN count after a valid event in the same batch must throw and roll back both event and cursor.
+    expect(() =>
+      store.commitEventBatch({
+        events: [
+          eventFixture("rolled-back-1", 2_000, { rule: "rule_rolled_back" }),
+          eventFixture("bad-nan-count", 3_000, { count: Number.NaN }),
+        ],
+        cursor: { source: "journal", expected: "c-1", next: "c-2" },
+        burstWindowMs: 1_000,
+      }),
+    ).toThrow();
+
+    expect(store.getCursor("journal")).toBe("c-1");
+    expect(store.recentEvents(0, 10).map((event) => event.id)).toEqual(["valid-initial"]);
+
+    // Non-positive, non-integer, or non-finite count must also reject and preserve cursor.
+    for (const badCount of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(() =>
+        store.commitEventBatch({
+          events: [eventFixture(`bad-count-${String(badCount)}`, 4_000, { count: badCount })],
+          cursor: { source: "journal", expected: "c-1", next: "c-2" },
+          burstWindowMs: 1_000,
+        }),
+      ).toThrow();
+    }
+
+    // Non-finite timestamps or inverted [firstAt, lastAt] must reject and preserve cursor.
+    expect(() =>
+      store.commitEventBatch({
+        events: [eventFixture("bad-first-nan", 5_000, { firstAt: Number.NaN })],
+        cursor: { source: "journal", expected: "c-1", next: "c-2" },
+        burstWindowMs: 1_000,
+      }),
+    ).toThrow();
+    expect(() =>
+      store.commitEventBatch({
+        events: [eventFixture("bad-last-inf", 5_000, { lastAt: Number.POSITIVE_INFINITY })],
+        cursor: { source: "journal", expected: "c-1", next: "c-2" },
+        burstWindowMs: 1_000,
+      }),
+    ).toThrow();
+    expect(() =>
+      store.commitEventBatch({
+        events: [eventFixture("bad-inverted", 5_000, { firstAt: 6_000, lastAt: 5_000 })],
+        cursor: { source: "journal", expected: "c-1", next: "c-2" },
+        burstWindowMs: 1_000,
+      }),
+    ).toThrow();
+
+    // NOT NULL violation (e.g. runtime null rule) must fail instead of being silently ignored by INSERT OR IGNORE.
+    expect(() =>
+      store.commitEventBatch({
+        events: [
+          eventFixture("bad-null-rule", 5_000, {
+            rule: null as unknown as string,
+          }),
+        ],
+        cursor: { source: "journal", expected: "c-1", next: "c-2" },
+        burstWindowMs: 1_000,
+      }),
+    ).toThrow();
+
+    expect(store.getCursor("journal")).toBe("c-1");
+    expect(store.recentEvents(0, 10).map((event) => event.id)).toEqual(["valid-initial"]);
+  } finally {
+    store.close();
+  }
+});
+
+test("prune preserves observation dedupe rows for surviving spanning bursts so replay does not double-count", () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-prune-dedupe-"));
+  const dbPath = join(root, "dedupe.db");
+  const store = new SecurityStore(dbPath);
+  try {
+    const now = 100 * DAY_MS;
+    const cutoff = now - 14 * DAY_MS;
+
+    // A burst spanning the 14-day retention cutoff:
+    // obs-before is 1s before cutoff, obs-after is 1s after cutoff, within a 5s burst window.
+    const preCutoffObs = eventFixture("span-before", cutoff - 1_000, {
+      rule: "ssh_burst",
+      target: "198.51.100.77",
+      count: 2,
+    });
+    const postCutoffObs = eventFixture("span-after", cutoff + 1_000, {
+      rule: "ssh_burst",
+      target: "198.51.100.77",
+      count: 3,
+    });
+
+    // A separate fully expired burst for the exact same (source, category, rule, target, is_noise)
+    // far earlier than the surviving burst.
+    const expiredObs = eventFixture("expired-separate", cutoff - 5 * DAY_MS, {
+      rule: "ssh_burst",
+      target: "198.51.100.77",
+      count: 4,
+    });
+
+    store.commitEventBatch({
+      events: [expiredObs, preCutoffObs, postCutoffObs],
+      burstWindowMs: 5_000,
+    });
+
+    store.prune(now);
+
+    // The spanning burst survives with count 5; the expired burst was pruned.
+    const afterPrune = store.recentEvents(0, 10);
+    expect(afterPrune).toHaveLength(1);
+    expect(afterPrune[0]).toMatchObject({
+      rule: "ssh_burst",
+      target: "198.51.100.77",
+      firstAt: cutoff - 1_000,
+      lastAt: cutoff + 1_000,
+      count: 5,
+    });
+
+    // Replaying the pre-cutoff observation must NOT double-count the surviving burst.
+    store.commitEventBatch({
+      events: [preCutoffObs],
+      burstWindowMs: 5_000,
+    });
+
+    const afterReplay = store.recentEvents(0, 10);
+    expect(afterReplay).toHaveLength(1);
+    expect(afterReplay[0]!.count).toBe(5);
+
+    // The expired separate burst's observation row was properly pruned (no unbounded leak).
+    const inspectDb = new Database(dbPath, { readonly: true });
+    try {
+      const obsIds = (
+        inspectDb
+          .query(
+            "SELECT observation_id FROM security_events WHERE row_kind = 'observation' ORDER BY observation_id",
+          )
+          .all() as { observation_id: string }[]
+      ).map((row) => row.observation_id);
+      expect(obsIds).toEqual(["span-after", "span-before"]);
+    } finally {
+      inspectDb.close();
+    }
+
+    // Once the spanning burst itself ages past 14 days, both its aggregate and observations are pruned.
+    store.prune(cutoff + 1_000 + 14 * DAY_MS + 1);
+    expect(store.recentEvents(0, 10)).toEqual([]);
+    const inspectAfterFinalPrune = new Database(dbPath, { readonly: true });
+    try {
+      const remaining = (
+        inspectAfterFinalPrune.query("SELECT COUNT(*) AS n FROM security_events").get() as {
+          n: number;
+        }
+      ).n;
+      expect(remaining).toBe(0);
+    } finally {
+      inspectAfterFinalPrune.close();
+    }
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("two-connection write-transaction contention on claimProposal is atomic and never produces two claims", async () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-lock-contend-"));
+  const dbPath = join(root, "contend.db");
+  const store = new SecurityStore(dbPath);
+  const storeZeroTimeout = new SecurityStore(dbPath);
+  try {
+    // Part 1: busy_timeout = 0 contention check against an active BEGIN IMMEDIATE transaction.
+    store.insertProposal(proposalFixture({ id: "contend-busy", expiresAt: 60_000 }));
+    const zeroDb = (storeZeroTimeout as unknown as { db: Database }).db;
+    zeroDb.run("PRAGMA busy_timeout = 0");
+
+    const rawLocker = new Database(dbPath);
+    try {
+      rawLocker.run("BEGIN IMMEDIATE");
+      expect(() => storeZeroTimeout.claimProposal("contend-busy", 1, 500)).toThrow(
+        /locked|busy/i,
+      );
+      rawLocker.run("ROLLBACK");
+    } finally {
+      rawLocker.close();
+    }
+
+    // After rollback, the proposal is still untouched and can be claimed exactly once.
+    const wonAfterRollback = storeZeroTimeout.claimProposal("contend-busy", 1, 500);
+    expect(wonAfterRollback).not.toBeNull();
+    expect(store.claimProposal("contend-busy", 1, 500)).toBeNull();
+    expect(store.listActions().filter((a) => a.proposalId === "contend-busy")).toHaveLength(1);
+
+    // Part 2: real concurrent child-process contention while parent holds BEGIN IMMEDIATE.
+    store.insertProposal(proposalFixture({ id: "contend-proc-commit", expiresAt: 60_000 }));
+    store.insertProposal(proposalFixture({ id: "contend-proc-rollback", expiresAt: 60_000 }));
+
+    const runChildClaim = async (
+      proposalId: string,
+      whileLocked: (locker: Database) => "commit" | "rollback",
+    ) => {
+      const storeModulePath = resolve("src/security/store.ts");
+      const childScript = `
+        import { SecurityStore } from ${JSON.stringify(storeModulePath)};
+        const store = new SecurityStore(${JSON.stringify(dbPath)});
+        try {
+          console.log("READY");
+          for await (const _line of console) {
+            break;
+          }
+          const action = store.claimProposal(${JSON.stringify(proposalId)}, 1, 500);
+          console.log(JSON.stringify({ action }));
+        } finally {
+          store.close();
+        }
+      `;
+
+      const child = Bun.spawn([process.execPath, "-e", childScript], {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const reader = child.stdout.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (!buffer.includes("READY\n")) {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          const stderrText = await new Response(child.stderr).text();
+          throw new Error(`Child exited before READY: ${stderrText}`);
+        }
+        buffer += decoder.decode(chunk.value, { stream: true });
+      }
+
+      const locker = new Database(dbPath);
+      try {
+        locker.run("BEGIN IMMEDIATE");
+        child.stdin.write("GO\n");
+        child.stdin.end();
+        // Give the child process time to enter BEGIN IMMEDIATE and block on SQLite busy_timeout.
+        await Bun.sleep(150);
+        const outcome = whileLocked(locker);
+        locker.run(outcome === "commit" ? "COMMIT" : "ROLLBACK");
+      } finally {
+        locker.close();
+      }
+
+      let rest = buffer.slice(buffer.indexOf("READY\n") + "READY\n".length);
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        rest += decoder.decode(chunk.value, { stream: true });
+      }
+      const exitCode = await child.exited;
+      const stderrText = await new Response(child.stderr).text();
+      expect(exitCode, `child stderr: ${stderrText}`).toBe(0);
+      return JSON.parse(rest.trim()) as { action: { id: string } | null };
+    };
+
+    // Parent holds write lock, claims proposal and commits -> child waits on busy_timeout, unblocks, sees claimed, returns null.
+    const commitRace = await runChildClaim("contend-proc-commit", (locker) => {
+      const updated = locker
+        .query(
+          `UPDATE lockdown_proposals
+           SET status = 'claimed', revision = revision + 1, updated_at = 500
+           WHERE id = 'contend-proc-commit' AND revision = 1 AND status = 'pending'
+           RETURNING target_json, lease_seconds`,
+        )
+        .get() as { target_json: string; lease_seconds: number };
+      locker
+        .query(
+          `INSERT INTO lockdown_actions (
+            id, proposal_id, idempotency_key, target_json, state,
+            created_at, expires_at, updated_at, rollback_handle
+          ) VALUES (?, 'contend-proc-commit', 'contend-proc-commit:1', ?, 'pending', 500, ?, 500, NULL)`,
+        )
+        .run("parent-action-id", updated.target_json, 500 + updated.lease_seconds * 1_000);
+      return "commit";
+    });
+    expect(commitRace.action).toBeNull();
+    expect(
+      store.listActions().filter((a) => a.proposalId === "contend-proc-commit").map((a) => a.id),
+    ).toEqual(["parent-action-id"]);
+
+    // Parent holds write lock and rolls back -> child waits on busy_timeout, unblocks, and atomically wins the single claim.
+    const rollbackRace = await runChildClaim("contend-proc-rollback", () => "rollback");
+    expect(rollbackRace.action).not.toBeNull();
+    expect(store.claimProposal("contend-proc-rollback", 1, 500)).toBeNull();
+    expect(
+      store.listActions().filter((a) => a.proposalId === "contend-proc-rollback").map((a) => a.id),
+    ).toEqual([rollbackRace.action!.id]);
+  } finally {
+    storeZeroTimeout.close();
+    store.close();
+    rmSync(root, { recursive: true, force: true });
   }
 });

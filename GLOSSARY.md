@@ -52,6 +52,10 @@ _Avoid_: Finding, webhook payload
 A server-configured notification destination and delivery adapter (`in-app`, `desktop`, `ntfy`, `discord`, or `telegram`) with independent retry and delivery status tracking.
 _Avoid_: Alert, generic webhook
 
+**AlertDelivery**:
+A per-`AlertChannel` outbox record for a `SecurityAlert` tracking its delivery status, attempt count, claim lease token, and retry schedule.
+_Avoid_: SecurityAlert, AlertChannel, raw notification
+
 **Corroboration**:
 An expiring deterministic signal—linking a rule, supporting `SecurityEvent` IDs, and an optional containment target—that confirms an active threat condition before autonomous containment is eligible.
 _Avoid_: AI hunch, raw alert
