@@ -609,9 +609,73 @@ test("readBounded throws output limit immediately when stream cancel stalls", as
 test("journal after-cursor fails when command emits a full page and exits non-zero", async () => {
   const realSpawn = Bun.spawn.bind(Bun);
   const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  const scripts = [
+    'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; exit 7',
+    'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; sleep 0.02; exit 7',
+  ];
+
+  try {
+    for (const script of scripts) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+          realSpawn(
+            ["/bin/sh", "-c", script],
+            options as Parameters<typeof Bun.spawn>[1],
+          )) as typeof Bun.spawn);
+        try {
+          const result = await createCommandRunner().run({
+            kind: "journal",
+            after: "s=abc123",
+            limit: 2,
+          });
+          expect(result).toEqual({ status: "failed" });
+        } finally {
+          spawnSpy.mockRestore();
+        }
+      }
+    }
+  } finally {
+    whichSpy.mockRestore();
+  }
+});
+
+test("journal after-cursor fails when command emits a full page and exits with SIGPIPE", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  const scripts = [
+    'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; kill -PIPE $$',
+    'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; sleep 0.02; kill -PIPE $$',
+  ];
+
+  try {
+    for (const script of scripts) {
+      const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+        realSpawn(
+          ["/bin/sh", "-c", script],
+          options as Parameters<typeof Bun.spawn>[1],
+        )) as typeof Bun.spawn);
+      try {
+        const result = await createCommandRunner().run({
+          kind: "journal",
+          after: "s=abc123",
+          limit: 2,
+        });
+        expect(result).toEqual({ status: "failed" });
+      } finally {
+        spawnSpy.mockRestore();
+      }
+    }
+  } finally {
+    whichSpy.mockRestore();
+  }
+});
+
+test("journal after-cursor succeeds when command emits an exact full page and exits zero", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
   const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
     realSpawn(
-      ["/bin/sh", "-c", 'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; exit 7'],
+      ["/bin/sh", "-c", 'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; exit 0'],
       options as Parameters<typeof Bun.spawn>[1],
     )) as typeof Bun.spawn);
 
@@ -621,38 +685,65 @@ test("journal after-cursor fails when command emits a full page and exits non-ze
       after: "s=abc123",
       limit: 2,
     });
-    expect(result).toEqual({ status: "failed" });
+    expect(result).toEqual({
+      status: "ok",
+      stdout: '{"MESSAGE":"one"}\n{"MESSAGE":"two"}',
+      exitCode: 0,
+    });
   } finally {
     spawnSpy.mockRestore();
     whichSpy.mockRestore();
   }
 });
 
-test("journal after-cursor succeeds when runner stops a streaming command at the line limit", async () => {
+test("journal after-cursor succeeds when runner stops a streaming command exceeding the line limit", async () => {
   const realSpawn = Bun.spawn.bind(Bun);
   const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
-  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
-    realSpawn(
-      ["/bin/sh", "-c", 'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; sleep 5'],
-      options as Parameters<typeof Bun.spawn>[1],
-    )) as typeof Bun.spawn);
+  const scripts = [
+    'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n{"MESSAGE":"three"}\\n\'; sleep 5',
+    'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; sleep 0.02; printf \'{"MESSAGE":"three"}\\n\'; sleep 5',
+    'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; while true; do printf \'{"MESSAGE":"more"}\\n\'; done',
+  ];
 
   try {
-    const startedAt = performance.now();
-    const result = await createCommandRunner().run({
-      kind: "journal",
-      after: "s=abc123",
-      limit: 2,
-    });
-    const elapsedMs = performance.now() - startedAt;
-    expect(result).toEqual({
-      status: "ok",
-      stdout: '{"MESSAGE":"one"}\n{"MESSAGE":"two"}',
-      exitCode: 0,
-    });
-    expect(elapsedMs).toBeLessThan(1_000);
+    for (const script of scripts) {
+      let spawned: ReturnType<typeof Bun.spawn> | undefined;
+      const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) => {
+        spawned = realSpawn(
+          ["/bin/sh", "-c", script],
+          options as Parameters<typeof Bun.spawn>[1],
+        );
+        return spawned;
+      }) as typeof Bun.spawn);
+
+      try {
+        const startedAt = performance.now();
+        const result = await createCommandRunner().run({
+          kind: "journal",
+          after: "s=abc123",
+          limit: 2,
+        });
+        const elapsedMs = performance.now() - startedAt;
+        expect(result).toEqual({
+          status: "ok",
+          stdout: '{"MESSAGE":"one"}\n{"MESSAGE":"two"}',
+          exitCode: 0,
+        });
+        expect(elapsedMs).toBeLessThan(1_000);
+        expect(spawned).toBeDefined();
+        expect(spawned!.signalCode).toBe("SIGKILL");
+        let alive = true;
+        try {
+          process.kill(spawned!.pid, 0);
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+      } finally {
+        spawnSpy.mockRestore();
+      }
+    }
   } finally {
-    spawnSpy.mockRestore();
     whichSpy.mockRestore();
   }
 });

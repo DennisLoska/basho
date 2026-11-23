@@ -140,6 +140,15 @@ async function readBoundedJsonLines(
         // Never emit a trailing unterminated/truncated line; only complete newline-delimited records.
         return { text: lines.join("\n"), reachedLimit };
       }
+      if (lines.length >= maxLines) {
+        if (value.byteLength === 0) {
+          continue;
+        }
+        reachedLimit = true;
+        onLimitReached();
+        cancel();
+        return { text: lines.join("\n"), reachedLimit };
+      }
       bytes += value.byteLength;
       if (bytes > maxBytes) {
         cancel();
@@ -153,10 +162,19 @@ async function readBoundedJsonLines(
         if (line.length > 0) {
           lines.push(line);
           if (lines.length >= maxLines) {
-            reachedLimit = true;
-            onLimitReached();
-            cancel();
-            return { text: lines.join("\n"), reachedLimit };
+            const hasTrailingBytesInChunk =
+              pending.length > 0 ||
+              (value.byteLength > 0 && value[value.byteLength - 1] !== 0x0a);
+            if (hasTrailingBytesInChunk) {
+              reachedLimit = true;
+              onLimitReached();
+              cancel();
+              return { text: lines.join("\n"), reachedLimit };
+            }
+            // Exactly maxLines complete lines arrived with no extra bytes yet:
+            // wait for either EOF (honoring the child's actual exit code/signal)
+            // or an additional byte confirming more records exist.
+            break;
           }
         }
         newlineIdx = pending.indexOf("\n");
@@ -600,13 +618,13 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
         const { stdoutResult, stderrResult, exitCode } = outcome;
         const terminatedByLineLimit =
           stoppedByLineLimit &&
-          (proc.signalCode === "SIGKILL" || proc.signalCode === "SIGPIPE");
+          ((proc.signalCode === null && exitCode === 0) || proc.signalCode === "SIGKILL");
 
-        if (terminatedByLineLimit && stdoutResult.ok) {
+        if (terminatedByLineLimit && stdoutResult.ok && stderrResult.ok) {
           return { status: "ok", stdout: stdoutResult.value, exitCode: 0 };
         }
         if (!stdoutResult.ok || !stderrResult.ok) return { status: "failed" };
-        if (recipe.benignExitCodes.includes(exitCode)) {
+        if (proc.signalCode === null && recipe.benignExitCodes.includes(exitCode)) {
           return { status: "ok", stdout: stdoutResult.value, exitCode };
         }
         return { status: "failed" };
