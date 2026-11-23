@@ -217,7 +217,7 @@ export type CommandRequest =
 
 export type CommandResult =
   | { status: "ok"; stdout: string; exitCode: number }
-  | { status: "unavailable" | "timeout" | "overflow" | "failed" };
+  | { status: "unavailable" | "timeout" | "overflow" | "failed" | "cursor_expired" };
 
 export interface CommandRunner {
   run(request: CommandRequest, signal?: AbortSignal): Promise<CommandResult>;

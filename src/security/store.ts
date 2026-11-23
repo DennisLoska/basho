@@ -148,6 +148,12 @@ export interface SecurityStoreContract {
   getCursor(source: string): string | null;
   commitEventBatch(batch: EventBatch): boolean;
   recentEvents(since: number, limit: number, category?: Category): SecurityEvent[];
+  recentObservations(
+    rule: string,
+    target: string,
+    since: number,
+    until?: number,
+  ): SecurityEvent[];
   hourlyEvents(now: number): { hour: number; signal: number; noise: number }[];
   insertProposal(proposal: LockdownProposal): void;
   listProposals(): LockdownProposal[];
@@ -446,15 +452,12 @@ export class SecurityStore implements SecurityStoreContract {
         )
       `);
 
-      const existing = this.db
+      const hasV1 = this.db
         .query("SELECT version FROM schema_migrations WHERE version = 1")
         .get() as { version: number } | null;
-      if (existing) {
-        return;
-      }
-
-      this.db.run(`
-        CREATE TABLE scans (
+      if (!hasV1) {
+        this.db.run(`
+          CREATE TABLE scans (
           id TEXT PRIMARY KEY,
           trigger_kind TEXT NOT NULL,
           started_at INTEGER NOT NULL,
@@ -670,6 +673,20 @@ export class SecurityStore implements SecurityStoreContract {
       this.db
         .query("INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)")
         .run(Date.now());
+      }
+
+      const hasV2 = this.db
+        .query("SELECT version FROM schema_migrations WHERE version = 2")
+        .get() as { version: number } | null;
+      if (!hasV2) {
+        this.db.run(`
+          CREATE INDEX IF NOT EXISTS idx_security_events_obs_rule_target
+          ON security_events(row_kind, rule, target, last_at DESC)
+        `);
+        this.db
+          .query("INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)")
+          .run(Date.now());
+      }
     });
   }
 
@@ -1180,6 +1197,59 @@ export class SecurityStore implements SecurityStoreContract {
                LIMIT ?`,
             )
             .all(since, limit)
+    ) as SecurityEventRow[];
+
+    return rows.map((row) => {
+      const payload = JSON.parse(row.payload_json) as { summary: string };
+      return {
+        id: row.event_id,
+        source: row.source,
+        category: row.category,
+        severity: row.severity,
+        rule: row.rule,
+        target: row.target,
+        firstAt: row.first_at,
+        lastAt: row.last_at,
+        count: row.count,
+        isNoise: row.is_noise === 1,
+        summary: payload.summary,
+      };
+    });
+  }
+
+  recentObservations(
+    rule: string,
+    target: string,
+    since: number,
+    until?: number,
+  ): SecurityEvent[] {
+    const rows = (
+      until !== undefined
+        ? this.db
+            .query(
+              `SELECT row_id, event_id, source, category, severity, rule, target,
+                      first_at, last_at, count, is_noise, payload_json
+               FROM security_events
+               WHERE row_kind = 'observation'
+                 AND rule = ?
+                 AND target = ?
+                 AND last_at >= ?
+                 AND last_at <= ?
+               ORDER BY last_at DESC, row_id DESC`,
+            )
+            .all(rule, target, since, until)
+        : this.db
+            .query(
+              `SELECT row_id, event_id, source, category, severity, rule, target,
+                      first_at, last_at, count, is_noise, payload_json
+               FROM security_events
+               WHERE row_kind = 'observation'
+                 AND rule = ?
+                 AND target = ?
+                 AND last_at >= ?
+               ORDER BY last_at DESC, row_id DESC`,
+            )
+            .all(rule, target, since)
     ) as SecurityEventRow[];
 
     return rows.map((row) => {

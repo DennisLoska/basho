@@ -17,8 +17,6 @@ import type {
 const JOURNAL_PAGE_LIMIT = 200;
 const BURST_WINDOW_MS = 300_000;
 const SSH_BURST_THRESHOLD = 5;
-const MAX_TRACKED_SSH_PEERS = 5_000;
-const MAX_OBSERVATIONS_PER_PEER = 500;
 
 const SYSTEMD_UNIT_SUFFIXES = [
   ".service",
@@ -229,18 +227,8 @@ function isLoopbackIp(canonicalIp: string): boolean {
   return false;
 }
 
-function isMulticastIp(canonicalIp: string): boolean {
-  const v4 = parseIpv4ToUint32(canonicalIp);
-  if (v4 !== null) {
-    // 224.0.0.0/4
-    return ((v4 & 0xf0000000) >>> 0) === 0xe0000000;
-  }
-  const groups = parseIpv6Groups(canonicalIp);
-  if (groups) {
-    // ff00::/8
-    return (groups[0]! & 0xff00) === 0xff00;
-  }
-  return false;
+function isFirewallNoiseMulticastIp(canonicalIp: string): boolean {
+  return canonicalIp === "224.0.0.1" || canonicalIp === "ff02::1";
 }
 
 function isTailnetIp(canonicalIp: string): boolean {
@@ -293,6 +281,14 @@ function isLoopbackListener(listener: Listener): boolean {
 function deterministicJournalEventId(cursor: string): string {
   const digest = createHash("sha256").update(cursor).digest("hex").slice(0, 24);
   return `journal:${digest}`;
+}
+
+function deterministicJournalGapId(previousCursor: string, nextCursor: string): string {
+  const digest = createHash("sha256")
+    .update(`${previousCursor}\0${nextCursor}`)
+    .digest("hex")
+    .slice(0, 24);
+  return `journal:cursor_gap:${digest}`;
 }
 
 function parseRealtimeTimestampMs(raw: unknown): number | null {
@@ -379,7 +375,8 @@ function parseUfwBlockEvent(
     }
   }
 
-  const isNoise = isMulticastIp(dstIp) || isLoopbackIp(srcIp) || isLoopbackIp(dstIp);
+  const isNoise =
+    isFirewallNoiseMulticastIp(dstIp) || isLoopbackIp(srcIp) || isLoopbackIp(dstIp);
   const summary =
     port !== null
       ? `UFW blocked ${proto} traffic from ${srcIp} to port ${port}`
@@ -695,6 +692,40 @@ function matchEnrolledWorkload(
   return matches.length === 1 ? matches[0]! : null;
 }
 
+interface ParsedProcessRow {
+  pid: number;
+  startedAt: number;
+  comm: string;
+}
+
+function parseProcessRows(stdout: string, nowMs: number): Map<number, ParsedProcessRow> {
+  const map = new Map<number, ParsedProcessRow>();
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const match = /^(\d+)\s+\d+\s+\d+\s+(\d+)\s+(.+)$/.exec(line);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const etimes = Number(match[2]);
+    const comm = match[3]!.trim();
+    if (
+      !Number.isSafeInteger(pid) ||
+      pid <= 0 ||
+      !Number.isSafeInteger(etimes) ||
+      etimes < 0 ||
+      comm.length === 0
+    ) {
+      continue;
+    }
+    const startedAt = nowMs - etimes * 1000;
+    if (!Number.isSafeInteger(startedAt)) {
+      continue;
+    }
+    map.set(pid, { pid, startedAt, comm });
+  }
+  return map;
+}
+
 // ---------------------------------------------------------------------------
 // EventMonitor
 // ---------------------------------------------------------------------------
@@ -705,8 +736,6 @@ export class EventMonitor {
   private readonly clock: Clock;
   private readonly workloads: readonly EnrolledWorkload[];
 
-  /** Exact SSH auth failure observations per canonical peer IP: peerIp -> (eventId -> timestampMs). */
-  private readonly sshObservations = new Map<string, Map<string, number>>();
   private hasSocketBaseline = false;
   private socketBaseline = new Map<string, Listener[]>();
   private socketPollSeq = 0;
@@ -720,7 +749,7 @@ export class EventMonitor {
 
   async pollJournal(signal?: AbortSignal): Promise<MonitorResult> {
     const previous = this.store.getCursor("journal");
-    const result = await this.runner.run(
+    let result = await this.runner.run(
       {
         kind: "journal",
         after: previous ?? undefined,
@@ -728,6 +757,19 @@ export class EventMonitor {
       },
       signal,
     );
+
+    let cursorRecovered = false;
+    if (result.status === "cursor_expired" && previous !== null) {
+      cursorRecovered = true;
+      result = await this.runner.run(
+        {
+          kind: "journal",
+          after: undefined,
+          limit: JOURNAL_PAGE_LIMIT,
+        },
+        signal,
+      );
+    }
 
     if (result.status !== "ok") {
       return {
@@ -759,13 +801,34 @@ export class EventMonitor {
       }
     }
 
-    const coverage: Coverage = malformed ? "partial" : "complete";
+    const coverage: Coverage = malformed || cursorRecovered ? "partial" : "complete";
     if (lastCursor === null) {
       return { alerts: [], corroboration: [], coverage };
     }
 
+    const now = this.clock.now();
+    const batchEvents: SecurityEvent[] = cursorRecovered
+      ? [
+          {
+            id: deterministicJournalGapId(previous!, lastCursor),
+            source: "journal",
+            category: "units",
+            severity: "warning",
+            rule: "journal_cursor_gap",
+            target: "journald",
+            firstAt: now,
+            lastAt: now,
+            count: 1,
+            isNoise: false,
+            summary:
+              "Journal cursor expired; recovered from bounded recent window with potential telemetry gap",
+          },
+          ...events,
+        ]
+      : events;
+
     const committed = this.store.commitEventBatch({
-      events,
+      events: batchEvents,
       cursor: {
         source: "journal",
         expected: previous,
@@ -778,7 +841,6 @@ export class EventMonitor {
       return { alerts: [], corroboration: [], coverage: "partial" };
     }
 
-    const now = this.clock.now();
     const windowStart = now - BURST_WINDOW_MS;
     const alerts: SecurityAlert[] = [];
     const seenAlertFingerprints = new Set<string>();
@@ -788,7 +850,6 @@ export class EventMonitor {
 
     for (const event of events) {
       if (event.rule === "ssh_auth_failure") {
-        this.recordSshObservation(event.target, event.id, event.lastAt);
         affectedSshPeers.add(event.target);
         continue;
       }
@@ -811,21 +872,13 @@ export class EventMonitor {
       }
     }
 
-    this.pruneSshObservations(windowStart);
-
     for (const peer of affectedSshPeers) {
       if (isProtectedPeerIp(peer)) continue;
-      const peerObs = this.sshObservations.get(peer);
-      if (!peerObs) continue;
+      const inWindow = this.store.recentObservations("ssh_auth_failure", peer, windowStart, now);
+      const totalFailures = inWindow.reduce((sum, obs) => sum + obs.count, 0);
 
-      const inWindowIds: string[] = [];
-      for (const [eventId, at] of peerObs.entries()) {
-        if (at >= windowStart && at <= now) {
-          inWindowIds.push(eventId);
-        }
-      }
-
-      if (inWindowIds.length >= SSH_BURST_THRESHOLD) {
+      if (totalFailures >= SSH_BURST_THRESHOLD) {
+        const inWindowIds = inWindow.map((obs) => obs.id);
         corroboration.push({
           rule: "ssh_burst",
           eventIds: inWindowIds,
@@ -840,7 +893,7 @@ export class EventMonitor {
             id: `alert:ssh_burst:${peer}:${now}`,
             fingerprint,
             severity: "critical",
-            summary: `SSH authentication failure burst from ${peer} (${inWindowIds.length} failures in 5m)`,
+            summary: `SSH authentication failure burst from ${peer} (${totalFailures} failures in 5m)`,
             createdAt: now,
           });
         }
@@ -909,6 +962,22 @@ export class EventMonitor {
     const alerts: SecurityAlert[] = [];
     const corroboration: Corroboration[] = [];
     const seenAlertFingerprints = new Set<string>();
+    let processesLoaded = false;
+    let processMap: Map<number, ParsedProcessRow> | null = null;
+    let coverage: Coverage = "complete";
+
+    const getProcessTable = async (): Promise<Map<number, ParsedProcessRow> | null> => {
+      if (processesLoaded) return processMap;
+      processesLoaded = true;
+      const procResult = await this.runner.run({ kind: "processes" }, signal);
+      if (procResult.status !== "ok") {
+        coverage = "partial";
+        processMap = null;
+        return null;
+      }
+      processMap = parseProcessRows(procResult.stdout, now);
+      return processMap;
+    };
 
     // Newly opened non-loopback listeners
     for (const [key, openedListeners] of currentNonLoopback.entries()) {
@@ -948,7 +1017,19 @@ export class EventMonitor {
         const matchedListener = unexpectedExposed.listener;
         const workload = matchEnrolledWorkload(matchedListener, this.workloads);
 
-        if (workload && matchedListener.pid !== undefined) {
+        let verifiedProcess: ParsedProcessRow | null = null;
+        if (workload && matchedListener.pid !== undefined && matchedListener.process) {
+          const table = await getProcessTable();
+          const candidate = table?.get(matchedListener.pid);
+          if (
+            candidate &&
+            candidate.comm.toLowerCase() === matchedListener.process.trim().toLowerCase()
+          ) {
+            verifiedProcess = candidate;
+          }
+        }
+
+        if (workload && verifiedProcess !== null) {
           corroboration.push({
             rule: "unexpected_workload",
             eventIds: [eventId],
@@ -956,8 +1037,8 @@ export class EventMonitor {
             target: {
               kind: "pause_workload",
               workloadId: workload.id,
-              pid: matchedListener.pid,
-              startedAt: now,
+              pid: verifiedProcess.pid,
+              startedAt: verifiedProcess.startedAt,
             },
           });
 
@@ -1024,48 +1105,6 @@ export class EventMonitor {
     }
 
     this.socketBaseline = currentNonLoopback;
-    return { alerts, corroboration, coverage: "complete" };
-  }
-
-  private recordSshObservation(peer: string, eventId: string, at: number): void {
-    let entries = this.sshObservations.get(peer);
-    if (!entries) {
-      if (this.sshObservations.size >= MAX_TRACKED_SSH_PEERS) {
-        const oldestKey = this.sshObservations.keys().next().value;
-        if (oldestKey !== undefined) {
-          this.sshObservations.delete(oldestKey);
-        }
-      }
-      entries = new Map<string, number>();
-      this.sshObservations.set(peer, entries);
-    }
-
-    entries.set(eventId, at);
-    if (entries.size > MAX_OBSERVATIONS_PER_PEER) {
-      let oldestId: string | undefined;
-      let oldestAt = Infinity;
-      for (const [id, ts] of entries.entries()) {
-        if (ts < oldestAt) {
-          oldestAt = ts;
-          oldestId = id;
-        }
-      }
-      if (oldestId !== undefined) {
-        entries.delete(oldestId);
-      }
-    }
-  }
-
-  private pruneSshObservations(windowStart: number): void {
-    for (const [peer, entries] of this.sshObservations.entries()) {
-      for (const [eventId, at] of entries.entries()) {
-        if (at < windowStart) {
-          entries.delete(eventId);
-        }
-      }
-      if (entries.size === 0) {
-        this.sshObservations.delete(peer);
-      }
-    }
+    return { alerts, corroboration, coverage };
   }
 }

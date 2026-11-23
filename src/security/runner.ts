@@ -28,6 +28,17 @@ const SYSTEMD_UNIT_SUFFIXES = [
 
 const JOURNAL_CURSOR_PATTERN = /^[A-Za-z0-9=;_:.,-]{1,512}$/;
 
+const EXPIRED_JOURNAL_CURSOR_PATTERNS = [
+  /failed to seek to cursor/i,
+  /cannot seek.*cursor/i,
+  /cursor.*(?:not found|expired|cannot seek|invalid)/i,
+  /(?:invalid|expired|missing)\s+cursor/i,
+] as const;
+
+function isExpiredJournalCursorStderr(stderr: string): boolean {
+  return EXPIRED_JOURNAL_CURSOR_PATTERNS.some((pattern) => pattern.test(stderr));
+}
+
 const USER_RUNTIME_ENV_KEYS = [
   "XDG_RUNTIME_DIR",
   "DBUS_SESSION_BUS_ADDRESS",
@@ -769,6 +780,15 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
             return { status: "failed" };
           }
           return { status: "ok", stdout: stdoutResult.value, exitCode };
+        }
+        if (
+          request.kind === "journal" &&
+          request.after !== undefined &&
+          proc.signalCode === null &&
+          exitCode !== 0 &&
+          isExpiredJournalCursorStderr(stderrResult.value)
+        ) {
+          return { status: "cursor_expired" };
         }
         return { status: "failed" };
       } finally {

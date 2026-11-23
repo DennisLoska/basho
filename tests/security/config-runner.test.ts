@@ -1369,3 +1369,56 @@ test("block_devices recipe requests MOUNTPOINTS column from lsblk", async () => 
     whichSpy.mockRestore();
   }
 });
+
+test("journal after-cursor classifies expired or missing cursor stderr as cursor_expired without leaking stderr", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockImplementation((cmd) =>
+    cmd === "journalctl" ? "/usr/bin/journalctl" : null,
+  );
+
+  const runJournal = async (script: string, after?: string) => {
+    const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+      realSpawn(
+        ["/bin/sh", "-c", script],
+        options as Parameters<typeof Bun.spawn>[1],
+      )) as typeof Bun.spawn);
+    try {
+      return await createCommandRunner().run({ kind: "journal", after, limit: 10 });
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  };
+
+  try {
+    const expiredMessages = [
+      "Failed to seek to cursor: Cannot assign requested address",
+      "Failed to seek to cursor: Invalid argument",
+      "journalctl: cursor not found in journal",
+      "journalctl: cursor expired",
+      "journalctl: cannot seek to cursor",
+      "journalctl: invalid cursor format",
+    ];
+
+    for (const msg of expiredMessages) {
+      const result = await runJournal(`printf '%s\\n' '${msg}' >&2; exit 1`, "s=abc123;i=1");
+      expect(result).toEqual({ status: "cursor_expired" });
+      expect(Object.keys(result)).toEqual(["status"]);
+    }
+
+    // Unrelated non-zero failure on after-cursor remains "failed".
+    const permissionDenied = await runJournal(
+      "printf 'Hint: You are currently not seeing messages from other users.\\n' >&2; exit 1",
+      "s=abc123;i=1",
+    );
+    expect(permissionDenied).toEqual({ status: "failed" });
+
+    // Without `after`, cursor stderr does not trigger cursor_expired.
+    const withoutAfter = await runJournal(
+      "printf 'Failed to seek to cursor: Invalid argument\\n' >&2; exit 1",
+      undefined,
+    );
+    expect(withoutAfter).toEqual({ status: "failed" });
+  } finally {
+    whichSpy.mockRestore();
+  }
+});

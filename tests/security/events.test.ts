@@ -755,7 +755,10 @@ describe("EventMonitor.pollSockets", () => {
       { id: "comfy", unit: "comfy.service", name: "comfy", ports: [8188] },
     ];
     let poll = 0;
-    const runner = runnerStub(() => {
+    const runner = runnerStub((request) => {
+      if (request.kind === "processes") {
+        return ok("  4242     1  1000   120 comfy\n");
+      }
       poll += 1;
       return poll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WORKLOAD);
     });
@@ -923,6 +926,262 @@ describe("EventMonitor edge cases", () => {
       expect(result.corroboration[0]?.target).toBeUndefined();
     } finally {
       store.close();
+    }
+  });
+
+  test("does not mark non-listed multicast firewall blocks such as SSDP 239.255.255.250 as noise", () => {
+    const nonNoiseMulticast = [
+      "[UFW BLOCK] IN=eth0 OUT= MAC=aa:bb:cc:dd:ee:ff SRC=198.51.100.42 DST=239.255.255.250 LEN=60 PROTO=UDP SPT=51234 DPT=1900",
+      "[UFW BLOCK] IN=eth0 OUT= MAC=aa:bb:cc:dd:ee:ff SRC=198.51.100.42 DST=224.0.0.251 LEN=60 PROTO=UDP SPT=5353 DPT=5353",
+      "[UFW BLOCK] IN=eth0 OUT= MAC=aa:bb:cc:dd:ee:ff SRC=2001:db8::9 DST=ff02::2 LEN=80 PROTO=58",
+    ];
+
+    for (const [index, message] of nonNoiseMulticast.entries()) {
+      const event = parsedEvent(
+        jline({
+          __CURSOR: `s=non-noise-mcast;i=${index}`,
+          _TRANSPORT: "kernel",
+          SYSLOG_IDENTIFIER: "kernel",
+          MESSAGE: message,
+        }),
+      );
+
+      expect(event.category).toBe("firewall");
+      expect(event.isNoise).toBe(false);
+    }
+  });
+
+  test("recovers from an expired journal cursor via bounded recent window with gap notice and partial coverage", async () => {
+    const store = memoryStore();
+    const requests: CommandRequest[] = [];
+    let stage = 0;
+    const runner = runnerStub((request) => {
+      stage += 1;
+      if (stage === 1) {
+        return journalPage([
+          jline({
+            __CURSOR: "s=expired;i=1",
+            SYSLOG_IDENTIFIER: "cron",
+            MESSAGE: "(root) CMD (true)",
+          }),
+        ]);
+      }
+      if (stage === 2) {
+        expect(request).toEqual({ kind: "journal", after: "s=expired;i=1", limit: 200 });
+        return { status: "cursor_expired" };
+      }
+      if (stage === 3) {
+        expect(request).toEqual({ kind: "journal", after: undefined, limit: 200 });
+        return journalPage([
+          jline({
+            __CURSOR: "s=recovered;i=9",
+            SYSLOG_IDENTIFIER: "sshd",
+            MESSAGE: sshFailureMessage(PEER),
+          }),
+        ]);
+      }
+      return ok("");
+    }, requests);
+    const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW) });
+
+    try {
+      const initial = await monitor.pollJournal();
+      expect(initial.coverage).toBe("complete");
+      expect(store.getCursor("journal")).toBe("s=expired;i=1");
+
+      const recovered = await monitor.pollJournal();
+      expect(recovered.coverage).toBe("partial");
+      expect(store.getCursor("journal")).toBe("s=recovered;i=9");
+
+      const stored = store.recentEvents(0, 50);
+      const gapEvent = stored.find((event) => event.rule === "journal_cursor_gap");
+      expect(gapEvent).toBeDefined();
+      expect(gapEvent!.source).toBe("journal");
+      expect(gapEvent!.isNoise).toBe(false);
+      expect(gapEvent!.severity).toBe("warning");
+      expect(authEventTotal(store, PEER)).toBe(1);
+
+      await monitor.pollJournal();
+      expect(requests[3]).toEqual({ kind: "journal", after: "s=recovered;i=9", limit: 200 });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("aborts expired-cursor recovery atomically on cursor CAS mismatch without writing gap or recovered events", async () => {
+    const store = memoryStore();
+    let stage = 0;
+    const runner = runnerStub(() => {
+      stage += 1;
+      if (stage === 1) {
+        return journalPage([
+          jline({
+            __CURSOR: "s=cas-old;i=1",
+            SYSLOG_IDENTIFIER: "cron",
+            MESSAGE: "(root) CMD (true)",
+          }),
+        ]);
+      }
+      if (stage === 2) {
+        return { status: "cursor_expired" };
+      }
+      // Simulate a concurrent poller advancing the cursor before recovery commits.
+      const raced = store.commitEventBatch({
+        events: [],
+        cursor: { source: "journal", expected: "s=cas-old;i=1", next: "s=cas-winner;i=99" },
+        burstWindowMs: 300_000,
+      });
+      expect(raced).toBe(true);
+
+      return journalPage([
+        jline({
+          __CURSOR: "s=cas-stale-recovery;i=5",
+          SYSLOG_IDENTIFIER: "sshd",
+          MESSAGE: sshFailureMessage(PEER),
+        }),
+      ]);
+    });
+    const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW) });
+
+    try {
+      await monitor.pollJournal();
+      expect(store.getCursor("journal")).toBe("s=cas-old;i=1");
+
+      const result = await monitor.pollJournal();
+      expect(result).toEqual({ alerts: [], corroboration: [], coverage: "partial" });
+      expect(store.getCursor("journal")).toBe("s=cas-winner;i=99");
+      expect(store.recentEvents(0, 50)).toEqual([]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("persists the 5-minute SSH failure window across EventMonitor restarts", async () => {
+    const store = memoryStore();
+    const firstRunner = runnerStub(() =>
+      journalPage([
+        jline({
+          __CURSOR: "s=restart;i=1",
+          __REALTIME_TIMESTAMP: String((NOW - 120 * SECOND_MS) * 1000),
+          MESSAGE: sshFailureMessage(PEER),
+        }),
+        jline({
+          __CURSOR: "s=restart;i=2",
+          __REALTIME_TIMESTAMP: String((NOW - 90 * SECOND_MS) * 1000),
+          MESSAGE: sshFailureMessage(PEER),
+        }),
+        jline({
+          __CURSOR: "s=restart;i=3",
+          __REALTIME_TIMESTAMP: String((NOW - 60 * SECOND_MS) * 1000),
+          MESSAGE: sshFailureMessage(PEER),
+        }),
+      ]),
+    );
+    const secondRunner = runnerStub(() =>
+      journalPage([
+        jline({
+          __CURSOR: "s=restart;i=4",
+          __REALTIME_TIMESTAMP: String((NOW - 30 * SECOND_MS) * 1000),
+          MESSAGE: sshFailureMessage(PEER),
+        }),
+        jline({
+          __CURSOR: "s=restart;i=5",
+          __REALTIME_TIMESTAMP: String(NOW * 1000),
+          MESSAGE: sshFailureMessage(PEER),
+        }),
+      ]),
+    );
+
+    const monitor1 = new EventMonitor({ store, runner: firstRunner, clock: clockAt(NOW) });
+    const monitor2 = new EventMonitor({ store, runner: secondRunner, clock: clockAt(NOW) });
+
+    try {
+      const first = await monitor1.pollJournal();
+      expect(first.corroboration.some((entry) => entry.rule === "ssh_burst")).toBe(false);
+
+      const second = await monitor2.pollJournal();
+      const burst = second.corroboration.find((entry) => entry.rule === "ssh_burst");
+      expect(burst).toBeDefined();
+      expect(burst!.target).toEqual({ kind: "deny_peer_ip", ip: PEER });
+      expect(burst!.eventIds).toHaveLength(5);
+      expect(second.alerts.some((alert) => alert.fingerprint === `ssh_burst:${PEER}`)).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("computes pause_workload startedAt from real ps etimes instead of fabricating now", async () => {
+    const store = memoryStore();
+    const workloads: EnrolledWorkload[] = [
+      { id: "comfy", unit: "comfy.service", name: "comfy", ports: [8188] },
+    ];
+    const etimesSeconds = 345;
+    let socketPoll = 0;
+    const runner = runnerStub((request) => {
+      if (request.kind === "processes") {
+        return ok(`  4242     1  1000   ${etimesSeconds} comfy\n`);
+      }
+      socketPoll += 1;
+      return socketPoll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WORKLOAD);
+    });
+    const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW), workloads });
+
+    try {
+      await monitor.pollSockets(async (listeners) => benignEntries(listeners));
+      const result = await monitor.pollSockets(async (listeners) =>
+        unexpectedEntries(listeners),
+      );
+
+      const corroborated = result.corroboration.find(
+        (entry) => entry.rule === "unexpected_workload",
+      );
+      expect(corroborated).toBeDefined();
+      expect(corroborated!.target).toEqual({
+        kind: "pause_workload",
+        workloadId: "comfy",
+        pid: 4242,
+        startedAt: NOW - etimesSeconds * 1000,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("falls back to unexpected_listener without a target when processes is unavailable, missing PID, or comm mismatches", async () => {
+    const workloads: EnrolledWorkload[] = [
+      { id: "comfy", unit: "comfy.service", name: "comfy", ports: [8188] },
+    ];
+    const cases: { label: string; processResult: CommandResult }[] = [
+      { label: "processes unavailable", processResult: { status: "unavailable" } },
+      { label: "PID missing from ps", processResult: ok("  1111     1  1000    90 node\n") },
+      { label: "PID comm mismatch", processResult: ok("  4242     1  1000    90 python3\n") },
+    ];
+
+    for (const testCase of cases) {
+      const store = memoryStore();
+      let socketPoll = 0;
+      const runner = runnerStub((request) => {
+        if (request.kind === "processes") {
+          return testCase.processResult;
+        }
+        socketPoll += 1;
+        return socketPoll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WORKLOAD);
+      });
+      const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW), workloads });
+
+      try {
+        await monitor.pollSockets(async (listeners) => benignEntries(listeners));
+        const result = await monitor.pollSockets(async (listeners) =>
+          unexpectedEntries(listeners),
+        );
+
+        expect(result.alerts.length).toBeGreaterThan(0);
+        expect(result.corroboration).toHaveLength(1);
+        expect(result.corroboration[0]?.rule).toBe("unexpected_listener");
+        expect(result.corroboration[0]?.target).toBeUndefined();
+      } finally {
+        store.close();
+      }
     }
   });
 });

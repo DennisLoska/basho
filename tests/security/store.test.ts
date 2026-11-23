@@ -2555,3 +2555,58 @@ test("commitEventBatch caches per-hour totals by (hourBucket, isNoise) without d
     store.close();
   }
 });
+
+test("recentObservations queries exact observation rows by rule, target, and time window", () => {
+  const store = new SecurityStore(":memory:");
+  try {
+    const base = 1_796_000_000_000;
+    expect(
+      store.commitEventBatch({
+        events: [
+          eventFixture("obs-old", base - 360_000, {
+            rule: "ssh_auth_failure",
+            target: "198.51.100.42",
+          }),
+          eventFixture("obs-in-1", base - 200_000, {
+            rule: "ssh_auth_failure",
+            target: "198.51.100.42",
+          }),
+          eventFixture("obs-in-2", base - 60_000, {
+            rule: "ssh_auth_failure",
+            target: "198.51.100.42",
+          }),
+          eventFixture("obs-future", base + 10_000, {
+            rule: "ssh_auth_failure",
+            target: "198.51.100.42",
+          }),
+          eventFixture("obs-other-target", base - 60_000, {
+            rule: "ssh_auth_failure",
+            target: "203.0.113.7",
+          }),
+          eventFixture("obs-other-rule", base - 60_000, {
+            rule: "ufw_block",
+            target: "198.51.100.42",
+          }),
+        ],
+        burstWindowMs: 300_000,
+      }),
+    ).toBe(true);
+
+    // Even though all 4 observations for 198.51.100.42 merged into a single aggregate,
+    // recentObservations returns individual observation rows within [since, until].
+    expect(store.recentEvents(0, 20).filter((e) => e.rule === "ssh_auth_failure" && e.target === "198.51.100.42")).toHaveLength(1);
+
+    const sinceOnly = store.recentObservations("ssh_auth_failure", "198.51.100.42", base - 300_000);
+    expect(sinceOnly.map((e) => e.id).sort()).toEqual(["obs-future", "obs-in-1", "obs-in-2"]);
+
+    const bounded = store.recentObservations(
+      "ssh_auth_failure",
+      "198.51.100.42",
+      base - 300_000,
+      base,
+    );
+    expect(bounded.map((e) => e.id).sort()).toEqual(["obs-in-1", "obs-in-2"]);
+  } finally {
+    store.close();
+  }
+});
