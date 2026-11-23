@@ -155,6 +155,8 @@ export interface UserWorkloadLockdownAdapterOptions {
   clock?: Clock;
   timeoutMs?: number;
   exec?: SubprocessExecutor;
+  resolveProcess?: ResolveProcess;
+  currentUid?: number;
 }
 
 export interface CompositeLockdownAdapterOptions {
@@ -162,6 +164,8 @@ export interface CompositeLockdownAdapterOptions {
   workload?: LockdownAdapter;
   getWorkloads?: () => readonly EnrolledWorkload[];
   clock?: Clock;
+  resolveProcess?: ResolveProcess;
+  currentUid?: number;
 }
 
 type ParsedIp =
@@ -684,6 +688,7 @@ export class LockdownEngine {
   private readonly resolveProcess: ResolveProcess;
   private readonly currentUid: number;
   private readonly observedWorkloads = new Map<string, ProcessIdentity>();
+  private readonly inFlightActions = new Set<string>();
 
   constructor(options: LockdownEngineOptions) {
     this.store = options.store;
@@ -729,16 +734,23 @@ export class LockdownEngine {
   private async applyClaimedAction(
     action: LockdownAction,
   ): Promise<{ succeeded: boolean; action: LockdownAction }> {
+    this.inFlightActions.add(action.id);
     try {
       const applied = await this.adapter.apply(action);
       const updatedAt = this.clock.now();
-      this.store.transitionAction(
+      const transitioned = this.store.transitionAction(
         action.id,
         "pending",
         "active",
         updatedAt,
         applied.handle,
       );
+      if (!transitioned) {
+        const current =
+          this.store.listActions().find((entry) => entry.id === action.id) ??
+          action;
+        return { succeeded: false, action: current };
+      }
       return {
         succeeded: true,
         action: {
@@ -751,6 +763,8 @@ export class LockdownEngine {
     } catch {
       // Leave the action in "pending" state so reconcile() can inspect and settle it.
       return { succeeded: false, action };
+    } finally {
+      this.inFlightActions.delete(action.id);
     }
   }
 
@@ -967,33 +981,52 @@ export class LockdownEngine {
     if (action.state !== "active" && action.state !== "rolling_back") {
       return false;
     }
-
-    if (action.state === "active") {
-      const transitioned = this.store.transitionAction(
-        action.id,
-        "active",
-        "rolling_back",
-        this.clock.now(),
-      );
-      if (!transitioned) {
-        return false;
-      }
+    if (this.inFlightActions.has(action.id)) {
+      return false;
     }
 
-    return this.attemptRollback({ ...action, state: "rolling_back" });
+    this.inFlightActions.add(action.id);
+    try {
+      if (action.state === "active") {
+        const transitioned = this.store.transitionAction(
+          action.id,
+          "active",
+          "rolling_back",
+          this.clock.now(),
+        );
+        if (!transitioned) {
+          return false;
+        }
+      }
+
+      return await this.executeRollback({ ...action, state: "rolling_back" });
+    } finally {
+      this.inFlightActions.delete(action.id);
+    }
   }
 
   private async attemptRollback(action: LockdownAction): Promise<boolean> {
+    if (this.inFlightActions.has(action.id)) {
+      return false;
+    }
+    this.inFlightActions.add(action.id);
+    try {
+      return await this.executeRollback(action);
+    } finally {
+      this.inFlightActions.delete(action.id);
+    }
+  }
+
+  private async executeRollback(action: LockdownAction): Promise<boolean> {
     try {
       const result = await this.adapter.rollback(action);
       if (result.state === "absent") {
-        this.store.transitionAction(
+        return this.store.transitionAction(
           action.id,
           "rolling_back",
           "rolled_back",
           this.clock.now(),
         );
-        return true;
       }
       return false;
     } catch {
@@ -1019,6 +1052,10 @@ export class LockdownEngine {
 
     const actions = this.store.listActions();
     for (const action of actions) {
+      if (this.inFlightActions.has(action.id)) {
+        continue;
+      }
+
       if (action.state === "pending") {
         let inspected: LockdownInspectResult;
         try {
@@ -1027,16 +1064,20 @@ export class LockdownEngine {
           inspected = { state: "unknown" };
         }
 
+        if (this.inFlightActions.has(action.id)) {
+          continue;
+        }
+
         if (inspected.state === "active") {
           const updatedAt = this.clock.now();
-          this.store.transitionAction(
+          const transitioned = this.store.transitionAction(
             action.id,
             "pending",
             "active",
             updatedAt,
             inspected.handle,
           );
-          if (action.expiresAt <= updatedAt) {
+          if (transitioned && action.expiresAt <= updatedAt) {
             const moved = this.store.transitionAction(
               action.id,
               "active",
@@ -1272,6 +1313,9 @@ export function createUserWorkloadLockdownAdapter(
   const clock = options.clock ?? { now: () => Date.now() };
   const timeoutMs = options.timeoutMs ?? DEFAULT_ADAPTER_TIMEOUT_MS;
   const exec = options.exec ?? defaultSubprocessExec;
+  const resolveProcess = options.resolveProcess ?? createProcProcessResolver(exec);
+  const currentUid = options.currentUid ?? defaultUid();
+  const guard = new DeadMansSwitch();
 
   const resolveUnit = (action: LockdownAction): string | null => {
     if (action.target.kind !== "pause_workload") return null;
@@ -1321,10 +1365,33 @@ export function createUserWorkloadLockdownAdapter(
 
     async apply(action: LockdownAction): Promise<LockdownApplyResult> {
       const opId = assertSafeOpId(action.id);
+      if (action.target.kind !== "pause_workload") {
+        throw new Error(`Unsupported target for user workload adapter: ${action.target.kind}`);
+      }
       const unit = resolveUnit(action);
       if (!unit) {
         throw new Error(`Enrolled unit not found for action ${opId}`);
       }
+
+      // Re-verify live PID identity and enrolled user-unit ownership immediately
+      // before arming the thaw timer or freezing the unit.
+      let liveProcess: ProcessIdentity | null = null;
+      try {
+        liveProcess = await resolveProcess(action.target.pid);
+      } catch {
+        liveProcess = null;
+      }
+      const identityValid = guard.allows(action.target, {
+        workloads: options.getWorkloads(),
+        currentProcess: liveProcess,
+        currentUid,
+      });
+      if (!identityValid) {
+        throw new Error(
+          `Workload process identity or unit ownership drifted before freeze for action ${opId}`,
+        );
+      }
+
       const ttl = clampLeaseSeconds(action.expiresAt, clock.now());
       const timerUnit = safeTimerUnitName(opId);
 
@@ -1424,6 +1491,8 @@ export function createCompositeLockdownAdapter(
     createUserWorkloadLockdownAdapter({
       getWorkloads: options.getWorkloads ?? (() => []),
       clock: options.clock,
+      resolveProcess: options.resolveProcess,
+      currentUid: options.currentUid,
     });
 
   const pick = (target: ContainmentTarget): LockdownAdapter =>

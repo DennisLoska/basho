@@ -1019,6 +1019,44 @@ describe("LockdownEngine.reconcile", () => {
 
     expect(onlyProposal(harness.store).status).toBe("expired");
   });
+
+  test("reconcile running concurrently during an in-flight apply does not mark the action failed", async () => {
+    let releaseApply: (value: { handle: string }) => void = () => {};
+    let applyStarted = false;
+    const pendingApply = new Promise<{ handle: string }>((resolveApply) => {
+      releaseApply = resolveApply;
+    });
+
+    const harness = createEngine({
+      adapterConfig: {
+        apply: async () => {
+          applyStarted = true;
+          return pendingApply;
+        },
+        inspect: async () => ({ state: "absent" }),
+      },
+    });
+    await harness.engine.consider(scanFixture(), [PEER_DRAFT], [], harness.settings);
+    const proposal = onlyProposal(harness.store);
+
+    const approvePromise = harness.engine.approve(
+      proposal.id,
+      proposal.revision,
+      harness.settings,
+    );
+    await waitUntil(() => applyStarted);
+
+    // Reconcile runs while apply() is still in flight and inspect() would report absent.
+    await harness.engine.reconcile();
+    expect(harness.calls.inspect).toHaveLength(0);
+    expect(onlyAction(harness.store).state).toBe("pending");
+
+    releaseApply({ handle: "handle-in-flight" });
+    expect(await approvePromise).toBe(true);
+    const settled = onlyAction(harness.store);
+    expect(settled.state).toBe("active");
+    expect(settled.rollbackHandle).toBe("handle-in-flight");
+  });
 });
 
 describe("LockdownEngine.helperReady", () => {
@@ -1409,6 +1447,37 @@ describe("scripts/basho-lockdown-helper.sh", () => {
     expect(runHelper(fixture, ["deny-ip", PEER, "600", "../escape"]).code).toBe(64);
     expect(firewallMutations(fixture)).toEqual([]);
   });
+
+  test("deny-ip prepends IPv6 rules cleanly against a non-empty IPv4 ruleset", () => {
+    const fixture = installHelperFixture();
+    writeFileSync(
+      fixture.rulesPath,
+      "22/tcp ALLOW IN 192.0.2.10\n41641/udp ALLOW IN Anywhere\n",
+      "utf8",
+    );
+
+    const deny = runHelper(fixture, ["deny-ip", "2001:db8::10", "600", "op-v6"]);
+    expect(deny.code).toBe(0);
+
+    const mutations = firewallMutations(fixture);
+    expect(mutations).toEqual([
+      "ufw prepend deny from 2001:db8::10 to any comment basho-op-v6",
+    ]);
+
+    const inspected = runHelper(fixture, ["inspect", "op-v6"]);
+    expect(inspected.code).toBe(0);
+    expect(inspected.stdout).toMatch(/\bactive\b/i);
+
+    const rulesWithV6 = readFileSync(fixture.rulesPath, "utf8");
+    expect(rulesWithV6).toContain("2001:db8::10");
+    expect(rulesWithV6).toContain("192.0.2.10");
+
+    expect(runHelper(fixture, ["rollback", "op-v6"]).code).toBe(0);
+    const rulesAfterRollback = readFileSync(fixture.rulesPath, "utf8");
+    expect(rulesAfterRollback).not.toContain("2001:db8::10");
+    expect(rulesAfterRollback).toContain("192.0.2.10");
+    expect(runHelper(fixture, ["inspect", "op-v6"]).stdout).toMatch(/\babsent\b/i);
+  });
 });
 
 describe("DeadMansSwitch user-unit scope and production adapters", () => {
@@ -1492,6 +1561,8 @@ describe("DeadMansSwitch user-unit scope and production adapters", () => {
         getWorkloads: () => [ENROLLED_WORKLOAD],
         exec,
         clock: clock.clock,
+        resolveProcess: async (pid) => defaultProcess(pid),
+        currentUid: CURRENT_UID,
       }),
     });
 
@@ -1528,5 +1599,48 @@ describe("DeadMansSwitch user-unit scope and production adapters", () => {
       handle: `user-unit:${ENROLLED_UNIT}`,
     });
     expect(await adapter.rollback(workloadAction)).toEqual({ state: "absent" });
+  });
+
+  test("user workload adapter aborts apply without arming timer or freezing if process drifted", async () => {
+    const calls: string[][] = [];
+    const exec = async (argv: readonly string[]) => {
+      calls.push([...argv]);
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    const identity: ProcessIdentity = defaultProcess(ENROLLED_PID);
+    const clock = createClock();
+    const adapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => [ENROLLED_WORKLOAD],
+      exec,
+      clock: clock.clock,
+      resolveProcess: async (pid) => (pid === identity.pid ? identity : null),
+      currentUid: CURRENT_UID,
+    });
+
+    const workloadAction: LockdownAction = {
+      id: "act-work-drift-1",
+      proposalId: "prop-drift-1",
+      idempotencyKey: "prop-drift-1:1",
+      target: WORKLOAD_TARGET,
+      state: "pending",
+      createdAt: NOW,
+      expiresAt: NOW + 120 * SECOND,
+      updatedAt: NOW,
+    };
+
+    // Start-time drift right before apply
+    identity.startedAt = ENROLLED_STARTED_AT + 42;
+    await expect(adapter.apply(workloadAction)).rejects.toThrow(/drift|identity|match/i);
+
+    // User-unit ownership drift right before apply
+    identity.startedAt = ENROLLED_STARTED_AT;
+    identity.unit = "other.service";
+    await expect(adapter.apply(workloadAction)).rejects.toThrow(/drift|identity|unit|match/i);
+
+    expect(
+      calls.some(
+        (argv) => argv[0] === "/usr/bin/systemd-run" || argv.includes("freeze"),
+      ),
+    ).toBe(false);
   });
 });

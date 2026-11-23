@@ -465,10 +465,10 @@ cmd_deny_ip() {
     die "failed to arm rollback timer" 1
   fi
 
-  if ! "$UFW_BIN" insert 1 deny from "$CANONICAL_IP" to any comment "basho-${op_id}" >/dev/null; then
+  if ! "$UFW_BIN" prepend deny from "$CANONICAL_IP" to any comment "basho-${op_id}" >/dev/null; then
     "$SYSTEMCTL_BIN" stop "${timer_unit}.timer" >/dev/null 2>&1 || true
     /usr/bin/rm -f "$lease_file"
-    die "failed to insert ufw deny rule" 1
+    die "failed to prepend ufw deny rule" 1
   fi
 
   printf 'active %s\n' "$op_id"
@@ -511,7 +511,7 @@ cmd_isolate_lan() {
 
   local port
   for port in "${LAN_PORTS_LIST[@]}"; do
-    if ! "$UFW_BIN" insert 1 deny in on "$LAN_INTERFACE" to any port "$port" comment "basho-${op_id}" >/dev/null; then
+    if ! "$UFW_BIN" prepend deny in on "$LAN_INTERFACE" to any port "$port" comment "basho-${op_id}" >/dev/null; then
       # Best-effort cleanup of partially inserted tagged rules.
       local partial_out num
       if partial_out="$("$UFW_BIN" status numbered 2>/dev/null)"; then
@@ -520,7 +520,7 @@ cmd_isolate_lan() {
           "$UFW_BIN" --force delete "$num" >/dev/null 2>&1 || true
         done < <(find_tagged_rule_numbers_desc "$partial_out" "$op_id")
       fi
-      die "failed to insert LAN isolation rule for port $port" 1
+      die "failed to prepend LAN isolation rule for port $port" 1
     fi
   done
 
@@ -531,6 +531,11 @@ cmd_inspect() {
   [ $# -eq 1 ] || die "usage: inspect <id>" 64
   local op_id="$1"
   validate_op_id "$op_id"
+
+  ensure_state_dir
+  local lock_file="${STATE_DIR}/lock"
+  exec 9>>"$lock_file"
+  /usr/bin/flock -s 9
 
   local ufw_out
   if ! ufw_out="$("$UFW_BIN" status numbered)"; then
