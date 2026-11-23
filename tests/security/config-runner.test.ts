@@ -44,6 +44,37 @@ async function rejectionOf(fn: () => Promise<unknown>): Promise<Error> {
   throw new Error("expected the operation to reject, but it resolved");
 }
 
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    return false;
+  }
+
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const closeParen = stat.lastIndexOf(")");
+      if (closeParen !== -1) {
+        const state = stat.slice(closeParen + 1).trimStart()[0];
+        if (state === "Z" || state === "X" || state === "x") {
+          return false;
+        }
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code === "ENOENT" || code === "ESRCH") {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Defaults and shape
 // ---------------------------------------------------------------------------
@@ -1112,15 +1143,6 @@ test("timeout terminates the full process tree including background descendants"
       options as Parameters<typeof Bun.spawn>[1],
     )) as typeof Bun.spawn);
 
-  const isPidAlive = (pid: number): boolean => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
   try {
     const startedAt = performance.now();
     const result = await createCommandRunner({ timeoutMs: 150 }).run({ kind: "processes" });
@@ -1135,10 +1157,10 @@ test("timeout terminates the full process tree including background descendants"
 
     // Allow brief kernel subreaper latency for the already-SIGKILLed descendant to vanish.
     const deadline = performance.now() + 500;
-    while (isPidAlive(descendantPid) && performance.now() < deadline) {
+    while (isProcessAlive(descendantPid) && performance.now() < deadline) {
       await Bun.sleep(10);
     }
-    expect(isPidAlive(descendantPid)).toBe(false);
+    expect(isProcessAlive(descendantPid)).toBe(false);
   } finally {
     spawnSpy.mockRestore();
     whichSpy.mockRestore();
@@ -1161,21 +1183,12 @@ test("abort and overflow terminate background descendants in the child process t
   const realSpawn = Bun.spawn.bind(Bun);
   const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
 
-  const isPidAlive = (pid: number): boolean => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
   const waitUntilDead = async (pid: number) => {
     const deadline = performance.now() + 500;
-    while (isPidAlive(pid) && performance.now() < deadline) {
+    while (isProcessAlive(pid) && performance.now() < deadline) {
       await Bun.sleep(10);
     }
-    return !isPidAlive(pid);
+    return !isProcessAlive(pid);
   };
 
   try {
@@ -1305,15 +1318,6 @@ test("direct child exit terminates lingering descendants that closed stdout and 
       options as Parameters<typeof Bun.spawn>[1],
     )) as typeof Bun.spawn);
 
-  const isPidAlive = (pid: number): boolean => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
   try {
     const result = await createCommandRunner({ timeoutMs: 1_000 }).run({ kind: "processes" });
     expect(result).toEqual({ status: "ok", stdout: "done\n", exitCode: 0 });
@@ -1323,10 +1327,10 @@ test("direct child exit terminates lingering descendants that closed stdout and 
     expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
 
     const deadline = performance.now() + 500;
-    while (isPidAlive(descendantPid) && performance.now() < deadline) {
+    while (isProcessAlive(descendantPid) && performance.now() < deadline) {
       await Bun.sleep(10);
     }
-    expect(isPidAlive(descendantPid)).toBe(false);
+    expect(isProcessAlive(descendantPid)).toBe(false);
   } finally {
     spawnSpy.mockRestore();
     whichSpy.mockRestore();

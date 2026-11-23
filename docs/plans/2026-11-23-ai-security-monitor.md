@@ -114,15 +114,15 @@ export type Severity = "info" | "warning" | "critical" | "breach";
 export type LockdownMode = "monitor" | "approve" | "auto-lockdown";
 export type AlertChannel = "in-app" | "desktop" | "ntfy" | "discord" | "telegram";
 export type Coverage = "complete" | "partial" | "unavailable";
-export type Facts = Record<string, string | number | boolean | null>;
+export type Facts = Readonly<Record<string, string | number | boolean | null>>;
 
 export interface Clock { now(): number }
 export type HttpFetcher = (url: string, init: RequestInit) => Promise<Response>;
 
 export interface Evidence {
-  id: string;
-  kind: "criterion" | "listener" | "event" | "process" | "unit";
-  facts: Facts;
+  readonly id: string;
+  readonly kind: "criterion" | "listener" | "event" | "process" | "unit";
+  readonly facts: Facts;
 }
 
 export interface PostureCheck {
@@ -334,7 +334,7 @@ export async function readBounded(stream: ReadableStream<Uint8Array>, max: numbe
 }
 ```
 
-Drain stdout and stderr concurrently, cap each at 256 KiB, and kill and reap the child on overflow, caller abort, or the 5-second deadline. Return stderr-free failure classifications. Permit command-specific benign exit statuses, including read-only cached `pacman -Qu` (exit 0 for pending updates, exit 1 with empty stdout and empty stderr for up-to-date, unavailable when missing). For initial journal reads, pass `--lines=N`; for cursor reads, stream forward from `--after-cursor` and stop after `N` complete JSON lines. Never checkpoint a truncated line. Validate cursor length and character set, unit names, and the desktop urgency enum before forming argv. End option parsing before dynamic desktop text.
+Drain stdout and stderr concurrently, cap each at 256 KiB, and kill and reap the child on overflow, caller abort, or the 5-second deadline. Return stderr-free failure classifications. Permit command-specific benign exit statuses, including read-only cached `pacman -Qu` (exit 0 with empty stderr for pending updates, exit 1 with empty stdout and empty stderr for up-to-date, unavailable when missing). For initial journal reads, pass `--lines=N`; for cursor reads, stream forward from `--after-cursor` and stop after `N` complete JSON lines. Never checkpoint a truncated line. Validate cursor length and character set, unit names, and the desktop urgency enum before forming argv. End option parsing before dynamic desktop text.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -576,7 +576,7 @@ Export `parseListeners(text: string): Listener[]` and `evaluateFirewall(listener
 | `firewall_ufw` | Read `ufw status`, IPv4/IPv6 user rules, and defaults. Use first matching terminal rule per family. Track protocol, port/range, interface, destination and source scope. Report unused allow rules only when socket inventory and corresponding rule coverage are complete. Report indeterminate for relevant rule syntax the collector cannot evaluate. |
 | `network_exposure` | Parse `ss -tulnp` TCP/UDP local bindings, IPv6 brackets, interface scope, and optional PID/comm. Match Serve/Funnel JSON by supported local backend endpoint or port and declared publication. Recognize loopback, LAN-bound, Tailnet bind/Serve, verified UFW deny, and publicly published/proven dual-stack exposure. Treat wildcard `*`, uncertain family, or unverifiable firewall and publication as unknown unless independent evidence proves a narrower class. Compare ports with `expectedPorts`. |
 | `ssh_hardening` | Parse global OpenSSH first-value semantics, resolving supported `Include` directives in place and preserving `Match` scope. Evaluate password auth, root login, keyboard-interactive auth, and port 22 reachability outside Tailnet. Report partial coverage for unresolved includes or conditional settings that affect the result. |
-| `package_updates` | Run read-only cached `pacman -Qu` (exit 0 pending updates, exit 1 with empty stdout up-to-date, unavailable when missing), count pending updates, mark `linux-*` updates, parse the last pacman upgrade, flag age greater than 14 days, and optionally summarize `arch-audit` counts. Keep update count unknown when `pacman` is unavailable. |
+| `package_updates` | Run read-only cached `pacman -Qu` (exit 0 with empty stderr for pending updates, exit 1 with empty stdout and empty stderr for up-to-date, unavailable when missing), count pending updates, mark `linux-*` updates, parse the last pacman upgrade, flag age greater than 14 days, and optionally summarize `arch-audit` counts. Keep update count unknown when `pacman` is unavailable. |
 | `disk_and_boot` | Walk `lsblk -J` parent/child chains by mount point and encryption type, then project root encryption and unencrypted secondary volumes. Read Secure Boot and TPM2 fields from `bootctl status`, with unknown for absent values. |
 | `kernel_sysctl` | Read `kernel.kptr_restrict`, `kernel.dmesg_restrict`, `kernel.unprivileged_bpf_disabled`, `kernel.yama.ptrace_scope`, `kernel.kexec_load_disabled`, `fs.suid_dumpable`, `net.ipv4.conf.all.rp_filter`, and IPv4/IPv6 redirect settings. Flag unsafe known values; preserve per-key missing coverage. |
 | `systemd_health` | Parse failed system and user units, and report readable Snapper and Limine health signals. Use sanitized unit identifiers and counts. |
