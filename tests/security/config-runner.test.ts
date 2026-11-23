@@ -1494,3 +1494,135 @@ test("journal returns complete JSON lines prefix on 256 KiB byte cap and overflo
     whichSpy.mockRestore();
   }
 });
+
+test("processes recipe requests 7-column ps output including unit and uunit", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockImplementation((cmd) =>
+    cmd === "ps" ? "/usr/bin/ps" : null,
+  );
+  let seenArgv: unknown;
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((argv, options) => {
+    seenArgv = argv;
+    return realSpawn(
+      ["/bin/sh", "-c", "printf '  4242     1  1000   120 user@1000.service comfy.service comfy\\n'; exit 0"],
+      options as Parameters<typeof Bun.spawn>[1],
+    );
+  }) as typeof Bun.spawn);
+
+  try {
+    const result = await createCommandRunner().run({ kind: "processes" });
+    expect(result.status).toBe("ok");
+    expect(seenArgv).toEqual([
+      "/usr/bin/ps",
+      "-eo",
+      "pid=,ppid=,uid=,etimes=,unit=,uunit=,comm=",
+    ]);
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+  }
+});
+
+test("journal recipe restricts output fields with --output-fields in both initial and after-cursor modes", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockImplementation((cmd) =>
+    cmd === "journalctl" ? "/usr/bin/journalctl" : null,
+  );
+  const expectedFieldsArg =
+    "--output-fields=__CURSOR,__REALTIME_TIMESTAMP,__SEQNUM,__SEQNUM_ID,_TRANSPORT,_UID,_COMM,_EXE,_SYSTEMD_UNIT,_SYSTEMD_USER_UNIT,SYSLOG_IDENTIFIER,UNIT,USER_UNIT,MESSAGE";
+
+  const seenArgvs: unknown[] = [];
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((argv, options) => {
+    seenArgvs.push(argv);
+    return realSpawn(
+      ["/bin/sh", "-c", "exit 0"],
+      options as Parameters<typeof Bun.spawn>[1],
+    );
+  }) as typeof Bun.spawn);
+
+  try {
+    const initial = await createCommandRunner().run({ kind: "journal", limit: 25 });
+    expect(initial.status).toBe("ok");
+    const after = await createCommandRunner().run({
+      kind: "journal",
+      after: "s=abc123;i=1",
+      limit: 25,
+    });
+    expect(after.status).toBe("ok");
+
+    expect(seenArgvs[0]).toEqual([
+      "/usr/bin/journalctl",
+      "--no-pager",
+      "-o",
+      "json",
+      expectedFieldsArg,
+      "--lines=25",
+    ]);
+    expect(seenArgvs[1]).toEqual([
+      "/usr/bin/journalctl",
+      "--no-pager",
+      "-o",
+      "json",
+      expectedFieldsArg,
+      "--after-cursor=s=abc123;i=1",
+    ]);
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+  }
+});
+
+test("journal reports skippedCursor on single oversized record with valid top-level __CURSOR and plain overflow otherwise", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockImplementation((cmd) =>
+    cmd === "journalctl" ? "/usr/bin/journalctl" : null,
+  );
+
+  try {
+    // Valid top-level __CURSOR before >256 KiB payload -> overflow with skippedCursor.
+    const cursorScript = [
+      `printf '{"__CURSOR":"s=oversized;i=42","__REALTIME_TIMESTAMP":"1796000000000000","MESSAGE":"'`,
+      `head -c 280000 /dev/zero | tr '\\0' 'A'`,
+      `printf '"}\\n'`,
+    ].join("; ");
+    const cursorSpawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+      realSpawn(
+        ["/bin/sh", "-c", cursorScript],
+        options as Parameters<typeof Bun.spawn>[1],
+      )) as typeof Bun.spawn);
+    try {
+      const result = await createCommandRunner({ timeoutMs: 2_000 }).run({
+        kind: "journal",
+        after: "s=oversized;i=41",
+        limit: 50,
+      });
+      expect(result).toEqual({ status: "overflow", skippedCursor: "s=oversized;i=42" });
+    } finally {
+      cursorSpawnSpy.mockRestore();
+    }
+
+    // Spoofed __CURSOR embedded inside an oversized MESSAGE string -> plain overflow (no skippedCursor).
+    const spoofedScript = [
+      `printf '{"MESSAGE":"prefix \\"__CURSOR\\":\\"s=spoof;i=99\\" '`,
+      `head -c 280000 /dev/zero | tr '\\0' 'B'`,
+      `printf '"}\\n'`,
+    ].join("; ");
+    const spoofedSpawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+      realSpawn(
+        ["/bin/sh", "-c", spoofedScript],
+        options as Parameters<typeof Bun.spawn>[1],
+      )) as typeof Bun.spawn);
+    try {
+      const result = await createCommandRunner({ timeoutMs: 2_000 }).run({
+        kind: "journal",
+        after: "s=oversized;i=41",
+        limit: 50,
+      });
+      expect(result).toEqual({ status: "overflow" });
+    } finally {
+      spoofedSpawnSpy.mockRestore();
+    }
+  } finally {
+    whichSpy.mockRestore();
+  }
+});

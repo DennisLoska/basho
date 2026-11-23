@@ -2545,4 +2545,26 @@ describe("PostureCollector Stage 2 code quality regressions", () => {
     expect(procEv?.facts.comm).toBe("weird-daemon");
     expect(procEv?.facts.pid).toBe(5150);
   });
+
+  test("process_and_timers parses 7-column ps output containing unit and uunit columns", async () => {
+    const result = await harness({
+      commands: {
+        sockets: okResult(
+          ss('tcp   LISTEN 0      128    0.0.0.0:5321    0.0.0.0:*    users:(("weird-daemon",pid=5150,fd=3))'),
+        ),
+        processes: okResult(
+          [
+            "  5150     1  1000     120 user@1000.service weird.service weird-daemon",
+            "  4242     1  1000     900 -                 -             bun",
+          ].join("\n"),
+        ),
+      },
+    }).collector.collect("scan-ps-seven-col", settings());
+
+    const check = checkById(result, "process_and_timers");
+    expect(check.status).toBe("warn");
+    const procEv = result.snapshot.evidence.find((e) => e.kind === "process");
+    expect(procEv?.facts.comm).toBe("weird-daemon");
+    expect(procEv?.facts.pid).toBe(5150);
+  });
 });

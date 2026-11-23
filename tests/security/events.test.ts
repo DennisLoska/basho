@@ -1610,4 +1610,375 @@ describe("EventMonitor edge cases", () => {
       store.close();
     }
   });
+
+  test("verifies user-owned systemd uunit from 7-column ps output for pause_workload and rejects mismatched uunit", async () => {
+    const workloads: EnrolledWorkload[] = [
+      { id: "comfy", unit: "comfy.service", name: "comfy", ports: [8188] },
+    ];
+
+    // User unit matching uunit while system unit is user@1000.service -> emits pause_workload.
+    {
+      const store = memoryStore();
+      let socketPoll = 0;
+      const runner = runnerStub((request) => {
+        if (request.kind === "processes") {
+          return ok("  4242     1  1000   120 user@1000.service comfy.service comfy\n");
+        }
+        socketPoll += 1;
+        return socketPoll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WORKLOAD);
+      });
+      const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW), workloads });
+      try {
+        await monitor.pollSockets(async (listeners) => benignEntries(listeners));
+        const result = await monitor.pollSockets(async (listeners) =>
+          unexpectedEntries(listeners),
+        );
+        const corroborated = result.corroboration.find(
+          (entry) => entry.rule === "unexpected_workload",
+        );
+        expect(corroborated).toBeDefined();
+        expect(corroborated!.target).toEqual({
+          kind: "pause_workload",
+          workloadId: "comfy",
+          pid: 4242,
+          startedAt: NOW - 120 * 1000,
+        });
+      } finally {
+        store.close();
+      }
+    }
+
+    // System service matching unit with uunit="-" -> emits pause_workload.
+    {
+      const store = memoryStore();
+      let socketPoll = 0;
+      const runner = runnerStub((request) => {
+        if (request.kind === "processes") {
+          return ok("  4242     1  1000   120 comfy.service - comfy\n");
+        }
+        socketPoll += 1;
+        return socketPoll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WORKLOAD);
+      });
+      const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW), workloads });
+      try {
+        await monitor.pollSockets(async (listeners) => benignEntries(listeners));
+        const result = await monitor.pollSockets(async (listeners) =>
+          unexpectedEntries(listeners),
+        );
+        const corroborated = result.corroboration.find(
+          (entry) => entry.rule === "unexpected_workload",
+        );
+        expect(corroborated).toBeDefined();
+        expect(corroborated!.target).toEqual({
+          kind: "pause_workload",
+          workloadId: "comfy",
+          pid: 4242,
+          startedAt: NOW - 120 * 1000,
+        });
+      } finally {
+        store.close();
+      }
+    }
+
+    // Mismatched uunit or missing units ("-") in 7-column output -> falls back to unexpected_listener.
+    const mismatchedRows = [
+      "  4242     1  1000   120 user@1000.service other.service comfy\n",
+      "  4242     1  1000   120 user@1000.service - comfy\n",
+      "  4242     1  1000   120 - - comfy\n",
+    ];
+    for (const psLine of mismatchedRows) {
+      const store = memoryStore();
+      let socketPoll = 0;
+      const runner = runnerStub((request) => {
+        if (request.kind === "processes") {
+          return ok(psLine);
+        }
+        socketPoll += 1;
+        return socketPoll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WORKLOAD);
+      });
+      const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW), workloads });
+      try {
+        await monitor.pollSockets(async (listeners) => benignEntries(listeners));
+        const result = await monitor.pollSockets(async (listeners) =>
+          unexpectedEntries(listeners),
+        );
+        expect(result.alerts.length).toBeGreaterThan(0);
+        expect(result.corroboration).toHaveLength(1);
+        expect(result.corroboration[0]?.rule).toBe("unexpected_listener");
+        expect(result.corroboration[0]?.target).toBeUndefined();
+      } finally {
+        store.close();
+      }
+    }
+  });
+
+  test("accepts polkitd running as system UID (<1000) and rejects regular user UIDs or spoofed metadata", () => {
+    const polkitMsg =
+      "Operator of unix-process:1234:5678 successfully authenticated as unix-user:dennis to gain one-shot authorization for org.freedesktop.systemd1.manage-units";
+
+    // Positive: system UID 102 with polkitd comm, polkit.service unit, and /polkitd exe
+    const legitPolkit = parsedEvent(
+      jline({
+        __CURSOR: "s=polkit-sys;i=1",
+        _UID: "102",
+        _COMM: "polkitd",
+        _SYSTEMD_UNIT: "polkit.service",
+        _EXE: "/usr/lib/polkit-1/polkitd",
+        SYSLOG_IDENTIFIER: "polkitd",
+        MESSAGE: polkitMsg,
+      }),
+    );
+    expect(legitPolkit.rule).toBe("polkit_escalation");
+    expect(legitPolkit.category).toBe("auth");
+
+    // Positive without _EXE
+    const legitPolkitNoExe = parsedEvent(
+      jline({
+        __CURSOR: "s=polkit-sys;i=2",
+        _UID: "102",
+        _COMM: "polkitd",
+        _SYSTEMD_UNIT: "polkit.service",
+        SYSLOG_IDENTIFIER: "polkitd",
+        MESSAGE: polkitMsg,
+      }),
+    );
+    expect(legitPolkitNoExe.rule).toBe("polkit_escalation");
+
+    // Negative: regular user UID >= 1000, spoofed _COMM, spoofed _SYSTEMD_UNIT, spoofed _EXE
+    const rejectedCases = [
+      {
+        __CURSOR: "s=polkit-bad;i=1",
+        _UID: "1000",
+        _COMM: "polkitd",
+        _SYSTEMD_UNIT: "polkit.service",
+        _EXE: "/usr/lib/polkit-1/polkitd",
+        SYSLOG_IDENTIFIER: "polkitd",
+        MESSAGE: polkitMsg,
+      },
+      {
+        __CURSOR: "s=polkit-bad;i=2",
+        _UID: "102",
+        _COMM: "fake-polkitd",
+        _SYSTEMD_UNIT: "polkit.service",
+        SYSLOG_IDENTIFIER: "polkitd",
+        MESSAGE: polkitMsg,
+      },
+      {
+        __CURSOR: "s=polkit-bad;i=3",
+        _UID: "102",
+        _COMM: "polkitd",
+        _SYSTEMD_UNIT: "evil.service",
+        SYSLOG_IDENTIFIER: "polkitd",
+        MESSAGE: polkitMsg,
+      },
+      {
+        __CURSOR: "s=polkit-bad;i=4",
+        _UID: "102",
+        _COMM: "polkitd",
+        _SYSTEMD_UNIT: "polkit.service",
+        _EXE: "/usr/bin/logger",
+        SYSLOG_IDENTIFIER: "polkitd",
+        MESSAGE: polkitMsg,
+      },
+    ];
+
+    for (const record of rejectedCases) {
+      const parsed = parseJournalRecord(jline(record));
+      expect(parsed).not.toBeNull();
+      expect(parsed!.event).toBeUndefined();
+    }
+  });
+
+  test("verifies sudo _EXE when present and ignores renamed fake sudo binaries", () => {
+    const sudoMsg = "dennis : TTY=pts/0 ; PWD=/home/dennis ; USER=root ; COMMAND=/usr/bin/id";
+
+    for (const exe of ["/usr/bin/sudo", "/bin/sudo"]) {
+      const legit = parsedEvent(
+        jline({
+          __CURSOR: `s=sudo-ok;e=${exe.replaceAll("/", "_")}`,
+          _COMM: "sudo",
+          _EXE: exe,
+          SYSLOG_IDENTIFIER: "sudo",
+          MESSAGE: sudoMsg,
+        }),
+      );
+      expect(legit.rule).toBe("sudo_escalation");
+    }
+
+    for (const badExe of ["/tmp/fake-sudo", "/tmp/sudo", "/usr/bin/logger"]) {
+      const parsed = parseJournalRecord(
+        jline({
+          __CURSOR: `s=sudo-bad;e=${badExe.replaceAll("/", "_")}`,
+          _COMM: "sudo",
+          _EXE: badExe,
+          SYSLOG_IDENTIFIER: "sudo",
+          MESSAGE: sudoMsg,
+        }),
+      );
+      expect(parsed).not.toBeNull();
+      expect(parsed!.event).toBeUndefined();
+    }
+  });
+
+  test("advances past a single oversized journal record with synthetic skipped notice and partial coverage", async () => {
+    const store = memoryStore();
+    const realSpawn = Bun.spawn.bind(Bun);
+    const whichSpy = spyOn(Bun, "which").mockImplementation((cmd) =>
+      cmd === "journalctl" ? "/usr/bin/journalctl" : null,
+    );
+
+    const oversizedScript = [
+      `printf '{"__CURSOR":"s=giant;i=1","__REALTIME_TIMESTAMP":"${NOW * 1000}","MESSAGE":"'`,
+      `head -c 280000 /dev/zero | tr '\\0' 'A'`,
+      `printf '"}\\n'`,
+    ].join("; ");
+    const nextLine = jline({
+      __CURSOR: "s=giant;i=2",
+      MESSAGE: sshFailureMessage(PEER),
+    });
+
+    let call = 0;
+    const seenArgvs: unknown[] = [];
+    const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((argv, options) => {
+      call += 1;
+      seenArgvs.push(argv);
+      const script = call === 1 ? oversizedScript : `printf '%s\\n' '${nextLine}'`;
+      return realSpawn(
+        ["/bin/sh", "-c", script],
+        options as Parameters<typeof Bun.spawn>[1],
+      );
+    }) as typeof Bun.spawn);
+
+    try {
+      const runner = createCommandRunner({ timeoutMs: 2_000 });
+      const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW) });
+
+      const first = await monitor.pollJournal();
+      expect(first.coverage).toBe("partial");
+      expect(first.alerts).toEqual([]);
+      expect(first.corroboration).toEqual([]);
+      expect(store.getCursor("journal")).toBe("s=giant;i=1");
+
+      const gapOrSkipped = store
+        .recentEvents(0, 50)
+        .find((event) => event.rule === "journal_record_skipped");
+      expect(gapOrSkipped).toBeDefined();
+      expect(gapOrSkipped!.severity).toBe("warning");
+      expect(gapOrSkipped!.isNoise).toBe(false);
+
+      // Next poll resumes after s=giant;i=1 and ingests s=giant;i=2 instead of stalling.
+      const second = await monitor.pollJournal();
+      expect(second.coverage).toBe("complete");
+      expect(store.getCursor("journal")).toBe("s=giant;i=2");
+      expect(authEventTotal(store, PEER)).toBe(1);
+      expect(seenArgvs[1]).toContain("--after-cursor=s=giant;i=1");
+    } finally {
+      spawnSpy.mockRestore();
+      whichSpy.mockRestore();
+      store.close();
+    }
+  });
+
+  test("deduplicates SSH multi-line companion and failed_auth records across consecutive polls within 15s", async () => {
+    const store = memoryStore();
+    let poll = 0;
+    const runner = runnerStub(() => {
+      poll += 1;
+      if (poll === 1) {
+        // 3 attempts split across poll boundary:
+        // - ports 53001 & 53002 send Invalid user at end of poll 1
+        // - port 53003 sends Failed password at end of poll 1
+        return journalPage([
+          jline({
+            __CURSOR: "s=xpoll;i=1",
+            __REALTIME_TIMESTAMP: String((NOW - 10 * SECOND_MS) * 1000),
+            SYSLOG_IDENTIFIER: "sshd-session",
+            MESSAGE: `Invalid user admin from ${PEER} port 53001`,
+          }),
+          jline({
+            __CURSOR: "s=xpoll;i=2",
+            __REALTIME_TIMESTAMP: String((NOW - 8 * SECOND_MS) * 1000),
+            SYSLOG_IDENTIFIER: "sshd-session",
+            MESSAGE: `Invalid user admin from ${PEER} port 53002`,
+          }),
+          jline({
+            __CURSOR: "s=xpoll;i=3",
+            __REALTIME_TIMESTAMP: String((NOW - 6 * SECOND_MS) * 1000),
+            SYSLOG_IDENTIFIER: "sshd-session",
+            MESSAGE: `Failed password for invalid user admin from ${PEER} port 53003 ssh2`,
+          }),
+        ]);
+      }
+      if (poll === 2) {
+        // Companion / paired lines arrive at start of poll 2 within 15s:
+        // - port 53001 & 53002 send Failed password + Connection closed
+        // - port 53003 sends Connection closed
+        // None of these should double-count against the 5-failure threshold!
+        return journalPage([
+          jline({
+            __CURSOR: "s=xpoll;i=4",
+            __REALTIME_TIMESTAMP: String((NOW - 9 * SECOND_MS) * 1000),
+            SYSLOG_IDENTIFIER: "sshd-session",
+            MESSAGE: `Failed password for invalid user admin from ${PEER} port 53001 ssh2`,
+          }),
+          jline({
+            __CURSOR: "s=xpoll;i=5",
+            __REALTIME_TIMESTAMP: String((NOW - 9 * SECOND_MS + 10) * 1000),
+            SYSLOG_IDENTIFIER: "sshd-session",
+            MESSAGE: `Connection closed by authenticating user admin ${PEER} port 53001 [preauth]`,
+          }),
+          jline({
+            __CURSOR: "s=xpoll;i=6",
+            __REALTIME_TIMESTAMP: String((NOW - 7 * SECOND_MS) * 1000),
+            SYSLOG_IDENTIFIER: "sshd-session",
+            MESSAGE: `Failed password for invalid user admin from ${PEER} port 53002 ssh2`,
+          }),
+          jline({
+            __CURSOR: "s=xpoll;i=7",
+            __REALTIME_TIMESTAMP: String((NOW - 5 * SECOND_MS) * 1000),
+            SYSLOG_IDENTIFIER: "sshd-session",
+            MESSAGE: `Connection closed by authenticating user admin ${PEER} port 53003 [preauth]`,
+          }),
+        ]);
+      }
+      // Poll 3: Same port 53001 reused 20s later (> 15s window) + one new port -> now reaches 5 total.
+      return journalPage([
+        jline({
+          __CURSOR: "s=xpoll;i=8",
+          __REALTIME_TIMESTAMP: String((NOW + 12 * SECOND_MS) * 1000),
+          SYSLOG_IDENTIFIER: "sshd-session",
+          MESSAGE: `Failed password for invalid user admin from ${PEER} port 53001 ssh2`,
+        }),
+        jline({
+          __CURSOR: "s=xpoll;i=9",
+          __REALTIME_TIMESTAMP: String((NOW + 13 * SECOND_MS) * 1000),
+          SYSLOG_IDENTIFIER: "sshd-session",
+          MESSAGE: `Failed password for invalid user admin from ${PEER} port 53004 ssh2`,
+        }),
+      ]);
+    });
+
+    let now = NOW;
+    const monitor = new EventMonitor({ store, runner, clock: { now: () => now } });
+
+    try {
+      const first = await monitor.pollJournal();
+      expect(first.corroboration.some((entry) => entry.rule === "ssh_burst")).toBe(false);
+      expect(authEventTotal(store, PEER)).toBe(3);
+
+      const second = await monitor.pollJournal();
+      expect(second.corroboration.some((entry) => entry.rule === "ssh_burst")).toBe(false);
+      expect(second.alerts).toEqual([]);
+      expect(authEventTotal(store, PEER)).toBe(3);
+
+      now = NOW + 15 * SECOND_MS;
+      const third = await monitor.pollJournal();
+      const burst = third.corroboration.find((entry) => entry.rule === "ssh_burst");
+      expect(burst).toBeDefined();
+      expect(burst!.target).toEqual({ kind: "deny_peer_ip", ip: PEER });
+      expect(authEventTotal(store, PEER)).toBe(5);
+    } finally {
+      store.close();
+    }
+  });
 });

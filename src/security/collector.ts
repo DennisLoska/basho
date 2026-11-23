@@ -2243,12 +2243,21 @@ function parseProcesses(stdout: string, nowMs: number): Map<number, ParsedProces
     const etimes = Number(match[4]);
     const rest = match[5]!.trim();
     let commRaw = rest;
+    const isUnitToken = (tok: string): boolean => tok === "-" || isValidSystemdUnitName(tok);
     const firstSpace = rest.search(/\s/);
     if (firstSpace !== -1) {
       const firstTok = rest.slice(0, firstSpace);
-      const tail = rest.slice(firstSpace).trim();
-      if (tail.length > 0 && (firstTok === "-" || isValidSystemdUnitName(firstTok))) {
-        commRaw = tail;
+      const afterFirst = rest.slice(firstSpace).trim();
+      if (afterFirst.length > 0 && isUnitToken(firstTok)) {
+        commRaw = afterFirst;
+        const secondSpace = afterFirst.search(/\s/);
+        if (secondSpace !== -1) {
+          const secondTok = afterFirst.slice(0, secondSpace);
+          const afterSecond = afterFirst.slice(secondSpace).trim();
+          if (afterSecond.length > 0 && isUnitToken(secondTok)) {
+            commRaw = afterSecond;
+          }
+        }
       }
     }
     const comm = sanitizeProcessComm(commRaw);

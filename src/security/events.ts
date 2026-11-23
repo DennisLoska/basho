@@ -17,6 +17,8 @@ import type {
 const JOURNAL_PAGE_LIMIT = 200;
 const BURST_WINDOW_MS = 300_000;
 const SSH_BURST_THRESHOLD = 5;
+const SSH_DEDUPE_WINDOW_MS = 15_000;
+const MAX_SSH_DEDUPE_ENTRIES = 1_024;
 
 const SYSTEMD_UNIT_SUFFIXES = [
   ".service",
@@ -291,6 +293,14 @@ function deterministicJournalGapId(previousCursor: string, nextCursor: string): 
   return `journal:cursor_gap:${digest}`;
 }
 
+function deterministicJournalOversizedId(cursor: string): string {
+  const digest = createHash("sha256")
+    .update(`oversized\0${cursor}`)
+    .digest("hex")
+    .slice(0, 24);
+  return `journal:oversized_skipped:${digest}`;
+}
+
 function deterministicSocketEventId(
   nowMs: number,
   transition: "opened" | "closed",
@@ -470,6 +480,15 @@ function verifyTrustedUidRoot(record: Record<string, unknown>): boolean {
   return record._UID === "0";
 }
 
+function verifyTrustedSystemUid(record: Record<string, unknown>): boolean {
+  if (record._UID === undefined) return true;
+  if (typeof record._UID !== "string" || !/^(?:0|[1-9]\d{0,9})$/.test(record._UID)) {
+    return false;
+  }
+  const uid = Number(record._UID);
+  return Number.isInteger(uid) && uid >= 0 && uid < 1000;
+}
+
 function verifyTrustedComm(
   record: Record<string, unknown>,
   allowedComms: readonly string[],
@@ -588,6 +607,13 @@ function classifyJournalMessage(
     if (!verifyTrustedComm(record, ["sudo"])) {
       return undefined;
     }
+    if (
+      record._EXE !== undefined &&
+      record._EXE !== "/usr/bin/sudo" &&
+      record._EXE !== "/bin/sudo"
+    ) {
+      return undefined;
+    }
     const isCommand = /\bCOMMAND=/.test(message);
     const isAuthError =
       /authentication failure|incorrect password|user NOT in sudoers/i.test(message);
@@ -622,7 +648,7 @@ function classifyJournalMessage(
 
   if (identifier === "polkitd") {
     if (
-      !verifyTrustedUidRoot(record) ||
+      !verifyTrustedSystemUid(record) ||
       !verifyTrustedComm(record, ["polkitd"]) ||
       hasSystemdUserUnit(record)
     ) {
@@ -632,6 +658,14 @@ function classifyJournalMessage(
       record._SYSTEMD_UNIT !== undefined &&
       record._SYSTEMD_UNIT !== "polkit.service" &&
       record._SYSTEMD_UNIT !== "polkitd.service"
+    ) {
+      return undefined;
+    }
+    if (
+      record._EXE !== undefined &&
+      (typeof record._EXE !== "string" ||
+        !record._EXE.startsWith("/") ||
+        !record._EXE.endsWith("/polkitd"))
     ) {
       return undefined;
     }
@@ -838,11 +872,14 @@ interface ParsedProcessRow {
   pid: number;
   startedAt: number;
   comm: string;
+  hasUnitMetadata: boolean;
   unit?: string;
+  uunit?: string;
 }
 
 function parseProcessRows(stdout: string, nowMs: number): Map<number, ParsedProcessRow> {
   const map = new Map<number, ParsedProcessRow>();
+  const isUnitToken = (tok: string): boolean => tok === "-" || isValidSystemdUnitName(tok);
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
@@ -851,15 +888,27 @@ function parseProcessRows(stdout: string, nowMs: number): Map<number, ParsedProc
     const pid = Number(match[1]);
     const etimes = Number(match[2]);
     const rest = match[3]!.trim();
+    let hasUnitMetadata = false;
     let unit: string | undefined;
+    let uunit: string | undefined;
     let comm = rest;
     const firstSpace = rest.search(/\s/);
     if (firstSpace !== -1) {
       const firstTok = rest.slice(0, firstSpace);
-      const tail = rest.slice(firstSpace).trim();
-      if (tail.length > 0 && (firstTok === "-" || isValidSystemdUnitName(firstTok))) {
-        unit = firstTok;
-        comm = tail;
+      const afterFirst = rest.slice(firstSpace).trim();
+      if (afterFirst.length > 0 && isUnitToken(firstTok)) {
+        hasUnitMetadata = true;
+        unit = firstTok === "-" ? undefined : firstTok;
+        comm = afterFirst;
+        const secondSpace = afterFirst.search(/\s/);
+        if (secondSpace !== -1) {
+          const secondTok = afterFirst.slice(0, secondSpace);
+          const afterSecond = afterFirst.slice(secondSpace).trim();
+          if (afterSecond.length > 0 && isUnitToken(secondTok)) {
+            uunit = secondTok === "-" ? undefined : secondTok;
+            comm = afterSecond;
+          }
+        }
       }
     }
     if (
@@ -875,9 +924,22 @@ function parseProcessRows(stdout: string, nowMs: number): Map<number, ParsedProc
     if (!Number.isSafeInteger(startedAt)) {
       continue;
     }
-    map.set(pid, unit !== undefined ? { pid, startedAt, comm, unit } : { pid, startedAt, comm });
+    map.set(pid, {
+      pid,
+      startedAt,
+      comm,
+      hasUnitMetadata,
+      ...(unit !== undefined ? { unit } : {}),
+      ...(uunit !== undefined ? { uunit } : {}),
+    });
   }
   return map;
+}
+
+interface RecentSshPeerState {
+  lastFailedAuthAt?: number;
+  unpairedCompanionAt?: number;
+  lastSeenAt: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +954,7 @@ export class EventMonitor {
 
   private hasSocketBaseline = false;
   private socketBaseline = new Map<string, Listener[]>();
+  private recentSshPeers = new Map<string, RecentSshPeerState>();
 
   constructor(deps: EventMonitorDeps) {
     this.store = deps.store;
@@ -922,6 +985,59 @@ export class EventMonitor {
         },
         signal,
       );
+    }
+
+    if (
+      result.status === "overflow" &&
+      result.skippedCursor !== undefined &&
+      isValidJournalCursor(result.skippedCursor)
+    ) {
+      const now = this.clock.now();
+      const skippedEvents: SecurityEvent[] = [];
+      if (cursorRecovered && previous !== null) {
+        skippedEvents.push({
+          id: deterministicJournalGapId(previous, result.skippedCursor),
+          source: "journal",
+          category: "units",
+          severity: "warning",
+          rule: "journal_cursor_gap",
+          target: "journald",
+          firstAt: now,
+          lastAt: now,
+          count: 1,
+          isNoise: false,
+          summary:
+            "Journal cursor expired; recovered from bounded recent window with potential telemetry gap",
+        });
+      }
+      skippedEvents.push({
+        id: deterministicJournalOversizedId(result.skippedCursor),
+        source: "journal",
+        category: "units",
+        severity: "warning",
+        rule: "journal_record_skipped",
+        target: "journald",
+        firstAt: now,
+        lastAt: now,
+        count: 1,
+        isNoise: false,
+        summary:
+          "Skipped oversized journal record exceeding byte limit; cursor advanced with partial coverage",
+      });
+      this.store.commitEventBatch({
+        events: skippedEvents,
+        cursor: {
+          source: "journal",
+          expected: previous,
+          next: result.skippedCursor,
+        },
+        burstWindowMs: BURST_WINDOW_MS,
+      });
+      return {
+        alerts: [],
+        corroboration: [],
+        coverage: "partial",
+      };
     }
 
     if (result.status !== "ok") {
@@ -956,23 +1072,96 @@ export class EventMonitor {
       }
     }
 
-    const failedAuthPeerKeys = new Set<string>();
+    const batchFailedAuthTimes = new Map<string, number[]>();
+    let maxSshEventTs: number | null = null;
     for (const item of parsedItems) {
-      if (item.sshMeta?.subtype === "failed_auth" && item.sshMeta.peerKey !== undefined) {
-        failedAuthPeerKeys.add(item.sshMeta.peerKey);
+      if (item.sshMeta?.peerKey !== undefined) {
+        const ts = item.event.lastAt;
+        if (maxSshEventTs === null || ts > maxSshEventTs) {
+          maxSshEventTs = ts;
+        }
+        if (item.sshMeta.subtype === "failed_auth") {
+          const list = batchFailedAuthTimes.get(item.sshMeta.peerKey);
+          if (list) {
+            list.push(ts);
+          } else {
+            batchFailedAuthTimes.set(item.sshMeta.peerKey, [ts]);
+          }
+        }
       }
+    }
+
+    const nextSshPeers = new Map<string, RecentSshPeerState>();
+    for (const [key, state] of this.recentSshPeers.entries()) {
+      nextSshPeers.set(key, { ...state });
     }
 
     const events: SecurityEvent[] = [];
     for (const item of parsedItems) {
-      if (
-        item.sshMeta?.subtype === "companion" &&
-        item.sshMeta.peerKey !== undefined &&
-        failedAuthPeerKeys.has(item.sshMeta.peerKey)
-      ) {
+      const sshMeta = item.sshMeta;
+      if (!sshMeta || sshMeta.peerKey === undefined) {
+        events.push(item.event);
         continue;
       }
+
+      const peerKey = sshMeta.peerKey;
+      const ts = item.event.lastAt;
+      const prior = nextSshPeers.get(peerKey);
+
+      if (sshMeta.subtype === "failed_auth") {
+        if (
+          prior?.unpairedCompanionAt !== undefined &&
+          Math.abs(ts - prior.unpairedCompanionAt) <= SSH_DEDUPE_WINDOW_MS
+        ) {
+          // Pairs with an already-counted companion line from a prior poll; do not double-count.
+          nextSshPeers.set(peerKey, {
+            lastFailedAuthAt: ts,
+            lastSeenAt: Math.max(prior.lastSeenAt, ts),
+          });
+          continue;
+        }
+        events.push(item.event);
+        nextSshPeers.set(peerKey, {
+          lastFailedAuthAt: ts,
+          lastSeenAt: prior ? Math.max(prior.lastSeenAt, ts) : ts,
+        });
+        continue;
+      }
+
+      // Companion line (Invalid user / Connection closed by authenticating user)
+      const batchAuthTimes = batchFailedAuthTimes.get(peerKey);
+      if (batchAuthTimes?.some((authTs) => Math.abs(authTs - ts) <= SSH_DEDUPE_WINDOW_MS)) {
+        continue;
+      }
+      if (
+        prior?.lastFailedAuthAt !== undefined &&
+        Math.abs(ts - prior.lastFailedAuthAt) <= SSH_DEDUPE_WINDOW_MS
+      ) {
+        nextSshPeers.set(peerKey, {
+          ...prior,
+          lastSeenAt: Math.max(prior.lastSeenAt, ts),
+        });
+        continue;
+      }
+      if (
+        prior?.unpairedCompanionAt !== undefined &&
+        Math.abs(ts - prior.unpairedCompanionAt) <= SSH_DEDUPE_WINDOW_MS
+      ) {
+        nextSshPeers.set(peerKey, {
+          ...prior,
+          lastSeenAt: Math.max(prior.lastSeenAt, ts),
+        });
+        continue;
+      }
+
       events.push(item.event);
+      nextSshPeers.set(peerKey, {
+        ...(prior?.lastFailedAuthAt !== undefined
+          ? { lastFailedAuthAt: prior.lastFailedAuthAt }
+          : {}),
+        unpairedCompanionAt: ts,
+        lastSeenAt: prior ? Math.max(prior.lastSeenAt, ts) : ts,
+      });
     }
 
     const coverage: Coverage = malformed || cursorRecovered ? "partial" : "complete";
@@ -1014,6 +1203,24 @@ export class EventMonitor {
     if (!committed) {
       return { alerts: [], corroboration: [], coverage: "partial" };
     }
+
+    const sshPruneCutoff =
+      maxSshEventTs !== null
+        ? Math.min(now, maxSshEventTs) - SSH_DEDUPE_WINDOW_MS
+        : now - BURST_WINDOW_MS;
+    for (const [key, state] of nextSshPeers.entries()) {
+      if (state.lastSeenAt < sshPruneCutoff || now - state.lastSeenAt > BURST_WINDOW_MS) {
+        nextSshPeers.delete(key);
+      }
+    }
+    if (nextSshPeers.size > MAX_SSH_DEDUPE_ENTRIES) {
+      const sorted = [...nextSshPeers.entries()].sort((a, b) => a[1].lastSeenAt - b[1].lastSeenAt);
+      const excess = nextSshPeers.size - MAX_SSH_DEDUPE_ENTRIES;
+      for (let i = 0; i < excess; i += 1) {
+        nextSshPeers.delete(sorted[i]![0]);
+      }
+    }
+    this.recentSshPeers = nextSshPeers;
 
     const windowStart = now - BURST_WINDOW_MS;
     const alerts: SecurityAlert[] = [];
@@ -1193,10 +1400,13 @@ export class EventMonitor {
         if (workload && matchedListener.pid !== undefined && matchedListener.process) {
           const table = await getProcessTable();
           const candidate = table?.get(matchedListener.pid);
+          const expectedUnit = workload.unit.trim();
           if (
             candidate &&
             candidate.comm.toLowerCase() === matchedListener.process.trim().toLowerCase() &&
-            (candidate.unit === undefined || candidate.unit === workload.unit.trim())
+            (!candidate.hasUnitMetadata ||
+              candidate.unit === expectedUnit ||
+              candidate.uunit === expectedUnit)
           ) {
             verifiedProcess = candidate;
           }

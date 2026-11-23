@@ -27,6 +27,8 @@ const SYSTEMD_UNIT_SUFFIXES = [
 ] as const;
 
 const JOURNAL_CURSOR_PATTERN = /^[A-Za-z0-9=;_:.,-]{1,512}$/;
+const JOURNAL_OUTPUT_FIELDS =
+  "__CURSOR,__REALTIME_TIMESTAMP,__SEQNUM,__SEQNUM_ID,_TRANSPORT,_UID,_COMM,_EXE,_SYSTEMD_UNIT,_SYSTEMD_USER_UNIT,SYSLOG_IDENTIFIER,UNIT,USER_UNIT,MESSAGE";
 
 const EXPIRED_JOURNAL_CURSOR_PATTERNS = [
   /failed to seek to cursor/i,
@@ -119,6 +121,153 @@ export function readBounded(
   max: number,
 ): Promise<string> {
   return readBoundedStream(stream, max).then((res) => res.text);
+}
+
+function skipJsonWhitespace(src: string, pos: number): number {
+  let i = pos;
+  while (i < src.length) {
+    const ch = src.charCodeAt(i);
+    if (ch === 0x20 || ch === 0x09 || ch === 0x0a || ch === 0x0d) {
+      i += 1;
+    } else {
+      break;
+    }
+  }
+  return i;
+}
+
+function readJsonStringEnd(src: string, start: number): number {
+  if (start >= src.length || src.charCodeAt(start) !== 0x22) return -1;
+  let i = start + 1;
+  while (i < src.length) {
+    const ch = src.charCodeAt(i);
+    if (ch === 0x5c) {
+      i += 2;
+      continue;
+    }
+    if (ch === 0x22) {
+      return i + 1;
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+function skipJsonValue(src: string, start: number): number {
+  if (start >= src.length) return -1;
+  const first = src.charCodeAt(start);
+  if (first === 0x22) {
+    return readJsonStringEnd(src, start);
+  }
+  if (first === 0x7b || first === 0x5b) {
+    let depth = 0;
+    let i = start;
+    while (i < src.length) {
+      const ch = src.charCodeAt(i);
+      if (ch === 0x22) {
+        const end = readJsonStringEnd(src, i);
+        if (end === -1) return -1;
+        i = end;
+        continue;
+      }
+      if (ch === 0x7b || ch === 0x5b) {
+        depth += 1;
+      } else if (ch === 0x7d || ch === 0x5d) {
+        depth -= 1;
+        if (depth === 0) return i + 1;
+      }
+      i += 1;
+    }
+    return -1;
+  }
+  let i = start;
+  while (i < src.length) {
+    const ch = src.charCodeAt(i);
+    if (
+      ch === 0x2c ||
+      ch === 0x7d ||
+      ch === 0x5d ||
+      ch === 0x20 ||
+      ch === 0x09 ||
+      ch === 0x0a ||
+      ch === 0x0d
+    ) {
+      return i > start ? i : -1;
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+/**
+ * Extracts a validated top-level `"__CURSOR"` string from a truncated JSON
+ * journal record prefix without matching substrings inside other string values
+ * such as `"MESSAGE"`.
+ */
+function extractTopLevelJournalCursor(prefix: string): string | null {
+  let pos = skipJsonWhitespace(prefix, 0);
+  if (pos >= prefix.length || prefix.charCodeAt(pos) !== 0x7b) {
+    return null;
+  }
+  pos += 1;
+
+  while (pos < prefix.length) {
+    pos = skipJsonWhitespace(prefix, pos);
+    if (pos >= prefix.length || prefix.charCodeAt(pos) === 0x7d) {
+      return null;
+    }
+    if (prefix.charCodeAt(pos) !== 0x22) {
+      return null;
+    }
+    const keyEnd = readJsonStringEnd(prefix, pos);
+    if (keyEnd === -1) return null;
+
+    let key: unknown;
+    try {
+      key = JSON.parse(prefix.slice(pos, keyEnd));
+    } catch {
+      return null;
+    }
+
+    pos = skipJsonWhitespace(prefix, keyEnd);
+    if (pos >= prefix.length || prefix.charCodeAt(pos) !== 0x3a) {
+      return null;
+    }
+    pos = skipJsonWhitespace(prefix, pos + 1);
+    if (pos >= prefix.length) return null;
+
+    if (key === "__CURSOR") {
+      if (prefix.charCodeAt(pos) !== 0x22) return null;
+      const valEnd = readJsonStringEnd(prefix, pos);
+      if (valEnd === -1) return null;
+      let val: unknown;
+      try {
+        val = JSON.parse(prefix.slice(pos, valEnd));
+      } catch {
+        return null;
+      }
+      return typeof val === "string" && isValidJournalCursor(val) ? val : null;
+    }
+
+    const valEnd = skipJsonValue(prefix, pos);
+    if (valEnd === -1) return null;
+    pos = skipJsonWhitespace(prefix, valEnd);
+    if (pos >= prefix.length || prefix.charCodeAt(pos) !== 0x2c) {
+      return null;
+    }
+    pos += 1;
+  }
+
+  return null;
+}
+
+class OutputLimitError extends Error {
+  readonly skippedCursor?: string;
+
+  constructor(skippedCursor?: string) {
+    super("output limit");
+    this.skippedCursor = skippedCursor;
+  }
 }
 
 async function readBoundedJsonLines(
@@ -258,8 +407,10 @@ async function readBoundedJsonLines(
           cancel();
           return { text: lines.join("\n"), reachedLimit, complete: true };
         }
+        pending += decoder.decode();
+        const skippedCursor = extractTopLevelJournalCursor(pending);
         cancel();
-        throw new Error("output limit");
+        throw new OutputLimitError(skippedCursor ?? undefined);
       }
       pending += decoder.decode(value, { stream: true });
       let newlineIdx = pending.indexOf("\n");
@@ -401,7 +552,7 @@ function buildRecipe(request: CommandRequest): BuiltRecipe {
       };
     case "processes":
       return {
-        argv: ["ps", "-eo", "pid=,ppid=,uid=,etimes=,unit=,comm="],
+        argv: ["ps", "-eo", "pid=,ppid=,uid=,etimes=,unit=,uunit=,comm="],
         benignExitCodes: [0],
         includeUserRuntimeEnv: false,
       };
@@ -453,6 +604,7 @@ function buildRecipe(request: CommandRequest): BuiltRecipe {
             "--no-pager",
             "-o",
             "json",
+            `--output-fields=${JOURNAL_OUTPUT_FIELDS}`,
             `--after-cursor=${request.after}`,
           ],
           benignExitCodes: [0],
@@ -466,6 +618,7 @@ function buildRecipe(request: CommandRequest): BuiltRecipe {
           "--no-pager",
           "-o",
           "json",
+          `--output-fields=${JOURNAL_OUTPUT_FIELDS}`,
           `--lines=${request.limit}`,
         ],
         benignExitCodes: [0],
@@ -595,6 +748,8 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
       let timedOut = false;
       let aborted = false;
       let overflowed = false;
+      let stderrOverflowed = false;
+      let overflowSkippedCursor: string | undefined;
       let stoppedByLineLimit = false;
       let processExited = false;
       let finished = false;
@@ -702,6 +857,13 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
                 .catch((err: unknown) => {
                   if (err instanceof Error && err.message === "output limit") {
                     overflowed = true;
+                    if (
+                      err instanceof OutputLimitError &&
+                      err.skippedCursor !== undefined &&
+                      isValidJournalCursor(err.skippedCursor)
+                    ) {
+                      overflowSkippedCursor = err.skippedCursor;
+                    }
                     terminateEarly();
                   }
                   throw err;
@@ -723,6 +885,8 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
               (err: unknown) => {
                 if (err instanceof Error && err.message === "output limit") {
                   overflowed = true;
+                  stderrOverflowed = true;
+                  overflowSkippedCursor = undefined;
                   terminateEarly();
                 }
                 throw err;
@@ -768,7 +932,11 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
       try {
         const outcome = await Promise.race([allDone, earlyStop]);
 
-        if (overflowed) return { status: "overflow" };
+        if (overflowed) {
+          return !stderrOverflowed && overflowSkippedCursor !== undefined
+            ? { status: "overflow", skippedCursor: overflowSkippedCursor }
+            : { status: "overflow" };
+        }
         if (timedOut) return { status: "timeout" };
         if (aborted) return { status: "failed" };
 
