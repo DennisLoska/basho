@@ -1986,15 +1986,42 @@ test("two-connection write-transaction contention on claimProposal is atomic and
         import { SecurityStore } from ${JSON.stringify(storeModulePath)};
         const store = new SecurityStore(${JSON.stringify(dbPath)});
         try {
+          const db = store.db;
+          const busyRow = db.query("PRAGMA busy_timeout").get();
+          const defaultBusyTimeout = Object.values(busyRow)[0];
           console.log("READY");
           for await (const _line of console) {
             break;
           }
+          // Deterministically observe SQLITE_BUSY against the parent's active BEGIN IMMEDIATE lock.
+          db.run("PRAGMA busy_timeout = 0");
+          let observedBusy = false;
+          let busyMessage = "";
+          try {
+            store.claimProposal(${JSON.stringify(proposalId)}, 1, 500);
+          } catch (error) {
+            observedBusy = true;
+            busyMessage = error instanceof Error ? error.message : String(error);
+          } finally {
+            db.run(\`PRAGMA busy_timeout = \${defaultBusyTimeout}\`);
+          }
+          if (!observedBusy) {
+            throw new Error("Expected SQLITE_BUSY while parent held BEGIN IMMEDIATE lock");
+          }
           const startedAt = Date.now();
-          console.log("CLAIMING");
+          console.log("BUSY_OBSERVED");
           const action = store.claimProposal(${JSON.stringify(proposalId)}, 1, 500);
           const finishedAt = Date.now();
-          console.log(JSON.stringify({ action, startedAt, finishedAt }));
+          console.log(
+            JSON.stringify({
+              defaultBusyTimeout,
+              observedBusy,
+              busyMessage,
+              action,
+              startedAt,
+              finishedAt,
+            }),
+          );
         } finally {
           store.close();
         }
@@ -2031,11 +2058,12 @@ test("two-connection write-transaction contention on claimProposal is atomic and
         locker.run("BEGIN IMMEDIATE");
         child.stdin.write("GO\n");
         child.stdin.end();
-        // Wait for the child to confirm it is about to enter claimProposal while we hold the lock.
-        await waitForMarker("CLAIMING\n");
+        // Wait for the child to deterministically observe SQLITE_BUSY while we hold the lock
+        // and restore busy_timeout before entering normal claimProposal.
+        await waitForMarker("BUSY_OBSERVED\n");
         expect(buffer).toBe("");
 
-        // Hold BEGIN IMMEDIATE for ~40ms and prove the child remains blocked until lock release.
+        // Hold BEGIN IMMEDIATE for ~45ms and prove the child remains blocked until lock release.
         pendingRead = reader.read();
         const holdOutcome = await Promise.race([
           pendingRead.then(() => "unblocked-early" as const),
@@ -2064,10 +2092,16 @@ test("two-connection write-transaction contention on claimProposal is atomic and
       const stderrText = await new Response(child.stderr).text();
       expect(exitCode, `child stderr: ${stderrText}`).toBe(0);
       const parsed = JSON.parse(rest.trim()) as {
+        defaultBusyTimeout: number;
+        observedBusy: boolean;
+        busyMessage: string;
         action: { id: string } | null;
         startedAt: number;
         finishedAt: number;
       };
+      expect(parsed.defaultBusyTimeout).toBeGreaterThan(0);
+      expect(parsed.observedBusy).toBe(true);
+      expect(parsed.busyMessage).toMatch(/locked|busy/i);
       expect(parsed.finishedAt).toBeGreaterThanOrEqual(lockReleasedAt);
       expect(parsed.finishedAt - parsed.startedAt).toBeGreaterThanOrEqual(35);
       return parsed;
@@ -2405,5 +2439,119 @@ test("commitEventBatch caps aggregate burst span at 24h so continuously active b
   } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("commitEventBatch rejects a singleton observation whose span exceeds 24h and rolls back batch and cursor", () => {
+  const store = memoryStore();
+  try {
+    const base = 100 * DAY_MS;
+
+    // Exact 24h span (MAX_BURST_SPAN_MS) is accepted.
+    expect(
+      store.commitEventBatch({
+        events: [
+          eventFixture("span-exact-24h", base, {
+            firstAt: base,
+            lastAt: base + 24 * HOUR_MS,
+            count: 2,
+          }),
+        ],
+        cursor: { source: "journal", expected: null, next: "span-c1" },
+        burstWindowMs: 5_000,
+      }),
+    ).toBe(true);
+    expect(store.getCursor("journal")).toBe("span-c1");
+    expect(store.recentEvents(0, 10)).toHaveLength(1);
+
+    // A singleton observation with lastAt - firstAt > 24h must be rejected atomically.
+    expect(() =>
+      store.commitEventBatch({
+        events: [
+          eventFixture("span-rolled-back", base + 1_000, { rule: "should_rollback" }),
+          eventFixture("span-over-24h", base, {
+            firstAt: base,
+            lastAt: base + 24 * HOUR_MS + 1,
+            count: 1,
+          }),
+        ],
+        cursor: { source: "journal", expected: "span-c1", next: "span-c2" },
+        burstWindowMs: 5_000,
+      }),
+    ).toThrow(RangeError);
+
+    expect(store.getCursor("journal")).toBe("span-c1");
+    expect(store.recentEvents(0, 10).map((event) => event.id)).toEqual(["span-exact-24h"]);
+  } finally {
+    store.close();
+  }
+});
+
+test("commitEventBatch caches per-hour totals by (hourBucket, isNoise) without double-counting duplicates and catches intra-batch overflow", () => {
+  const store = memoryStore();
+  try {
+    const baseHour = Date.UTC(2026, 4, 2, 14, 0, 0);
+
+    expect(
+      store.commitEventBatch({
+        events: [eventFixture("cache-seed", baseHour + 1_000, { rule: "rule_a", count: 1 })],
+        cursor: { source: "journal", expected: null, next: "cache-c1" },
+        burstWindowMs: 5_000,
+      }),
+    ).toBe(true);
+
+    const internalDb = (store as unknown as { db: Database }).db;
+    internalDb
+      .query("UPDATE security_events SET count = ? WHERE row_kind = 'observation' AND observation_id = 'cache-seed'")
+      .run(Number.MAX_SAFE_INTEGER - 10);
+
+    // Fits exactly at MAX_SAFE_INTEGER for signal: 6 (unique) + 6 (dup ignored) + 4 (unique) = +10;
+    // noise bucket is tracked independently and does not interfere with signal headroom.
+    expect(
+      store.commitEventBatch({
+        events: [
+          eventFixture("cache-sig-1", baseHour + 2_000, { rule: "rule_b", count: 6 }),
+          eventFixture("cache-sig-1", baseHour + 2_000, { rule: "rule_b", count: 6 }),
+          eventFixture("cache-noise-1", baseHour + 2_500, { rule: "rule_noise", isNoise: true, count: 100 }),
+          eventFixture("cache-sig-2", baseHour + 3_000, { rule: "rule_c", count: 4 }),
+        ],
+        cursor: { source: "journal", expected: "cache-c1", next: "cache-c2" },
+        burstWindowMs: 5_000,
+      }),
+    ).toBe(true);
+    expect(store.getCursor("journal")).toBe("cache-c2");
+
+    // Seed another hour near MAX_SAFE_INTEGER and verify a second unique event in the same batch
+    // triggers overflow via the in-transaction hourly cache and rolls back the entire batch.
+    const nextHour = baseHour + HOUR_MS;
+    expect(
+      store.commitEventBatch({
+        events: [eventFixture("cache-seed-2", nextHour + 1_000, { rule: "rule_d", count: 1 })],
+        cursor: { source: "journal", expected: "cache-c2", next: "cache-c3" },
+        burstWindowMs: 5_000,
+      }),
+    ).toBe(true);
+
+    internalDb
+      .query("UPDATE security_events SET count = ? WHERE row_kind = 'observation' AND observation_id = 'cache-seed-2'")
+      .run(Number.MAX_SAFE_INTEGER - 5);
+
+    expect(() =>
+      store.commitEventBatch({
+        events: [
+          eventFixture("cache-intra-1", nextHour + 2_000, { rule: "rule_e", count: 4 }),
+          eventFixture("cache-intra-2", nextHour + 3_000, { rule: "rule_f", count: 2 }),
+        ],
+        cursor: { source: "journal", expected: "cache-c3", next: "cache-c4" },
+        burstWindowMs: 5_000,
+      }),
+    ).toThrow(RangeError);
+
+    expect(store.getCursor("journal")).toBe("cache-c3");
+    const rules = store.recentEvents(0, 20).map((event) => event.rule);
+    expect(rules).not.toContain("rule_e");
+    expect(rules).not.toContain("rule_f");
+  } finally {
+    store.close();
   }
 });

@@ -97,6 +97,11 @@ function validateSecurityEvent(event: SecurityEvent): void {
       `SecurityEvent firstAt (${event.firstAt}) must not exceed lastAt (${event.lastAt})`,
     );
   }
+  if (event.lastAt - event.firstAt > MAX_BURST_SPAN_MS) {
+    throw new RangeError(
+      `SecurityEvent span (${event.lastAt - event.firstAt}ms) must not exceed ${MAX_BURST_SPAN_MS}ms`,
+    );
+  }
   if (!Number.isSafeInteger(event.count) || event.count < 1 || event.count > MAX_EVENT_COUNT) {
     throw new RangeError(
       `SecurityEvent count must be a safe integer between 1 and ${MAX_EVENT_COUNT}: ${event.count}`,
@@ -984,6 +989,7 @@ export class SecurityStore implements SecurityStoreContract {
         );
       }
       const burstWindowMs = Math.max(0, batch.burstWindowMs);
+      const hourlyTotals = new Map<string, number>();
 
       for (const event of batch.events) {
         validateSecurityEvent(event);
@@ -1013,14 +1019,20 @@ export class SecurityStore implements SecurityStoreContract {
           continue;
         }
 
-        const hourlyRow = sumHourlyObservations.get(hourBucket, isNoiseInt, event.id) as {
-          total: number | bigint;
-        } | null;
-        safeAddCount(
-          hourlyRow ? hourlyRow.total : 0,
+        const hourlyKey = `${hourBucket}:${isNoiseInt}`;
+        let priorHourlyTotal: number | bigint | undefined = hourlyTotals.get(hourlyKey);
+        if (priorHourlyTotal === undefined) {
+          const hourlyRow = sumHourlyObservations.get(hourBucket, isNoiseInt, event.id) as {
+            total: number | bigint;
+          } | null;
+          priorHourlyTotal = hourlyRow ? hourlyRow.total : 0;
+        }
+        const nextHourlyTotal = safeAddCount(
+          priorHourlyTotal,
           eventCount,
           `SecurityEvent hourly total for hour ${hourBucket}`,
         );
+        hourlyTotals.set(hourlyKey, nextHourlyTotal);
 
         const collectedByRowId = new Map<number, SecurityEventRow>();
         let mergedFirst = event.firstAt;

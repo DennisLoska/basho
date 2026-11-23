@@ -13,7 +13,7 @@ A normalized host observation bound to a source, category, severity, and timesta
 _Avoid_: Raw log line, breach
 
 **EventBatch**:
-An atomic set of `SecurityEvent` observations committed together with a burst aggregation window and an optional compare-and-set source cursor transition.
+An ordered batch of `SecurityEvent` observations paired with an optional compare-and-set source cursor transition and a burst aggregation gap threshold, committed atomically.
 _Avoid_: Raw log chunk, unvalidated event list, cursor update
 
 **SecurityFinding**:
