@@ -218,6 +218,7 @@ function validateWorkloads(value: unknown): EnrolledWorkload[] {
   if (!Array.isArray(value)) {
     throw new Error("Invalid workloads: expected array");
   }
+  const seenIds = new Set<string>();
   return value.map((item, idx) => {
     if (!isPlainObject(item)) {
       throw new Error(`Invalid workloads[${idx}]: expected object`);
@@ -225,11 +226,16 @@ function validateWorkloads(value: unknown): EnrolledWorkload[] {
     if (typeof item.id !== "string" || item.id.trim() === "") {
       throw new Error(`Invalid workloads[${idx}].id: expected non-empty string`);
     }
+    const id = item.id.trim();
+    if (seenIds.has(id)) {
+      throw new Error(`Invalid workloads[${idx}].id: duplicate workload id "${id}"`);
+    }
+    seenIds.add(id);
     if (typeof item.unit !== "string" || !isValidSystemdUnitName(item.unit)) {
       throw new Error(`Invalid workloads[${idx}].unit: invalid systemd unit name`);
     }
     const workload: EnrolledWorkload = {
-      id: item.id.trim(),
+      id,
       unit: item.unit,
     };
     if (item.name !== undefined) {

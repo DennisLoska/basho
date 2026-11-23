@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadSecurityConfig } from "../../src/security/config";
@@ -934,3 +934,220 @@ test("timeout returns promptly when a grandchild keeps stdout and stderr pipes o
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("duplicate trimmed workload IDs are rejected in loadSecurityConfig", () => {
+  expect(() =>
+    loadSecurityConfig({
+      env: {},
+      fileConfig: {
+        workloads: [
+          { id: "worker", unit: "worker-a.service" },
+          { id: "worker", unit: "worker-b.service" },
+        ],
+      },
+    }),
+  ).toThrow(/duplicate/i);
+
+  expect(() =>
+    loadSecurityConfig({
+      env: {},
+      fileConfig: {
+        workloads: [
+          { id: "worker", unit: "worker-a.service" },
+          { id: "  worker  ", unit: "worker-b.service" },
+        ],
+      },
+    }),
+  ).toThrow(/duplicate/i);
+
+  const valid = loadSecurityConfig({
+    env: {},
+    fileConfig: {
+      workloads: [
+        { id: " worker-a ", unit: "worker-a.service" },
+        { id: "worker-b", unit: "worker-b.service" },
+      ],
+    },
+  });
+  expect(valid.settings.workloads).toEqual([
+    { id: "worker-a", unit: "worker-a.service" },
+    { id: "worker-b", unit: "worker-b.service" },
+  ]);
+});
+
+test("non-journal command fails when a descendant holds stdout open past exit", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+    realSpawn(
+      ["/bin/sh", "-c", "sleep 0.4 & printf 'partial\\n'; exit 0"],
+      options as Parameters<typeof Bun.spawn>[1],
+    )) as typeof Bun.spawn);
+
+  try {
+    const result = await createCommandRunner({ timeoutMs: 500 }).run({ kind: "processes" });
+    expect(result).toEqual({ status: "failed" });
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+  }
+});
+
+test("journal after-cursor fails when an incomplete page has stdout held open past exit", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+    realSpawn(
+      ["/bin/sh", "-c", 'sleep 0.4 & printf \'{"MESSAGE":"one"}\\n\'; exit 0'],
+      options as Parameters<typeof Bun.spawn>[1],
+    )) as typeof Bun.spawn);
+
+  try {
+    const result = await createCommandRunner({ timeoutMs: 500 }).run({
+      kind: "journal",
+      after: "s=abc123",
+      limit: 2,
+    });
+    expect(result).toEqual({ status: "failed" });
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+  }
+});
+
+test("updates recipe passes an isolated CHECKUPDATES_DB and removes it after exit", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  const seenDbDirs: string[] = [];
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) => {
+    const env = (options as { env?: Record<string, string> } | undefined)?.env;
+    if (env?.CHECKUPDATES_DB) {
+      seenDbDirs.push(env.CHECKUPDATES_DB);
+    }
+    return realSpawn(
+      [
+        "/bin/sh",
+        "-c",
+        'test -n "$CHECKUPDATES_DB" && test -d "$CHECKUPDATES_DB" && : > "$CHECKUPDATES_DB/db.lck" && printf "%s" "$CHECKUPDATES_DB"',
+      ],
+      options as Parameters<typeof Bun.spawn>[1],
+    );
+  }) as typeof Bun.spawn);
+
+  try {
+    const runner = createCommandRunner();
+    const first = await runner.run({ kind: "updates" });
+    const second = await runner.run({ kind: "updates" });
+
+    expect(first.status).toBe("ok");
+    expect(second.status).toBe("ok");
+    expect(seenDbDirs).toHaveLength(2);
+    const [firstDbDir, secondDbDir] = seenDbDirs;
+    expect(firstDbDir).toBeDefined();
+    expect(secondDbDir).toBeDefined();
+    expect(firstDbDir).not.toBe(secondDbDir);
+    if (first.status === "ok") {
+      expect(first.stdout).toBe(firstDbDir!);
+    }
+    if (second.status === "ok") {
+      expect(second.stdout).toBe(secondDbDir!);
+    }
+    expect(existsSync(firstDbDir!)).toBe(false);
+    expect(existsSync(secondDbDir!)).toBe(false);
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+    for (const dir of seenDbDirs) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("updates timeout sends SIGTERM then escalates to SIGKILL and cleans CHECKUPDATES_DB", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  let capturedDbDir: string | undefined;
+  const signals: Array<string | number | undefined> = [];
+
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) => {
+    const env = (options as { env?: Record<string, string> } | undefined)?.env;
+    capturedDbDir = env?.CHECKUPDATES_DB;
+    const child = realSpawn(
+      ["/bin/sh", "-c", 'trap "" TERM; : > "$CHECKUPDATES_DB/db.lck"; while true; do sleep 0.05; done'],
+      options as Parameters<typeof Bun.spawn>[1],
+    );
+    const origKill = child.kill.bind(child);
+    child.kill = ((sig?: number | NodeJS.Signals) => {
+      signals.push(sig);
+      return origKill(sig);
+    }) as typeof child.kill;
+    return child;
+  }) as typeof Bun.spawn);
+
+  try {
+    const startedAt = performance.now();
+    const result = await createCommandRunner({ timeoutMs: 80 }).run({ kind: "updates" });
+    const elapsedMs = performance.now() - startedAt;
+
+    expect(result).toEqual({ status: "timeout" });
+    expect(elapsedMs).toBeLessThan(1_000);
+    expect(signals[0]).toBe("SIGTERM");
+    expect(signals).toContain("SIGKILL");
+    expect(capturedDbDir).toBeDefined();
+    expect(existsSync(capturedDbDir!)).toBe(false);
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+    if (capturedDbDir) {
+      rmSync(capturedDbDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test(
+  "earlyStop returns promptly within bounded reap grace if child never exits",
+  async () => {
+    const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+    let resolveExited!: (code: number) => void;
+    const exited = new Promise<number>((resolve) => {
+      resolveExited = resolve;
+    });
+    let killCalls = 0;
+
+    const spawnSpy = spyOn(Bun, "spawn").mockImplementation((() => {
+      const openStream = () =>
+        new ReadableStream<Uint8Array>({
+          start() {
+            // Stays open until canceled.
+          },
+        });
+      return {
+        pid: 999999,
+        stdin: null,
+        stdout: openStream(),
+        stderr: openStream(),
+        exitCode: null,
+        signalCode: null,
+        exited,
+        kill() {
+          killCalls += 1;
+        },
+      } as unknown as ReturnType<typeof Bun.spawn>;
+    }) as typeof Bun.spawn);
+
+    try {
+      const startedAt = performance.now();
+      const result = await createCommandRunner({ timeoutMs: 50 }).run({ kind: "processes" });
+      const elapsedMs = performance.now() - startedAt;
+
+      expect(result).toEqual({ status: "timeout" });
+      expect(killCalls).toBeGreaterThanOrEqual(1);
+      expect(elapsedMs).toBeLessThan(600);
+    } finally {
+      resolveExited(137);
+      spawnSpy.mockRestore();
+      whichSpy.mockRestore();
+    }
+  },
+  1500,
+);

@@ -51,3 +51,11 @@ _Avoid_: Finding, webhook payload
 **AlertChannel**:
 A server-configured notification destination and delivery adapter (`in-app`, `desktop`, `ntfy`, `discord`, or `telegram`) with independent retry and delivery status tracking.
 _Avoid_: Alert, generic webhook
+
+**Corroboration**:
+An expiring deterministic signal—linking a rule, supporting `SecurityEvent` IDs, and an optional containment target—that confirms an active threat condition before autonomous containment is eligible.
+_Avoid_: AI hunch, raw alert
+
+**EnrolledWorkload**:
+An operator-registered host service identified by a unique ID and systemd unit name (with optional display name and expected ports) that Basho monitors and may target for guardrailed containment.
+_Avoid_: Arbitrary PID, unmanaged process

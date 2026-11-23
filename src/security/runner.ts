@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { CommandRequest, CommandResult, CommandRunner } from "./types";
 
 const TRUSTED_SEARCH_PATH =
@@ -7,6 +10,8 @@ const MAX_OUTPUT_BYTES = 256 * 1024;
 const COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_PAGE_SETTLE_MS = 50;
 const POST_EXIT_DRAIN_MS = 50;
+const EARLY_STOP_REAP_GRACE_MS = 150;
+const GRACEFUL_KILL_ESCALATE_MS = 50;
 const MAX_CURSOR_LENGTH = 512;
 const MAX_JOURNAL_LIMIT = 1_000;
 
@@ -65,7 +70,7 @@ async function readBoundedStream(
   stream: ReadableStream<Uint8Array>,
   max: number,
   registerCancel?: (cancel: () => void) => void,
-): Promise<string> {
+): Promise<{ text: string; complete: boolean }> {
   if (!Number.isInteger(max) || max < 0) {
     throw new RangeError("max must be a non-negative integer");
   }
@@ -88,7 +93,7 @@ async function readBoundedStream(
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) return text + decoder.decode();
+      if (done) return { text: text + decoder.decode(), complete: !canceled };
       bytes += value.byteLength;
       if (bytes > max) {
         cancel();
@@ -106,7 +111,7 @@ export function readBounded(
   stream: ReadableStream<Uint8Array>,
   max: number,
 ): Promise<string> {
-  return readBoundedStream(stream, max);
+  return readBoundedStream(stream, max).then((res) => res.text);
 }
 
 async function readBoundedJsonLines(
@@ -116,7 +121,7 @@ async function readBoundedJsonLines(
   onLimitReached: () => void,
   registerCancel?: (cancel: () => void) => void,
   pageSettleMs: number = DEFAULT_PAGE_SETTLE_MS,
-): Promise<{ text: string; reachedLimit: boolean }> {
+): Promise<{ text: string; reachedLimit: boolean; complete: boolean }> {
   if (!Number.isFinite(pageSettleMs) || pageSettleMs < 0) {
     throw new RangeError("pageSettleMs must be a non-negative finite number");
   }
@@ -157,7 +162,7 @@ async function readBoundedJsonLines(
         }
         const remainingMs = Math.max(0, settleDeadlineMs - performance.now());
         if (canceled) {
-          return { text: lines.join("\n"), reachedLimit };
+          return { text: lines.join("\n"), reachedLimit, complete: true };
         }
         const readPromise = reader.read();
         type SettleOutcome =
@@ -190,39 +195,39 @@ async function readBoundedJsonLines(
         });
 
         if (settleOutcome.kind === "canceled") {
-          return { text: lines.join("\n"), reachedLimit };
+          return { text: lines.join("\n"), reachedLimit, complete: true };
         }
         if (settleOutcome.kind === "timeout") {
           reachedLimit = true;
           onLimitReached();
           cancel();
-          return { text: lines.join("\n"), reachedLimit };
+          return { text: lines.join("\n"), reachedLimit, complete: true };
         }
         const { done, value } = settleOutcome.result;
         if (done) {
           pending += decoder.decode();
-          return { text: lines.join("\n"), reachedLimit };
+          return { text: lines.join("\n"), reachedLimit, complete: true };
         }
         if (value.byteLength === 0) {
           if (performance.now() >= settleDeadlineMs) {
             reachedLimit = true;
             onLimitReached();
             cancel();
-            return { text: lines.join("\n"), reachedLimit };
+            return { text: lines.join("\n"), reachedLimit, complete: true };
           }
           continue;
         }
         reachedLimit = true;
         onLimitReached();
         cancel();
-        return { text: lines.join("\n"), reachedLimit };
+        return { text: lines.join("\n"), reachedLimit, complete: true };
       }
 
       const { done, value } = await reader.read();
       if (done) {
         pending += decoder.decode();
         // Never emit a trailing unterminated/truncated line; only complete newline-delimited records.
-        return { text: lines.join("\n"), reachedLimit };
+        return { text: lines.join("\n"), reachedLimit, complete: !canceled };
       }
       bytes += value.byteLength;
       if (bytes > maxBytes) {
@@ -244,7 +249,7 @@ async function readBoundedJsonLines(
               reachedLimit = true;
               onLimitReached();
               cancel();
-              return { text: lines.join("\n"), reachedLimit };
+              return { text: lines.join("\n"), reachedLimit, complete: true };
             }
             // Exactly maxLines complete lines arrived with no extra bytes yet:
             // wait up to pageSettleMs for EOF (honoring the child's actual exit code/signal)
@@ -272,6 +277,7 @@ interface BuiltRecipe {
   benignExitCodes: readonly number[];
   includeUserRuntimeEnv: boolean;
   streamLineLimit?: number;
+  isolatedCheckupdatesDb?: boolean;
 }
 
 function buildRecipe(request: CommandRequest): BuiltRecipe {
@@ -305,6 +311,7 @@ function buildRecipe(request: CommandRequest): BuiltRecipe {
         argv: ["checkupdates"],
         benignExitCodes: [0, 2],
         includeUserRuntimeEnv: false,
+        isolatedCheckupdatesDb: true,
       };
     case "arch_audit":
       return {
@@ -541,6 +548,27 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
       const argv = [executable, ...recipe.argv.slice(1)];
       const env = buildChildEnv(recipe.includeUserRuntimeEnv);
 
+      let checkupdatesDbDir: string | undefined;
+      if (recipe.isolatedCheckupdatesDb) {
+        try {
+          checkupdatesDbDir = mkdtempSync(join(tmpdir(), "basho-checkupdates-"));
+        } catch {
+          return { status: "failed" };
+        }
+        env.CHECKUPDATES_DB = checkupdatesDbDir;
+      }
+
+      const cleanupCheckupdatesDb = () => {
+        if (!checkupdatesDbDir) return;
+        const dir = checkupdatesDbDir;
+        checkupdatesDbDir = undefined;
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // Best-effort cleanup of per-run checkupdates temp directory.
+        }
+      };
+
       let proc: ReturnType<typeof Bun.spawn>;
       try {
         proc = Bun.spawn(argv, {
@@ -550,6 +578,7 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
           env,
         });
       } catch {
+        cleanupCheckupdatesDb();
         return { status: "unavailable" };
       }
 
@@ -558,6 +587,9 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
       let overflowed = false;
       let stoppedByLineLimit = false;
       let processExited = false;
+      let finished = false;
+      let killInitiated = false;
+      let killEscalateTimer: ReturnType<typeof setTimeout> | undefined;
       const cancelCallbacks: Array<() => void> = [];
 
       const registerCancel = (cancel: () => void) => {
@@ -571,6 +603,24 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
       };
 
       const killChild = () => {
+        if (killInitiated) return;
+        killInitiated = true;
+        if (recipe.isolatedCheckupdatesDb) {
+          try {
+            proc.kill("SIGTERM");
+          } catch {
+            return;
+          }
+          killEscalateTimer = setTimeout(() => {
+            if (processExited) return;
+            try {
+              proc.kill("SIGKILL");
+            } catch {
+              // Process may have already exited.
+            }
+          }, GRACEFUL_KILL_ESCALATE_MS);
+          return;
+        }
         try {
           proc.kill("SIGKILL");
         } catch {
@@ -584,12 +634,24 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
       });
 
       let postExitTimer: ReturnType<typeof setTimeout> | undefined;
-      const exitedPromise = proc.exited.then((code) => {
-        processExited = true;
-        // Descendants can hold either pipe open after the direct child exits.
-        postExitTimer = setTimeout(cancelReaders, POST_EXIT_DRAIN_MS);
-        return code;
-      });
+      const exitedPromise = proc.exited.then(
+        (code) => {
+          processExited = true;
+          clearTimeout(killEscalateTimer);
+          cleanupCheckupdatesDb();
+          if (!finished) {
+            // Descendants can hold either pipe open after the direct child exits.
+            postExitTimer = setTimeout(cancelReaders, POST_EXIT_DRAIN_MS);
+          }
+          return code;
+        },
+        (err) => {
+          processExited = true;
+          clearTimeout(killEscalateTimer);
+          cleanupCheckupdatesDb();
+          throw err;
+        },
+      );
 
       const terminateEarly = () => {
         cancelReaders();
@@ -613,7 +675,7 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
       const stdoutStream = proc.stdout;
       const stderrStream = proc.stderr;
 
-      const stdoutPromise: Promise<string> =
+      const stdoutPromise: Promise<{ text: string; complete: boolean }> =
         stdoutStream && typeof stdoutStream !== "number"
           ? recipe.streamLineLimit !== undefined
             ? readBoundedJsonLines(
@@ -629,7 +691,7 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
                 },
                 registerCancel,
               )
-                .then((res) => res.text)
+                .then((res) => ({ text: res.text, complete: res.complete }))
                 .catch((err: unknown) => {
                   if (err instanceof Error && err.message === "output limit") {
                     overflowed = true;
@@ -646,9 +708,9 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
                   throw err;
                 },
               )
-          : Promise.resolve("");
+          : Promise.resolve({ text: "", complete: true });
 
-      const stderrPromise: Promise<string> =
+      const stderrPromise: Promise<unknown> =
         stderrStream && typeof stderrStream !== "number"
           ? readBoundedStream(stderrStream, MAX_OUTPUT_BYTES, registerCancel).catch(
               (err: unknown) => {
@@ -666,7 +728,7 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
       }
 
       const stdoutOutcome = stdoutPromise.then(
-        (value) => ({ ok: true as const, value }),
+        (result) => ({ ok: true as const, value: result.text, complete: result.complete }),
         () => ({ ok: false as const }),
       );
       const stderrOutcome = stderrPromise.then(
@@ -682,9 +744,17 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
           exitCode,
         }),
       );
+      void allDone.catch(() => {});
 
+      let reapGraceTimer: ReturnType<typeof setTimeout> | undefined;
       const earlyStop = terminatedPromise.then(async () => {
-        await exitedPromise;
+        void exitedPromise.catch(() => {});
+        await Promise.race([
+          exitedPromise,
+          new Promise<void>((resolve) => {
+            reapGraceTimer = setTimeout(resolve, EARLY_STOP_REAP_GRACE_MS);
+          }),
+        ]);
         return { kind: "terminated" as const };
       });
 
@@ -704,17 +774,21 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
           stoppedByLineLimit &&
           ((proc.signalCode === null && exitCode === 0) || proc.signalCode === "SIGKILL");
 
-        if (terminatedByLineLimit && stdoutResult.ok && stderrResult.ok) {
+        if (terminatedByLineLimit && stdoutResult.ok && stdoutResult.complete && stderrResult.ok) {
           return { status: "ok", stdout: stdoutResult.value, exitCode: 0 };
         }
-        if (!stdoutResult.ok || !stderrResult.ok) return { status: "failed" };
+        if (!stdoutResult.ok || !stdoutResult.complete || !stderrResult.ok) {
+          return { status: "failed" };
+        }
         if (proc.signalCode === null && recipe.benignExitCodes.includes(exitCode)) {
           return { status: "ok", stdout: stdoutResult.value, exitCode };
         }
         return { status: "failed" };
       } finally {
+        finished = true;
         clearTimeout(timeoutId);
         clearTimeout(postExitTimer);
+        clearTimeout(reapGraceTimer);
         if (signal) {
           signal.removeEventListener("abort", onAbort);
         }
