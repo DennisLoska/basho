@@ -605,10 +605,8 @@ function corroborationMatchesTarget(
     }
 
     case "isolate_lan_ingress": {
-      return (
-        entry.target?.kind === "isolate_lan_ingress" &&
-        (entry.rule === "unexpected_listener" || entry.rule === "system_anomaly")
-      );
+      // LAN isolation stays approval-only until a dedicated scoped LAN corroboration signal exists.
+      return false;
     }
   }
 }
@@ -1301,8 +1299,39 @@ export function createHelperLockdownAdapter(
   };
 }
 
+const SAFE_TIMER_UNIT_PATTERN = /^basho-thaw-[A-Za-z0-9_.-]{1,64}$/;
+
 function safeTimerUnitName(actionId: string): string {
   return `basho-thaw-${actionId.replace(/[^A-Za-z0-9_.-]/g, "_")}`;
+}
+
+function parseWorkloadHandle(
+  handle: string | undefined,
+): { unit: string; timerUnit?: string } | null {
+  if (!handle) return null;
+  const prefix = handle.startsWith("user-unit:")
+    ? "user-unit:"
+    : handle.startsWith("workload:")
+      ? "workload:"
+      : null;
+  if (!prefix) return null;
+  const rest = handle.slice(prefix.length);
+  if (!rest) return null;
+
+  const timerSep = rest.lastIndexOf(":basho-thaw-");
+  if (timerSep !== -1) {
+    const unit = rest.slice(0, timerSep);
+    const timerUnit = rest.slice(timerSep + 1);
+    if (isValidSystemdUnitName(unit) && SAFE_TIMER_UNIT_PATTERN.test(timerUnit)) {
+      return { unit, timerUnit };
+    }
+    return null;
+  }
+
+  if (isValidSystemdUnitName(rest)) {
+    return { unit: rest };
+  }
+  return null;
 }
 
 export function createUserWorkloadLockdownAdapter(
@@ -1327,6 +1356,19 @@ export function createUserWorkloadLockdownAdapter(
       return null;
     }
     return workload.unit;
+  };
+
+  const resolveActionTarget = (
+    action: LockdownAction,
+  ): { unit: string; timerUnit: string } | null => {
+    const opId = assertSafeOpId(action.id);
+    const parsed = parseWorkloadHandle(action.rollbackHandle);
+    const unit = parsed?.unit ?? resolveUnit(action);
+    if (!unit) {
+      return null;
+    }
+    const timerUnit = parsed?.timerUnit ?? safeTimerUnitName(opId);
+    return { unit, timerUnit };
   };
 
   return {
@@ -1422,9 +1464,21 @@ export function createUserWorkloadLockdownAdapter(
         timeoutMs,
       });
       if (freezeRes.exitCode !== 0) {
-        await exec([systemctlPath, "--user", "stop", `${timerUnit}.timer`], {
-          timeoutMs,
-        }).catch(() => {});
+        // On freeze timeout (exit 124), keep the thaw timer armed so reconcile() can settle it.
+        // On other failures, stop the thaw timer ONLY if FreezerState confirms the unit is running.
+        if (freezeRes.exitCode !== 124) {
+          const stateRes = await exec(
+            [systemctlPath, "--user", "show", "-p", "FreezerState", "--value", unit],
+            { timeoutMs },
+          ).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
+          const freezerState =
+            stateRes.exitCode === 0 ? stateRes.stdout.trim().toLowerCase() : "";
+          if (freezerState === "running") {
+            await exec([systemctlPath, "--user", "stop", `${timerUnit}.timer`], {
+              timeoutMs,
+            }).catch(() => {});
+          }
+        }
         throw new Error(
           freezeRes.stderr.trim() ||
             `Failed to freeze user unit ${unit} (exit ${freezeRes.exitCode})`,
@@ -1435,40 +1489,74 @@ export function createUserWorkloadLockdownAdapter(
     },
 
     async inspect(action: LockdownAction): Promise<LockdownInspectResult> {
-      const unit = resolveUnit(action);
-      if (!unit) {
+      const resolved = resolveActionTarget(action);
+      if (!resolved) {
         return { state: "unknown" };
       }
-      const res = await exec(
-        [systemctlPath, "--user", "show", "-p", "FreezerState", "--value", unit],
-        { timeoutMs },
-      );
-      if (res.exitCode !== 0) {
-        return { state: "unknown" };
+      const { unit, timerUnit } = resolved;
+
+      const [timerRes, freezerRes] = await Promise.all([
+        exec([systemctlPath, "--user", "is-active", `${timerUnit}.timer`], {
+          timeoutMs,
+        }),
+        exec([systemctlPath, "--user", "show", "-p", "FreezerState", "--value", unit], {
+          timeoutMs,
+        }),
+      ]);
+
+      const timerOut = timerRes.stdout.trim().toLowerCase();
+      let timerState: "active" | "inactive" | "unknown" = "unknown";
+      if (
+        timerRes.exitCode === 0 &&
+        (timerOut === "" ||
+          timerOut === "active" ||
+          timerOut === "activating" ||
+          timerOut === "reloading")
+      ) {
+        timerState = "active";
+      } else if (
+        timerRes.exitCode === 3 ||
+        timerRes.exitCode === 4 ||
+        timerOut === "inactive" ||
+        timerOut === "dead" ||
+        timerOut === "failed" ||
+        timerOut === "deactivating"
+      ) {
+        timerState = "inactive";
       }
-      const value = res.stdout.trim().toLowerCase();
-      if (value === "frozen" || value === "freezing") {
+
+      let freezerState: "frozen" | "running" | "unknown" = "unknown";
+      if (freezerRes.exitCode === 0) {
+        const value = freezerRes.stdout.trim().toLowerCase();
+        if (value === "frozen" || value === "freezing") {
+          freezerState = "frozen";
+        } else if (value === "running") {
+          freezerState = "running";
+        }
+      }
+
+      if (freezerState === "running" || timerState === "inactive") {
+        return { state: "absent" };
+      }
+      if (timerState === "active" && freezerState === "frozen") {
         return {
           state: "active",
           handle: action.rollbackHandle ?? `user-unit:${unit}`,
         };
       }
-      if (value === "running") {
-        return { state: "absent" };
-      }
       return { state: "unknown" };
     },
 
     async rollback(action: LockdownAction): Promise<LockdownRollbackResult> {
-      const opId = assertSafeOpId(action.id);
-      const unit = resolveUnit(action);
-      if (!unit) {
+      const resolved = resolveActionTarget(action);
+      if (!resolved) {
         return { state: "unknown" };
       }
+      const { unit, timerUnit } = resolved;
+
       const thawRes = await exec([systemctlPath, "--user", "thaw", unit], {
         timeoutMs,
       });
-      const timerUnit = safeTimerUnitName(opId);
       await exec([systemctlPath, "--user", "stop", `${timerUnit}.timer`], {
         timeoutMs,
       }).catch(() => {});
@@ -1514,29 +1602,95 @@ export function createCompositeLockdownAdapter(
   };
 }
 
+export interface ProcProcessResolverOptions {
+  exec?: SubprocessExecutor;
+  procRoot?: string;
+  clkTck?: number;
+}
+
+const DEFAULT_LINUX_CLK_TCK = 100;
+
 export function createProcProcessResolver(
-  exec: SubprocessExecutor = defaultSubprocessExec,
+  execOrOptions: SubprocessExecutor | ProcProcessResolverOptions = defaultSubprocessExec,
 ): ResolveProcess {
+  const exec =
+    typeof execOrOptions === "function"
+      ? execOrOptions
+      : (execOrOptions.exec ?? defaultSubprocessExec);
+  const procRoot =
+    typeof execOrOptions === "function"
+      ? "/proc"
+      : (execOrOptions.procRoot ?? "/proc");
+  const injectedClkTck =
+    typeof execOrOptions === "function" ? undefined : execOrOptions.clkTck;
+
+  let cachedClkTck: number | undefined =
+    typeof injectedClkTck === "number" &&
+    Number.isFinite(injectedClkTck) &&
+    injectedClkTck > 0
+      ? injectedClkTck
+      : undefined;
+
+  const getClkTck = async (): Promise<number> => {
+    if (cachedClkTck !== undefined) {
+      return cachedClkTck;
+    }
+    try {
+      const res = await exec(["/usr/bin/getconf", "CLK_TCK"], {
+        timeoutMs: 2_000,
+      });
+      if (res.exitCode === 0) {
+        const parsed = Number(res.stdout.trim());
+        if (Number.isSafeInteger(parsed) && parsed > 0) {
+          cachedClkTck = parsed;
+          return parsed;
+        }
+      }
+    } catch {
+      // Fall back to standard Linux USER_HZ (100).
+    }
+    cachedClkTck = DEFAULT_LINUX_CLK_TCK;
+    return cachedClkTck;
+  };
+
   return async (pid: number): Promise<ProcessIdentity | null> => {
     if (!Number.isSafeInteger(pid) || pid <= 0) {
       return null;
     }
 
     try {
-      const [statRaw, statusRaw, commRaw, psRes] = await Promise.all([
-        readFile(`/proc/${pid}/stat`, "utf8"),
-        readFile(`/proc/${pid}/status`, "utf8"),
-        readFile(`/proc/${pid}/comm`, "utf8"),
-        exec(["/usr/bin/ps", "-o", "unit=,uunit=", "-p", String(pid)], {
-          timeoutMs: 3_000,
-        }).catch(() => ({ exitCode: 1, stdout: "", stderr: "" })),
-      ]);
+      const [procStatRaw, statRaw, statusRaw, commRaw, psRes, clkTck] =
+        await Promise.all([
+          readFile(`${procRoot}/stat`, "utf8"),
+          readFile(`${procRoot}/${pid}/stat`, "utf8"),
+          readFile(`${procRoot}/${pid}/status`, "utf8"),
+          readFile(`${procRoot}/${pid}/comm`, "utf8"),
+          exec(["/usr/bin/ps", "-o", "unit=,uunit=", "-p", String(pid)], {
+            timeoutMs: 3_000,
+          }).catch(() => ({ exitCode: 1, stdout: "", stderr: "" })),
+          getClkTck(),
+        ]);
+
+      const btimeMatch = /^btime\s+(\d+)/m.exec(procStatRaw);
+      if (!btimeMatch) return null;
+      const btimeSeconds = Number(btimeMatch[1]);
+      if (!Number.isSafeInteger(btimeSeconds) || btimeSeconds <= 0) {
+        return null;
+      }
 
       const closeParen = statRaw.lastIndexOf(")");
       if (closeParen === -1) return null;
       const fields = statRaw.slice(closeParen + 2).trim().split(/\s+/);
-      // In /proc/<pid>/stat, field 22 (1-indexed) is starttime; after comm (field 2), index 19.
-      const startedAt = Number(fields[19]);
+      // In /proc/<pid>/stat, field 22 (1-indexed) is starttime in clock ticks since boot;
+      // after comm (field 2), index 19.
+      const startTicks = Number(fields[19]);
+      if (!Number.isSafeInteger(startTicks) || startTicks < 0) {
+        return null;
+      }
+
+      // Convert boot time + starttime ticks to Unix epoch milliseconds to match
+      // events.ts and collector.ts (now - etimes * 1000).
+      const startedAt = Math.floor(btimeSeconds + startTicks / clkTck) * 1_000;
       if (!Number.isSafeInteger(startedAt) || startedAt <= 0) {
         return null;
       }

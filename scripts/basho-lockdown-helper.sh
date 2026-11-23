@@ -307,6 +307,76 @@ find_lan_policy_file() {
   return 1
 }
 
+verify_helper_install() {
+  if [ "$TEST_MODE" != "0" ]; then
+    return 0
+  fi
+  if [ "$SCRIPT_SELF" != "$HELPER_SELF" ]; then
+    return 1
+  fi
+  if [ -L "$HELPER_SELF" ] || [ ! -f "$HELPER_SELF" ]; then
+    return 1
+  fi
+  local owner mode
+  owner="$(/usr/bin/stat -c '%u' "$HELPER_SELF" 2>/dev/null || printf 'invalid')"
+  mode="$(/usr/bin/stat -c '%a' "$HELPER_SELF" 2>/dev/null || printf '777')"
+  if [ "$owner" != "0" ] || [[ ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+    return 1
+  fi
+  if [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
+    return 1
+  fi
+  return 0
+}
+
+verify_ufw_active() {
+  UFW_STATUS_OUT=""
+  local ufw_status_out
+  if ! ufw_status_out="$("$UFW_BIN" status 2>/dev/null)"; then
+    return 1
+  fi
+  if [ -z "$ufw_status_out" ]; then
+    return 1
+  fi
+  if printf '%s\n' "$ufw_status_out" | /usr/bin/grep -Eqi '(^|[[:space:]])Status:[[:space:]]*inactive([[:space:]]|$)'; then
+    return 1
+  fi
+  if [ "$TEST_MODE" = "0" ]; then
+    if ! printf '%s\n' "$ufw_status_out" | /usr/bin/grep -Eqi '^Status:[[:space:]]*active([[:space:]]|$)'; then
+      return 1
+    fi
+  else
+    if printf '%s\n' "$ufw_status_out" | /usr/bin/grep -Eqi '(^|[[:space:]])Status:' && \
+       ! printf '%s\n' "$ufw_status_out" | /usr/bin/grep -Eqi '(^|[[:space:]])Status:[[:space:]]*active([[:space:]]|$)'; then
+      return 1
+    fi
+  fi
+  UFW_STATUS_OUT="$ufw_status_out"
+  return 0
+}
+
+has_preserved_tailscale_allow() {
+  local ufw_out="$1"
+  printf '%s\n' "$ufw_out" | /usr/bin/awk '
+    {
+      line = $0
+      sub(/#.*/, "", line)
+      sub(/^\[[[:space:]]*[0-9]+\][[:space:]]*/, "", line)
+      has_tailscale = (line ~ /(^|[[:space:]])(on[[:space:]]+)?tailscale0([[:space:]]|$)/) ||
+                      (line ~ /(^|[[:space:]])41641(\/udp)?([[:space:]]|$)/)
+      if (!has_tailscale) next
+      has_allow = (line ~ /(^|[[:space:]])ALLOW([[:space:]]+IN)?([[:space:]]|$)/) &&
+                  !(line ~ /(^|[[:space:]])ALLOW[[:space:]]+(OUT|FWD)([[:space:]]|$)/) &&
+                  !(line ~ /(^|[[:space:]])(DENY|REJECT)([[:space:]]|$)/)
+      has_deny = (line ~ /(^|[[:space:]])(DENY|REJECT)([[:space:]]+IN)?([[:space:]]|$)/) &&
+                 !(line ~ /(^|[[:space:]])(DENY|REJECT)[[:space:]]+(OUT|FWD)([[:space:]]|$)/)
+      if (has_deny) blocked = 1
+      if (has_allow) found = 1
+    }
+    END { exit((found && !blocked) ? 0 : 1) }
+  '
+}
+
 load_and_verify_lan_policy() {
   LAN_INTERFACE=""
   LAN_PORTS_LIST=()
@@ -384,15 +454,11 @@ load_and_verify_lan_policy() {
 
   [ "${#LAN_PORTS_LIST[@]}" -gt 0 ] || return 1
 
-  # Verify UFW status and preserved loopback/Tailscale paths before any mutation.
-  local ufw_status_out
-  if ! ufw_status_out="$("$UFW_BIN" status 2>/dev/null)"; then
+  # Verify UFW is active and preserved Tailscale paths are explicitly allowed before any mutation.
+  if ! verify_ufw_active; then
     return 1
   fi
-  if [ -z "$ufw_status_out" ]; then
-    return 1
-  fi
-  if ! printf '%s\n' "$ufw_status_out" | /usr/bin/grep -Eq '(tailscale0|41641/udp|41641\b)'; then
+  if ! has_preserved_tailscale_allow "$UFW_STATUS_OUT"; then
     return 1
   fi
 
@@ -403,12 +469,14 @@ find_tagged_rule_numbers_desc() {
   local ufw_numbered="$1"
   local tag="basho-$2"
   printf '%s\n' "$ufw_numbered" | /usr/bin/awk -v tag="$tag" '
-    match($0, /^\[[[:space:]]*([0-9]+)\]/, m) {
+    match($0, /^\[[[:space:]]*[0-9]+\]/) {
+      num = substr($0, RSTART + 1, RLENGTH - 2)
+      gsub(/[[:space:]]+/, "", num)
       idx = index($0, "# " tag)
       if (idx > 0) {
         rest = substr($0, idx + length("# " tag))
         if (rest == "" || substr(rest, 1, 1) ~ /[[:space:]]/) {
-          print m[1]
+          print num
         }
       }
     }
@@ -417,10 +485,11 @@ find_tagged_rule_numbers_desc() {
 
 cmd_status() {
   [ $# -eq 0 ] || die "status takes no arguments" 64
+  verify_helper_install || die "helper path or ownership verification failed" 1
   [ -x "$UFW_BIN" ] || die "ufw binary unavailable" 1
   [ -x "$SYSTEMD_RUN_BIN" ] || die "systemd-run binary unavailable" 1
   ensure_state_dir
-  "$UFW_BIN" status >/dev/null || die "ufw status failed" 1
+  verify_ufw_active || die "ufw is not active" 1
 
   local lan_state="missing"
   if load_and_verify_lan_policy; then
@@ -433,6 +502,7 @@ cmd_deny_ip() {
   [ $# -eq 3 ] || die "usage: deny-ip <ip> <ttl> <id>" 64
   local raw_ip="$1" ttl="$2" op_id="$3"
 
+  verify_helper_install || die "helper path or ownership verification failed" 1
   validate_ttl "$ttl"
   validate_op_id "$op_id"
   if ! canonicalize_and_validate_ip "$raw_ip"; then
@@ -440,6 +510,7 @@ cmd_deny_ip() {
   fi
   [ -x "$UFW_BIN" ] || die "ufw binary unavailable" 1
   [ -x "$SYSTEMD_RUN_BIN" ] || die "systemd-run binary unavailable" 1
+  verify_ufw_active || die "ufw is not active" 1
 
   ensure_state_dir
   local lock_file="${STATE_DIR}/lock"
@@ -478,6 +549,7 @@ cmd_isolate_lan() {
   [ $# -eq 2 ] || die "usage: isolate-lan <ttl> <id>" 64
   local ttl="$1" op_id="$2"
 
+  verify_helper_install || die "helper path or ownership verification failed" 1
   validate_ttl "$ttl"
   validate_op_id "$op_id"
 
@@ -512,14 +584,15 @@ cmd_isolate_lan() {
   local port
   for port in "${LAN_PORTS_LIST[@]}"; do
     if ! "$UFW_BIN" prepend deny in on "$LAN_INTERFACE" to any port "$port" comment "basho-${op_id}" >/dev/null; then
-      # Best-effort cleanup of partially inserted tagged rules.
-      local partial_out num
-      if partial_out="$("$UFW_BIN" status numbered 2>/dev/null)"; then
-        while IFS= read -r num; do
-          [ -n "$num" ] || continue
-          "$UFW_BIN" --force delete "$num" >/dev/null 2>&1 || true
-        done < <(find_tagged_rule_numbers_desc "$partial_out" "$op_id")
-      fi
+      # Best-effort cleanup of partially inserted tagged rules, re-reading rule numbers each step.
+      local partial_out next_num cleanup_iter=0
+      while [ "$cleanup_iter" -lt 128 ]; do
+        partial_out="$("$UFW_BIN" status numbered 2>/dev/null)" || break
+        next_num="$(find_tagged_rule_numbers_desc "$partial_out" "$op_id" | /usr/bin/head -n 1)"
+        [ -n "$next_num" ] || break
+        "$UFW_BIN" --force delete "$next_num" >/dev/null 2>&1 || break
+        cleanup_iter=$((cleanup_iter + 1))
+      done
       die "failed to prepend LAN isolation rule for port $port" 1
     fi
   done
@@ -565,18 +638,24 @@ cmd_rollback() {
   exec 9>"$lock_file"
   /usr/bin/flock -x 9
 
-  local ufw_out
-  if ! ufw_out="$("$UFW_BIN" status numbered)"; then
-    die "ufw status failed during rollback" 1
-  fi
-
-  local num
-  while IFS= read -r num; do
-    [ -n "$num" ] || continue
-    if ! "$UFW_BIN" --force delete "$num" >/dev/null; then
-      die "failed to delete tagged rule $num" 1
+  # Re-read `ufw status numbered` before every single delete so concurrent operator
+  # edits cannot cause stale rule numbers to delete the wrong rule.
+  local max_iterations=128
+  local iter=0
+  local ufw_out next_num
+  while [ "$iter" -lt "$max_iterations" ]; do
+    if ! ufw_out="$("$UFW_BIN" status numbered)"; then
+      die "ufw status failed during rollback" 1
     fi
-  done < <(find_tagged_rule_numbers_desc "$ufw_out" "$op_id")
+    next_num="$(find_tagged_rule_numbers_desc "$ufw_out" "$op_id" | /usr/bin/head -n 1)"
+    if [ -z "$next_num" ]; then
+      break
+    fi
+    if ! "$UFW_BIN" --force delete "$next_num" >/dev/null; then
+      die "failed to delete tagged rule $next_num" 1
+    fi
+    iter=$((iter + 1))
+  done
 
   # Confirm no rules carrying this tag remain before clearing lease state.
   local verify_out remaining

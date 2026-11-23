@@ -18,6 +18,7 @@ import {
   LockdownEngine,
   createCompositeLockdownAdapter,
   createHelperLockdownAdapter,
+  createProcProcessResolver,
   createUserWorkloadLockdownAdapter,
   decideContainment,
 } from "../../src/security/lockdown";
@@ -1642,5 +1643,403 @@ describe("DeadMansSwitch user-unit scope and production adapters", () => {
         (argv) => argv[0] === "/usr/bin/systemd-run" || argv.includes("freeze"),
       ),
     ).toBe(false);
+  });
+
+  test("createProcProcessResolver computes epoch-ms startedAt matching events.ts and DeadMansSwitch", async () => {
+    const procRoot = makeTempDir("proc");
+    const pidDir = join(procRoot, String(ENROLLED_PID));
+    mkdirSync(pidDir, { recursive: true });
+
+    const btimeSec = 1_700_000_000;
+    const clkTck = 100;
+    const startOffsetSec = 123;
+    const startTicks = startOffsetSec * clkTck; // 12300 ticks after boot
+    const expectedStartedAtMs = (btimeSec + startOffsetSec) * 1_000;
+
+    // Cross-check with events.ts formula: nowMs - etimes * 1000
+    const sampleNowMs = (btimeSec + 500) * 1_000;
+    const etimesSec = 500 - startOffsetSec;
+    const eventStartedAtMs = sampleNowMs - etimesSec * 1_000;
+    expect(eventStartedAtMs).toBe(expectedStartedAtMs);
+
+    writeFileSync(
+      join(procRoot, "stat"),
+      `cpu  100 0 50 1000 0 0 0 0 0 0\nbtime ${btimeSec}\nprocesses 4242\n`,
+      "utf8",
+    );
+    // Fields after "(comm)" are fields 3..22: index 19 is starttime (field 22).
+    const afterCommFields = [
+      "S", // 3 state
+      "1", // 4 ppid
+      "4242", // 5 pgrp
+      "4242", // 6 session
+      "0", // 7 tty_nr
+      "-1", // 8 tpgid
+      "4194304", // 9 flags
+      "100", // 10 minflt
+      "0", // 11 cminflt
+      "0", // 12 majflt
+      "0", // 13 cmajflt
+      "10", // 14 utime
+      "5", // 15 stime
+      "0", // 16 cutime
+      "0", // 17 cstime
+      "20", // 18 priority
+      "0", // 19 nice
+      "4", // 20 num_threads
+      "0", // 21 itrealvalue
+      String(startTicks), // 22 starttime (ticks since boot)
+      "1048576", // 23 vsize
+      "256", // 24 rss
+    ];
+    writeFileSync(
+      join(pidDir, "stat"),
+      `${ENROLLED_PID} (ollama) ${afterCommFields.join(" ")}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      join(pidDir, "status"),
+      `Name:\tollama\nUid:\t${CURRENT_UID}\t${CURRENT_UID}\t${CURRENT_UID}\t${CURRENT_UID}\n`,
+      "utf8",
+    );
+    writeFileSync(join(pidDir, "comm"), "ollama\n", "utf8");
+
+    const resolver = createProcProcessResolver({
+      procRoot,
+      clkTck,
+      exec: async () => ({
+        exitCode: 0,
+        stdout: `user@${CURRENT_UID}.service ${ENROLLED_UNIT}\n`,
+        stderr: "",
+      }),
+    });
+
+    const identity = await resolver(ENROLLED_PID);
+    expect(identity).not.toBeNull();
+    expect(identity!.startedAt).toBe(eventStartedAtMs);
+
+    const guard = new DeadMansSwitch();
+    expect(
+      guard.allows(
+        {
+          kind: "pause_workload",
+          workloadId: ENROLLED_ID,
+          pid: ENROLLED_PID,
+          startedAt: eventStartedAtMs,
+        },
+        {
+          workloads: [ENROLLED_WORKLOAD],
+          currentProcess: identity,
+          currentUid: CURRENT_UID,
+        },
+      ),
+    ).toBe(true);
+
+    // Exact === check must still reject drifted start times.
+    expect(
+      guard.allows(
+        {
+          kind: "pause_workload",
+          workloadId: ENROLLED_ID,
+          pid: ENROLLED_PID,
+          startedAt: eventStartedAtMs + 1,
+        },
+        {
+          workloads: [ENROLLED_WORKLOAD],
+          currentProcess: identity,
+          currentUid: CURRENT_UID,
+        },
+      ),
+    ).toBe(false);
+  });
+
+  test("user workload apply keeps thaw timer armed on freeze timeout or non-running FreezerState and stops it only when confirmed running", async () => {
+    const makeAction = (id: string): LockdownAction => ({
+      id,
+      proposalId: "prop-freeze",
+      idempotencyKey: `${id}:1`,
+      target: WORKLOAD_TARGET,
+      state: "pending",
+      createdAt: NOW,
+      expiresAt: NOW + 120 * SECOND,
+      updatedAt: NOW,
+    });
+
+    // Case 1: freeze times out (exit 124) -> timer must stay armed.
+    const timeoutCalls: string[][] = [];
+    const timeoutAdapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => [ENROLLED_WORKLOAD],
+      clock: createClock().clock,
+      resolveProcess: async (pid) => defaultProcess(pid),
+      currentUid: CURRENT_UID,
+      exec: async (argv) => {
+        timeoutCalls.push([...argv]);
+        if (argv.includes("freeze")) {
+          return { exitCode: 124, stdout: "", stderr: "timed out" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    await expect(timeoutAdapter.apply(makeAction("act-timeout"))).rejects.toThrow(/timed out/i);
+    expect(timeoutCalls.some((argv) => argv.includes("stop"))).toBe(false);
+
+    // Case 2: freeze fails (exit 1) and FreezerState is frozen/unknown -> timer must stay armed.
+    const frozenCalls: string[][] = [];
+    const frozenAdapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => [ENROLLED_WORKLOAD],
+      clock: createClock().clock,
+      resolveProcess: async (pid) => defaultProcess(pid),
+      currentUid: CURRENT_UID,
+      exec: async (argv) => {
+        frozenCalls.push([...argv]);
+        if (argv.includes("freeze")) {
+          return { exitCode: 1, stdout: "", stderr: "bus hiccup" };
+        }
+        if (argv.includes("FreezerState")) {
+          return { exitCode: 0, stdout: "frozen\n", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    await expect(frozenAdapter.apply(makeAction("act-frozen-err"))).rejects.toThrow(/bus hiccup/i);
+    expect(frozenCalls.some((argv) => argv.includes("FreezerState"))).toBe(true);
+    expect(frozenCalls.some((argv) => argv.includes("stop"))).toBe(false);
+
+    // Case 3: freeze fails (exit 1) and FreezerState confirms running -> timer is cleaned up.
+    const runningCalls: string[][] = [];
+    const runningAdapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => [ENROLLED_WORKLOAD],
+      clock: createClock().clock,
+      resolveProcess: async (pid) => defaultProcess(pid),
+      currentUid: CURRENT_UID,
+      exec: async (argv) => {
+        runningCalls.push([...argv]);
+        if (argv.includes("freeze")) {
+          return { exitCode: 1, stdout: "", stderr: "unit cannot freeze" };
+        }
+        if (argv.includes("FreezerState")) {
+          return { exitCode: 0, stdout: "running\n", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    await expect(runningAdapter.apply(makeAction("act-running-err"))).rejects.toThrow(
+      /unit cannot freeze/i,
+    );
+    expect(runningCalls.some((argv) => argv.includes("FreezerState"))).toBe(true);
+    expect(
+      runningCalls.some(
+        (argv) => argv.includes("stop") && argv.includes("basho-thaw-act-running-err.timer"),
+      ),
+    ).toBe(true);
+  });
+
+  test("user workload inspect keys on per-action thaw timer and rollback succeeds after de-enrollment", async () => {
+    let enrolledWorkloads: EnrolledWorkload[] = [ENROLLED_WORKLOAD];
+    const activeTimers = new Set<string>();
+    let freezerState = "running";
+    const calls: string[][] = [];
+
+    const adapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => enrolledWorkloads,
+      clock: createClock().clock,
+      resolveProcess: async (pid) => defaultProcess(pid),
+      currentUid: CURRENT_UID,
+      exec: async (argv) => {
+        calls.push([...argv]);
+        if (argv[0] === "/usr/bin/systemd-run") {
+          const unitArg = argv.find((a) => a.startsWith("--unit="));
+          if (unitArg) activeTimers.add(`${unitArg.slice("--unit=".length)}.timer`);
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (argv.includes("freeze")) {
+          freezerState = "frozen";
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (argv.includes("thaw")) {
+          freezerState = "running";
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (argv.includes("stop")) {
+          const timer = argv[argv.length - 1]!;
+          activeTimers.delete(timer);
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (argv.includes("is-active")) {
+          const timer = argv[argv.length - 1]!;
+          return activeTimers.has(timer)
+            ? { exitCode: 0, stdout: "active\n", stderr: "" }
+            : { exitCode: 3, stdout: "inactive\n", stderr: "" };
+        }
+        if (argv.includes("FreezerState")) {
+          return { exitCode: 0, stdout: `${freezerState}\n`, stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    const actionA: LockdownAction = {
+      id: "act-work-a",
+      proposalId: "prop-a",
+      idempotencyKey: "prop-a:1",
+      target: WORKLOAD_TARGET,
+      state: "pending",
+      createdAt: NOW,
+      expiresAt: NOW + 120 * SECOND,
+      updatedAt: NOW,
+    };
+    const actionB: LockdownAction = {
+      id: "act-work-b",
+      proposalId: "prop-b",
+      idempotencyKey: "prop-b:1",
+      target: WORKLOAD_TARGET,
+      state: "pending",
+      createdAt: NOW,
+      expiresAt: NOW + 120 * SECOND,
+      updatedAt: NOW,
+    };
+
+    // Only actionB is applied (its timer is active and unit is frozen).
+    const appliedB = await adapter.apply(actionB);
+    const activeB: LockdownAction = { ...actionB, state: "active", rollbackHandle: appliedB.handle };
+
+    // actionA shares the same unit, but its timer is not active -> must not cross-contaminate.
+    expect(await adapter.inspect(actionA)).toEqual({ state: "absent" });
+    expect(await adapter.inspect(activeB)).toEqual({
+      state: "active",
+      handle: appliedB.handle,
+    });
+
+    // De-enroll the workload: inspect and rollback must still succeed via rollbackHandle.
+    enrolledWorkloads = [];
+    expect(await adapter.inspect(activeB)).toEqual({
+      state: "active",
+      handle: appliedB.handle,
+    });
+    expect(await adapter.rollback(activeB)).toEqual({ state: "absent" });
+    expect(
+      calls.some((argv) => argv.includes("thaw") && argv.includes(ENROLLED_UNIT)),
+    ).toBe(true);
+    expect(freezerState).toBe("running");
+  });
+
+  test("decideContainment keeps isolate_lan_ingress approval-only even with scoped corroboration", () => {
+    for (const rule of ["unexpected_listener", "system_anomaly"] as const) {
+      expect(
+        decideContainment(
+          decisionInput({
+            target: LAN_TARGET,
+            corroboration: [
+              {
+                rule,
+                eventIds: ["ev-lan-1"],
+                expiresAt: NOW + 5 * MINUTE,
+                target: LAN_TARGET,
+              },
+            ],
+          }),
+        ),
+      ).toBe("queue");
+    }
+  });
+});
+
+describe("scripts/basho-lockdown-helper.sh hardening regressions", () => {
+  test("status and deny-ip refuse when ufw reports Status: inactive", () => {
+    const fixture = installHelperFixture();
+    writeFileSync(fixture.rulesPath, "Status: inactive\n", "utf8");
+
+    const status = runHelper(fixture, ["status"]);
+    expect(status.code).not.toBe(0);
+
+    const deny = runHelper(fixture, ["deny-ip", PEER, "600", "op-inactive"]);
+    expect(deny.code).not.toBe(0);
+    expect(firewallMutations(fixture)).toEqual([]);
+    const calls = readFileSync(fixture.logPath, "utf8");
+    expect(calls).not.toContain("systemd-run");
+  });
+
+  test("isolate-lan and status reject DENY rules on tailscale0 or 41641/udp as preserved paths", () => {
+    const fixture = installHelperFixture();
+    writeFileSync(
+      fixture.rulesPath,
+      "22/tcp ALLOW IN Anywhere\nAnywhere DENY IN on tailscale0\n41641/udp DENY IN Anywhere\n",
+      "utf8",
+    );
+    writeFileSync(
+      join(fixture.policyDir, "lan-policy.conf"),
+      "LAN_INTERFACE=enp1s0\nLAN_PORTS=8188,7000\n",
+      "utf8",
+    );
+
+    const status = runHelper(fixture, ["status"]);
+    expect(status.code).toBe(0);
+    expect(status.stdout).toContain("lan_policy=missing");
+
+    const iso = runHelper(fixture, ["isolate-lan", "600", "op-lan-deny-ts"]);
+    expect(iso.code).not.toBe(0);
+    expect(firewallMutations(fixture)).toEqual([]);
+  });
+
+  test("rollback re-reads ufw status numbered before each delete so concurrent rule shifts never remove operator rules", () => {
+    const fixture = installHelperFixture();
+    // Seed two tagged rules separated by an operator rule, and replace fake ufw with one
+    // that inserts a concurrent operator rule at position 1 after the first delete.
+    writeFileSync(
+      fixture.rulesPath,
+      [
+        "Anywhere DENY IN 198.51.100.42 # basho-op-shift",
+        "22/tcp ALLOW IN Anywhere",
+        "Anywhere DENY IN 198.51.100.42 # basho-op-shift",
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const shiftFlag = join(fixture.root, "shifted.flag");
+    const shiftingUfw = `#!/usr/bin/env bash
+set -u
+rules="\${BASHO_FAKE_UFW_RULES:?}"
+flag="${shiftFlag}"
+log="\${BASHO_FAKE_LOG:?}"
+printf 'ufw %s\\n' "$*" >>"$log"
+cmd="\${1:-}"
+case "$cmd" in
+  status)
+    n=0
+    while IFS= read -r line; do
+      n=$((n + 1))
+      printf '[%2d] %s\\n' "$n" "$line"
+    done <"$rules"
+    exit 0
+    ;;
+  --force|-f)
+    shift
+    exec "$0" "$@"
+    ;;
+  delete)
+    shift
+    while [ "\${1:-}" = "--force" ] || [ "\${1:-}" = "-f" ]; do shift; done
+    target="$1"
+    awk -v target="$target" '{ n = n + 1 } n != target { print }' "$rules" >"$rules.tmp"
+    mv "$rules.tmp" "$rules"
+    if [ ! -f "$flag" ]; then
+      touch "$flag"
+      printf '443/tcp ALLOW IN Anywhere\\n' | cat - "$rules" >"$rules.tmp"
+      mv "$rules.tmp" "$rules"
+    fi
+    exit 0
+    ;;
+esac
+`;
+    const ufwPath = join(fixture.bin, "ufw");
+    writeFileSync(ufwPath, shiftingUfw, "utf8");
+    chmodSync(ufwPath, 0o755);
+
+    const rb = runHelper(fixture, ["rollback", "op-shift"]);
+    expect(rb.code).toBe(0);
+
+    const remaining = readFileSync(fixture.rulesPath, "utf8");
+    expect(remaining).not.toContain("basho-op-shift");
+    expect(remaining).toContain("22/tcp ALLOW IN Anywhere");
+    expect(remaining).toContain("443/tcp ALLOW IN Anywhere");
   });
 });
