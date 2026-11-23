@@ -1289,3 +1289,55 @@ test(
   },
   1500,
 );
+
+test("direct child exit terminates lingering descendants that closed stdout and stderr", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "basho-runner-closed-pipes-"));
+  const pidFile = join(dir, "descendant.pid");
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+    realSpawn(
+      [
+        "/bin/sh",
+        "-c",
+        `sleep 30 </dev/null >&- 2>&- & echo $! > '${pidFile}'; printf 'done\\n'; exit 0`,
+      ],
+      options as Parameters<typeof Bun.spawn>[1],
+    )) as typeof Bun.spawn);
+
+  const isPidAlive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  try {
+    const result = await createCommandRunner({ timeoutMs: 1_000 }).run({ kind: "processes" });
+    expect(result).toEqual({ status: "ok", stdout: "done\n", exitCode: 0 });
+    expect(existsSync(pidFile)).toBe(true);
+
+    const descendantPid = Number(readFileSync(pidFile, "utf8").trim());
+    expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+
+    const deadline = performance.now() + 500;
+    while (isPidAlive(descendantPid) && performance.now() < deadline) {
+      await Bun.sleep(10);
+    }
+    expect(isPidAlive(descendantPid)).toBe(false);
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+    try {
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      if (Number.isInteger(pid) && pid > 0) {
+        process.kill(pid, "SIGKILL");
+      }
+    } catch {
+      // Descendant already terminated.
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

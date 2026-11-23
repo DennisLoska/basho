@@ -776,6 +776,7 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
         clearTimeout(timeoutId);
         clearTimeout(postExitTimer);
         clearTimeout(reapGraceTimer);
+        killProcessGroup();
         if (signal) {
           signal.removeEventListener("abort", onAbort);
         }

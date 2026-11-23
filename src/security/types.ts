@@ -26,7 +26,7 @@ export const alertChannels = [
 export type AlertChannel = (typeof alertChannels)[number];
 
 export type Coverage = "complete" | "partial" | "unavailable";
-export type Facts = Record<string, string | number | boolean | null>;
+export type Facts = Readonly<Record<string, string | number | boolean | null>>;
 
 export interface Clock {
   now(): number;
@@ -35,9 +35,9 @@ export interface Clock {
 export type HttpFetcher = (url: string, init: RequestInit) => Promise<Response>;
 
 export interface Evidence {
-  id: string;
-  kind: "criterion" | "listener" | "event" | "process" | "unit";
-  facts: Facts;
+  readonly id: string;
+  readonly kind: "criterion" | "listener" | "event" | "process" | "unit";
+  readonly facts: Facts;
 }
 
 export interface PostureCheck {

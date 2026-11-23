@@ -79,3 +79,7 @@ _Avoid_: SecurityFinding, alert, containment decision
 **ContainmentTarget**:
 A closed, typed union identifying the exact allowlisted subject of a containment operation (`pause_workload`, `deny_peer_ip`, or `isolate_lan_ingress`) referenced by `Corroboration`, `LockdownProposal`, and `LockdownAction`.
 _Avoid_: Target string, shell argument, arbitrary host resource
+
+**EvidenceTool**:
+An allowlisted read-only investigation operation (`read_posture_detail`, `read_listener_detail`, `read_recent_events`, `read_process_summary`, or `read_unit_status`) invoked by the AI analyst and recorded in the `InvestigationTrail`.
+_Avoid_: Arbitrary tool call, shell command, raw query
