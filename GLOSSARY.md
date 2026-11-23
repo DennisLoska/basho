@@ -115,3 +115,11 @@ _Avoid_: Tool runner, log proxy, evidence dump
 **ProposalDraft**:
 An unpersisted, locally validated containment candidate produced by `AiAnalyst` pairing a strict `ContainmentTarget` with issued `Evidence` IDs, before policy evaluation or persistence as a `LockdownProposal`.
 _Avoid_: Approved action, LockdownProposal, raw recommendation
+
+**LockdownEngine**:
+The policy and lease-lifecycle controller that evaluates `ProposalDraft` candidates through `DeadMansSwitch` and `LockdownAdapter`, persists `LockdownProposal` records, atomically claims execution via SQLite CAS, and reconciles uncertain applies, rollbacks, and expired leases.
+_Avoid_: Firewall controller, remediation runner, auto-blocker
+
+**LockdownAdapter**:
+The typed containment execution seam (`preflight`, `apply`, `inspect`, `rollback`) separating `LockdownEngine` policy from host enforcement backends such as the privileged helper (`basho-lockdown-helper`) and user-space `systemctl --user` workload freeze/thaw.
+_Avoid_: Shell executor, sudo wrapper, ufw client
