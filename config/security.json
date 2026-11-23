@@ -1,0 +1,23 @@
+{
+  "mode": "approve",
+  "scanIntervalMinutes": 60,
+  "criteria": {},
+  "expectedPorts": [22, 6969],
+  "workloads": [],
+  "ai": {
+    "baseURL": "https://opencode.ai/zen/go/v1",
+    "model": "deepseek-v4.1-flash",
+    "sessionHeader": true,
+    "confidenceThreshold": 0.85,
+    "triageCooldownMinutes": 10
+  },
+  "notifications": {
+    "channels": ["in-app"],
+    "cooldownMinutes": 15
+  },
+  "lockdown": {
+    "proposalMinutes": 30,
+    "leaseSeconds": 600,
+    "helperEnabled": false
+  }
+}
