@@ -166,7 +166,18 @@ function validateUrl(
     if (parsed.search !== "" || raw.includes("?")) {
       throw new Error(`Invalid ${label}: must be a bare origin without query parameters`);
     }
-    if (parsed.pathname !== "/") {
+    if (!/^https?:\/\//i.test(raw)) {
+      throw new Error(`Invalid ${label}: must be a bare origin`);
+    }
+    const afterScheme = raw.slice(raw.indexOf("://") + 3);
+    if (afterScheme.includes("\\") || afterScheme.includes("@")) {
+      throw new Error(`Invalid ${label}: must be a bare origin without a path`);
+    }
+    const slashIdx = afterScheme.indexOf("/");
+    if (
+      parsed.pathname !== "/" ||
+      (slashIdx !== -1 && slashIdx !== afterScheme.length - 1)
+    ) {
       throw new Error(`Invalid ${label}: must be a bare origin without a path`);
     }
     return parsed.origin;
@@ -339,6 +350,10 @@ function validateOverrides(overrides: RuntimeOverrides | undefined): RuntimeOver
   return overrides;
 }
 
+function withDefault<T>(value: unknown, fallback: T): unknown {
+  return value === undefined ? fallback : value;
+}
+
 export function loadSecurityConfig(
   input: LoadSecurityConfigInput = {},
 ): { settings: SecuritySettings; secrets: SecuritySecrets } {
@@ -359,49 +374,56 @@ export function loadSecurityConfig(
     throw new Error("Invalid lockdown configuration: expected object");
   }
 
-  const mode = validateMode(overrides.mode ?? file.mode ?? "approve");
-  const scanIntervalMinutes = validateIntRange(
-    overrides.scanIntervalMinutes ?? file.scanIntervalMinutes ?? 60,
-    1,
-    1440,
-    "scanIntervalMinutes",
-  );
+  const fileMode = file.mode !== undefined ? validateMode(file.mode) : undefined;
+  const overrideMode = overrides.mode !== undefined ? validateMode(overrides.mode) : undefined;
+  const mode = overrideMode ?? fileMode ?? "approve";
+
+  const fileScanInterval =
+    file.scanIntervalMinutes !== undefined
+      ? validateIntRange(file.scanIntervalMinutes, 1, 1440, "scanIntervalMinutes")
+      : undefined;
+  const overrideScanInterval =
+    overrides.scanIntervalMinutes !== undefined
+      ? validateIntRange(overrides.scanIntervalMinutes, 1, 1440, "scanIntervalMinutes")
+      : undefined;
+  const scanIntervalMinutes = overrideScanInterval ?? fileScanInterval ?? 60;
 
   let criteria = defaultCriteria();
   criteria = mergeCriteria(criteria, file.criteria, "criteria");
   criteria = mergeCriteria(criteria, overrides.criteria, "overrides.criteria");
 
-  const expectedPorts = validateExpectedPorts(file.expectedPorts ?? [22, 6969]);
-  const workloads = validateWorkloads(file.workloads ?? []);
+  const expectedPorts = validateExpectedPorts(withDefault(file.expectedPorts, [22, 6969]));
+  const workloads = validateWorkloads(withDefault(file.workloads, []));
 
+  const fileBaseURL =
+    fileAi.baseURL !== undefined ? validateUrl(fileAi.baseURL, "ai.baseURL") : undefined;
   const envBaseURL = env.OPENCODE_BASE_URL;
-  const rawBaseURL =
+  const baseURL =
     envBaseURL !== undefined && envBaseURL !== ""
-      ? envBaseURL
-      : (fileAi.baseURL ?? "https://opencode.ai/zen/go/v1");
-  const baseURL = validateUrl(rawBaseURL, "ai.baseURL");
+      ? validateUrl(envBaseURL, "ai.baseURL")
+      : (fileBaseURL ?? "https://opencode.ai/zen/go/v1");
 
-  const model = fileAi.model ?? "deepseek-v4.1-flash";
+  const model = withDefault(fileAi.model, "deepseek-v4.1-flash");
   if (typeof model !== "string" || model.trim() === "") {
     throw new Error("Invalid ai.model: expected non-empty string");
   }
 
-  const sessionHeader = fileAi.sessionHeader ?? true;
+  const sessionHeader = withDefault(fileAi.sessionHeader, true);
   if (typeof sessionHeader !== "boolean") {
     throw new Error("Invalid ai.sessionHeader: expected boolean");
   }
 
-  const confidenceThreshold = validateConfidence(fileAi.confidenceThreshold ?? 0.85);
+  const confidenceThreshold = validateConfidence(withDefault(fileAi.confidenceThreshold, 0.85));
   const triageCooldownMinutes = validateIntRange(
-    fileAi.triageCooldownMinutes ?? 10,
+    withDefault(fileAi.triageCooldownMinutes, 10),
     0,
     1440,
     "ai.triageCooldownMinutes",
   );
 
-  const channels = validateChannels(fileNotifications.channels ?? ["in-app"]);
+  const channels = validateChannels(withDefault(fileNotifications.channels, ["in-app"]));
   const cooldownMinutes = validateIntRange(
-    fileNotifications.cooldownMinutes ?? 15,
+    withDefault(fileNotifications.cooldownMinutes, 15),
     0,
     1440,
     "notifications.cooldownMinutes",
@@ -418,18 +440,18 @@ export function loadSecurityConfig(
       : undefined;
 
   const proposalMinutes = validateIntRange(
-    fileLockdown.proposalMinutes ?? 30,
+    withDefault(fileLockdown.proposalMinutes, 30),
     1,
     1440,
     "lockdown.proposalMinutes",
   );
   const leaseSeconds = validateIntRange(
-    fileLockdown.leaseSeconds ?? 600,
+    withDefault(fileLockdown.leaseSeconds, 600),
     30,
     1800,
     "lockdown.leaseSeconds",
   );
-  const helperEnabled = fileLockdown.helperEnabled ?? false;
+  const helperEnabled = withDefault(fileLockdown.helperEnabled, false);
   if (typeof helperEnabled !== "boolean") {
     throw new Error("Invalid lockdown.helperEnabled: expected boolean");
   }

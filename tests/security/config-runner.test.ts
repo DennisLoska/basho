@@ -1,4 +1,7 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { loadSecurityConfig } from "../../src/security/config";
 import { createCommandRunner, readBounded } from "../../src/security/runner";
 import { criterionIds } from "../../src/security/types";
@@ -452,5 +455,274 @@ test("a benign recipe resolves without leaking environment secrets", async () =>
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests (Task 1 review findings)
+// ---------------------------------------------------------------------------
+
+test("explicit null in overrides is rejected instead of falling back to defaults", () => {
+  expect(() =>
+    loadSecurityConfig({
+      env: {},
+      overrides: { mode: null as unknown as LockdownMode },
+    }),
+  ).toThrow();
+  expect(() =>
+    loadSecurityConfig({
+      env: {},
+      overrides: { scanIntervalMinutes: null as unknown as number },
+    }),
+  ).toThrow();
+  expect(() =>
+    loadSecurityConfig({
+      env: {},
+      overrides: { criteria: null as unknown as Record<string, boolean> },
+    }),
+  ).toThrow();
+});
+
+test("explicit null in fileConfig fields is rejected instead of applying defaults", () => {
+  const nullConfigs: unknown[] = [
+    { mode: null },
+    { scanIntervalMinutes: null },
+    { expectedPorts: null },
+    { workloads: null },
+    { ai: { baseURL: null } },
+    { ai: { model: null } },
+    { ai: { sessionHeader: null } },
+    { ai: { confidenceThreshold: null } },
+    { ai: { triageCooldownMinutes: null } },
+    { notifications: { channels: null } },
+    { notifications: { cooldownMinutes: null } },
+    { notifications: { ntfyUrl: null } },
+    { notifications: { publicOrigin: null } },
+    { lockdown: { proposalMinutes: null } },
+    { lockdown: { leaseSeconds: null } },
+    { lockdown: { helperEnabled: null } },
+  ];
+
+  for (const fileConfig of nullConfigs) {
+    expect(() => loadSecurityConfig({ env: {}, fileConfig })).toThrow();
+  }
+
+  // Omitted or explicit undefined still falls back to defaults.
+  const withUndefined = loadSecurityConfig({
+    env: {},
+    fileConfig: {
+      mode: undefined,
+      scanIntervalMinutes: undefined,
+      expectedPorts: undefined,
+      ai: { confidenceThreshold: undefined },
+      lockdown: { leaseSeconds: undefined },
+    },
+    overrides: { mode: undefined, scanIntervalMinutes: undefined },
+  });
+  expect(withUndefined.settings.mode).toBe("approve");
+  expect(withUndefined.settings.scanIntervalMinutes).toBe(60);
+  expect(withUndefined.settings.expectedPorts).toEqual([22, 6969]);
+  expect(withUndefined.settings.ai.confidenceThreshold).toBe(0.85);
+  expect(withUndefined.settings.lockdown.leaseSeconds).toBe(600);
+});
+
+test("publicOrigin rejects raw paths that normalize to root", () => {
+  const invalidOrigins = [
+    "https://basho.example.test/dashboard/..",
+    "https://basho.example.test/.",
+    "https://basho.example.test/..",
+    "https://basho.example.test//",
+    "https://basho.example.test/a/../",
+    "https://basho.example.test\\dashboard\\..",
+    "https://basho.example.test/?",
+    "https://basho.example.test/#",
+  ];
+
+  for (const publicOrigin of invalidOrigins) {
+    expect(() =>
+      loadSecurityConfig({
+        env: {},
+        fileConfig: { notifications: { publicOrigin } },
+      }),
+    ).toThrow();
+  }
+
+  expect(
+    loadSecurityConfig({
+      env: {},
+      fileConfig: { notifications: { publicOrigin: "https://basho.example.test/" } },
+    }).settings.notifications.publicOrigin,
+  ).toBe("https://basho.example.test");
+  expect(
+    loadSecurityConfig({
+      env: {},
+      fileConfig: { notifications: { publicOrigin: "https://basho.example.test:8443/" } },
+    }).settings.notifications.publicOrigin,
+  ).toBe("https://basho.example.test:8443");
+});
+
+test("readBounded still throws output limit when stream cancel rejects", async () => {
+  let canceled = false;
+  const input = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(5));
+    },
+    cancel() {
+      canceled = true;
+      return Promise.reject(new Error("cancel exploded"));
+    },
+  });
+
+  const error = await rejectionOf(() => readBounded(input, 4));
+  expect(error.message).toBe("output limit");
+  expect(canceled).toBe(true);
+});
+
+test("readBounded throws output limit immediately when stream cancel stalls", async () => {
+  let canceled = false;
+  const input = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(5));
+    },
+    cancel() {
+      canceled = true;
+      return new Promise(() => {
+        // Intentionally never settles.
+      });
+    },
+  });
+
+  const outcome = await Promise.race([
+    rejectionOf(() => readBounded(input, 4)).then((error) => ({
+      kind: "rejected" as const,
+      message: error.message,
+    })),
+    new Promise<{ kind: "stalled" }>((resolve) =>
+      setTimeout(() => resolve({ kind: "stalled" }), 250),
+    ),
+  ]);
+
+  expect(outcome).toEqual({ kind: "rejected", message: "output limit" });
+  expect(canceled).toBe(true);
+});
+
+test("journal after-cursor fails when command emits a full page and exits non-zero", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+    realSpawn(
+      ["/bin/sh", "-c", 'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; exit 7'],
+      options as Parameters<typeof Bun.spawn>[1],
+    )) as typeof Bun.spawn);
+
+  try {
+    const result = await createCommandRunner().run({
+      kind: "journal",
+      after: "s=abc123",
+      limit: 2,
+    });
+    expect(result).toEqual({ status: "failed" });
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+  }
+});
+
+test("journal after-cursor succeeds when runner stops a streaming command at the line limit", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+    realSpawn(
+      ["/bin/sh", "-c", 'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; sleep 5'],
+      options as Parameters<typeof Bun.spawn>[1],
+    )) as typeof Bun.spawn);
+
+  try {
+    const startedAt = performance.now();
+    const result = await createCommandRunner().run({
+      kind: "journal",
+      after: "s=abc123",
+      limit: 2,
+    });
+    const elapsedMs = performance.now() - startedAt;
+    expect(result).toEqual({
+      status: "ok",
+      stdout: '{"MESSAGE":"one"}\n{"MESSAGE":"two"}',
+      exitCode: 0,
+    });
+    expect(elapsedMs).toBeLessThan(1_000);
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+  }
+});
+
+test("abort returns promptly when a grandchild keeps stdout and stderr pipes open", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "basho-runner-abort-"));
+  const pidFile = join(dir, "grandchild.pid");
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+    realSpawn(
+      ["/bin/sh", "-c", `sleep 5 & echo $! > '${pidFile}'; sleep 5`],
+      options as Parameters<typeof Bun.spawn>[1],
+    )) as typeof Bun.spawn);
+
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), 100);
+
+  try {
+    const startedAt = performance.now();
+    const result = await createCommandRunner().run({ kind: "processes" }, controller.signal);
+    const elapsedMs = performance.now() - startedAt;
+
+    expect(result).toEqual({ status: "failed" });
+    expect(elapsedMs).toBeLessThan(1_000);
+  } finally {
+    clearTimeout(abortTimer);
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+    try {
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      if (Number.isInteger(pid) && pid > 0) {
+        process.kill(pid, "SIGKILL");
+      }
+    } catch {
+      // Grandchild may have already exited.
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("timeout returns promptly when a grandchild keeps stdout and stderr pipes open", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "basho-runner-timeout-"));
+  const pidFile = join(dir, "grandchild.pid");
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+    realSpawn(
+      ["/bin/sh", "-c", `sleep 5 & echo $! > '${pidFile}'; sleep 5`],
+      options as Parameters<typeof Bun.spawn>[1],
+    )) as typeof Bun.spawn);
+
+  try {
+    const startedAt = performance.now();
+    const result = await createCommandRunner({ timeoutMs: 150 }).run({ kind: "processes" });
+    const elapsedMs = performance.now() - startedAt;
+
+    expect(result).toEqual({ status: "timeout" });
+    expect(elapsedMs).toBeLessThan(1_000);
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+    try {
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      if (Number.isInteger(pid) && pid > 0) {
+        process.kill(pid, "SIGKILL");
+      }
+    } catch {
+      // Grandchild may have already exited.
+    }
+    rmSync(dir, { recursive: true, force: true });
   }
 });

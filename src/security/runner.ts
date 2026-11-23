@@ -59,14 +59,27 @@ export function isValidJournalCursor(cursor: string): boolean {
   return JOURNAL_CURSOR_PATTERN.test(cursor);
 }
 
-export async function readBounded(
+async function readBoundedStream(
   stream: ReadableStream<Uint8Array>,
   max: number,
+  registerCancel?: (cancel: () => void) => void,
 ): Promise<string> {
   if (!Number.isInteger(max) || max < 0) {
     throw new RangeError("max must be a non-negative integer");
   }
   const reader = stream.getReader();
+  let canceled = false;
+  const cancel = () => {
+    if (canceled) return;
+    canceled = true;
+    try {
+      void reader.cancel().catch(() => {});
+    } catch {
+      // Ignore cancel errors so they never mask the caller's error.
+    }
+  };
+  registerCancel?.(cancel);
+
   const decoder = new TextDecoder();
   let bytes = 0;
   let text = "";
@@ -76,14 +89,22 @@ export async function readBounded(
       if (done) return text + decoder.decode();
       bytes += value.byteLength;
       if (bytes > max) {
-        await reader.cancel();
+        cancel();
         throw new Error("output limit");
       }
       text += decoder.decode(value, { stream: true });
     }
   } finally {
+    canceled = true;
     reader.releaseLock();
   }
+}
+
+export function readBounded(
+  stream: ReadableStream<Uint8Array>,
+  max: number,
+): Promise<string> {
+  return readBoundedStream(stream, max);
 }
 
 async function readBoundedJsonLines(
@@ -91,8 +112,21 @@ async function readBoundedJsonLines(
   maxBytes: number,
   maxLines: number,
   onLimitReached: () => void,
+  registerCancel?: (cancel: () => void) => void,
 ): Promise<{ text: string; reachedLimit: boolean }> {
   const reader = stream.getReader();
+  let canceled = false;
+  const cancel = () => {
+    if (canceled) return;
+    canceled = true;
+    try {
+      void reader.cancel().catch(() => {});
+    } catch {
+      // Ignore cancel errors so they never mask the caller's error.
+    }
+  };
+  registerCancel?.(cancel);
+
   const decoder = new TextDecoder();
   let bytes = 0;
   let pending = "";
@@ -108,7 +142,7 @@ async function readBoundedJsonLines(
       }
       bytes += value.byteLength;
       if (bytes > maxBytes) {
-        await reader.cancel();
+        cancel();
         throw new Error("output limit");
       }
       pending += decoder.decode(value, { stream: true });
@@ -120,8 +154,8 @@ async function readBoundedJsonLines(
           lines.push(line);
           if (lines.length >= maxLines) {
             reachedLimit = true;
-            await reader.cancel();
             onLimitReached();
+            cancel();
             return { text: lines.join("\n"), reachedLimit };
           }
         }
@@ -129,6 +163,7 @@ async function readBoundedJsonLines(
       }
     }
   } finally {
+    canceled = true;
     reader.releaseLock();
   }
 }
@@ -378,7 +413,16 @@ function buildChildEnv(includeUserRuntimeEnv: boolean): Record<string, string> {
   return env;
 }
 
-export function createCommandRunner(): CommandRunner {
+export interface CommandRunnerOptions {
+  timeoutMs?: number;
+}
+
+export function createCommandRunner(options: CommandRunnerOptions = {}): CommandRunner {
+  const timeoutMs = options.timeoutMs ?? COMMAND_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError("timeoutMs must be a positive finite number");
+  }
+
   return {
     async run(request: CommandRequest, signal?: AbortSignal): Promise<CommandResult> {
       const recipe = buildRecipe(request);
@@ -413,7 +457,19 @@ export function createCommandRunner(): CommandRunner {
       let timedOut = false;
       let aborted = false;
       let overflowed = false;
-      let stoppedAfterLimit = false;
+      let stoppedByLineLimit = false;
+      let processExited = false;
+      const cancelCallbacks: Array<() => void> = [];
+
+      const registerCancel = (cancel: () => void) => {
+        cancelCallbacks.push(cancel);
+      };
+
+      const cancelReaders = () => {
+        for (const cancel of cancelCallbacks) {
+          cancel();
+        }
+      };
 
       const killChild = () => {
         try {
@@ -423,20 +479,33 @@ export function createCommandRunner(): CommandRunner {
         }
       };
 
+      let resolveTerminate!: () => void;
+      const terminatedPromise = new Promise<void>((resolve) => {
+        resolveTerminate = resolve;
+      });
+
+      const exitedPromise = proc.exited.then((code) => {
+        processExited = true;
+        return code;
+      });
+
+      const terminateEarly = () => {
+        cancelReaders();
+        killChild();
+        resolveTerminate();
+      };
+
       const timeoutId = setTimeout(() => {
         timedOut = true;
-        killChild();
-      }, COMMAND_TIMEOUT_MS);
+        terminateEarly();
+      }, timeoutMs);
 
       const onAbort = () => {
         aborted = true;
-        killChild();
+        terminateEarly();
       };
       if (signal) {
         signal.addEventListener("abort", onAbort, { once: true });
-        if (signal.aborted) {
-          onAbort();
-        }
       }
 
       const stdoutStream = proc.stdout;
@@ -450,57 +519,92 @@ export function createCommandRunner(): CommandRunner {
                 MAX_OUTPUT_BYTES,
                 recipe.streamLineLimit,
                 () => {
-                  stoppedAfterLimit = true;
-                  killChild();
+                  if (!processExited && proc.exitCode === null && proc.signalCode === null) {
+                    stoppedByLineLimit = true;
+                    killChild();
+                    cancelReaders();
+                  }
                 },
+                registerCancel,
               )
                 .then((res) => res.text)
                 .catch((err: unknown) => {
                   if (err instanceof Error && err.message === "output limit") {
                     overflowed = true;
-                    killChild();
+                    terminateEarly();
                   }
                   throw err;
                 })
-            : readBounded(stdoutStream, MAX_OUTPUT_BYTES).catch((err: unknown) => {
-                if (err instanceof Error && err.message === "output limit") {
-                  overflowed = true;
-                  killChild();
-                }
-                throw err;
-              })
+            : readBoundedStream(stdoutStream, MAX_OUTPUT_BYTES, registerCancel).catch(
+                (err: unknown) => {
+                  if (err instanceof Error && err.message === "output limit") {
+                    overflowed = true;
+                    terminateEarly();
+                  }
+                  throw err;
+                },
+              )
           : Promise.resolve("");
 
       const stderrPromise: Promise<string> =
         stderrStream && typeof stderrStream !== "number"
-          ? readBounded(stderrStream, MAX_OUTPUT_BYTES).catch((err: unknown) => {
-              if (err instanceof Error && err.message === "output limit") {
-                overflowed = true;
-                killChild();
-              }
-              throw err;
-            })
+          ? readBoundedStream(stderrStream, MAX_OUTPUT_BYTES, registerCancel).catch(
+              (err: unknown) => {
+                if (err instanceof Error && err.message === "output limit") {
+                  overflowed = true;
+                  terminateEarly();
+                }
+                throw err;
+              },
+            )
           : Promise.resolve("");
 
-      try {
-        const [stdoutResult, stderrResult, exitCode] = await Promise.all([
-          stdoutPromise.then(
-            (value) => ({ ok: true as const, value }),
-            () => ({ ok: false as const }),
-          ),
-          stderrPromise.then(
-            () => ({ ok: true as const }),
-            () => ({ ok: false as const }),
-          ),
-          proc.exited,
-        ]);
+      if (signal?.aborted) {
+        onAbort();
+      }
 
-        if (stoppedAfterLimit && !overflowed && !timedOut && !aborted && stdoutResult.ok) {
-          return { status: "ok", stdout: stdoutResult.value, exitCode: 0 };
-        }
+      const stdoutOutcome = stdoutPromise.then(
+        (value) => ({ ok: true as const, value }),
+        () => ({ ok: false as const }),
+      );
+      const stderrOutcome = stderrPromise.then(
+        () => ({ ok: true as const }),
+        () => ({ ok: false as const }),
+      );
+
+      const allDone = Promise.all([stdoutOutcome, stderrOutcome, exitedPromise]).then(
+        ([stdoutResult, stderrResult, exitCode]) => ({
+          kind: "completed" as const,
+          stdoutResult,
+          stderrResult,
+          exitCode,
+        }),
+      );
+
+      const earlyStop = terminatedPromise.then(async () => {
+        await exitedPromise;
+        return { kind: "terminated" as const };
+      });
+
+      try {
+        const outcome = await Promise.race([allDone, earlyStop]);
+
         if (overflowed) return { status: "overflow" };
         if (timedOut) return { status: "timeout" };
         if (aborted) return { status: "failed" };
+
+        if (outcome.kind === "terminated") {
+          return { status: "failed" };
+        }
+
+        const { stdoutResult, stderrResult, exitCode } = outcome;
+        const terminatedByLineLimit =
+          stoppedByLineLimit &&
+          (proc.signalCode === "SIGKILL" || proc.signalCode === "SIGPIPE");
+
+        if (terminatedByLineLimit && stdoutResult.ok) {
+          return { status: "ok", stdout: stdoutResult.value, exitCode: 0 };
+        }
         if (!stdoutResult.ok || !stderrResult.ok) return { status: "failed" };
         if (recipe.benignExitCodes.includes(exitCode)) {
           return { status: "ok", stdout: stdoutResult.value, exitCode };
