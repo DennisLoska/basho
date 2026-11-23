@@ -1933,20 +1933,20 @@ describe("PostureCollector spec re-review regressions (findings 1-6)", () => {
     expect(checkNegated.status).toBe("unknown");
     expect(checkNegated.summary.toLowerCase()).not.toContain("no unused");
 
-    const rateLimitJump = await harness({
+    const unknownCustomJump = await harness({
       files: {
         "ufw-v4": [
           "-A ufw-user-input -p tcp --dport 6969 -j ACCEPT",
-          "-A ufw-user-input -p tcp --dport 22 -j ufw-user-limit",
+          "-A ufw-user-input -p tcp --dport 22 -j custom-chain",
         ].join("\n"),
         "ufw-v6": "-A ufw6-user-input -j RETURN",
       },
-    }).collector.collect("scan-ufw-limit-jump", settings());
+    }).collector.collect("scan-ufw-custom-jump", settings());
 
-    const checkLimit = checkById(rateLimitJump, "firewall_ufw");
-    expect(checkLimit.sourceCoverage.rule_audit).toBe("partial");
-    expect(checkLimit.status).toBe("unknown");
-    expect(checkLimit.summary.toLowerCase()).not.toContain("no unused");
+    const checkCustomJump = checkById(unknownCustomJump, "firewall_ufw");
+    expect(checkCustomJump.sourceCoverage.rule_audit).toBe("partial");
+    expect(checkCustomJump.status).toBe("unknown");
+    expect(checkCustomJump.summary.toLowerCase()).not.toContain("no unused");
   });
 
   test("re-review finding 6: SSH Include glob matching zero drop-in files marks coverage partial", async () => {
@@ -2108,7 +2108,7 @@ describe("PostureCollector Stage 2 code quality regressions", () => {
       true,
     );
 
-    // 2. Match all keeps inMatch true so loosening directives after Match all are not ignored.
+    // 2. Match all overrides global directives directly (fail with normal critical findings, not match_loosening).
     const matchAll = await harness({
       files: {
         "sshd-main": [
@@ -2121,8 +2121,30 @@ describe("PostureCollector Stage 2 code quality regressions", () => {
       },
     }).collector.collect("scan-ssh-match-all", settings());
     const matchAllCheck = checkById(matchAll, "ssh_hardening");
-    expect(matchAllCheck.status).not.toBe("pass");
-    expect(findingsFor(matchAll, matchAllCheck).length).toBeGreaterThan(0);
+    expect(matchAllCheck.status).toBe("fail");
+    const matchAllFindings = findingsFor(matchAll, matchAllCheck);
+    expect(matchAllFindings.some((f) => f.id.includes("password_auth"))).toBe(true);
+    expect(matchAllFindings.some((f) => f.id.includes("match_loosening"))).toBe(false);
+
+    // Match ALL (case-insensitive) with PermitRootLogin yes and KbdInteractiveAuthentication yes.
+    const matchAllRootAndKbd = await harness({
+      files: {
+        "sshd-main": [
+          "PasswordAuthentication no",
+          "PermitRootLogin no",
+          "KbdInteractiveAuthentication no",
+          "Match ALL",
+          "  PermitRootLogin yes",
+          "  KbdInteractiveAuthentication yes",
+        ].join("\n"),
+      },
+    }).collector.collect("scan-ssh-match-all-root-kbd", settings());
+    const matchAllRootCheck = checkById(matchAllRootAndKbd, "ssh_hardening");
+    expect(matchAllRootCheck.status).toBe("fail");
+    const matchAllRootFindings = findingsFor(matchAllRootAndKbd, matchAllRootCheck);
+    expect(matchAllRootFindings.some((f) => f.id.includes("root_login"))).toBe(true);
+    expect(matchAllRootFindings.some((f) => f.id.includes("kbd_interactive"))).toBe(true);
+    expect(matchAllRootFindings.some((f) => f.id.includes("match_loosening"))).toBe(false);
 
     // 3. Zero-match Include *.conf when dropIns is [] (readable empty dir) still flags default auth yes.
     const emptyIncludeWithDefaults = await harness({
@@ -2176,6 +2198,122 @@ describe("PostureCollector Stage 2 code quality regressions", () => {
         defaultInput: "deny",
       }),
     ).toBe("allow");
+  });
+
+  test("real 3-line ufw limit rules return allow for IPv4 and IPv6 and keep unknown modules on ACCEPT/DROP unknown", async () => {
+    const realV4LimitRules = [
+      "-A ufw-user-input -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --set",
+      "-A ufw-user-input -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --update --seconds 30 --hitcount 6 -j ufw-user-limit",
+      "-A ufw-user-input -p tcp --dport 22 -j ufw-user-limit-accept",
+      "-A ufw-user-input -j RETURN",
+    ].join("\n");
+
+    const realV6LimitRules = [
+      "-A ufw6-user-input -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --set",
+      "-A ufw6-user-input -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --update --seconds 30 --hitcount 6 -j ufw6-user-limit",
+      "-A ufw6-user-input -p tcp --dport 22 -j ufw6-user-limit-accept",
+      "-A ufw6-user-input -j RETURN",
+    ].join("\n");
+
+    const v4Ssh = { family: 4 as const, protocol: "tcp" as const, port: 22, address: "0.0.0.0" };
+    const v6Ssh = { family: 6 as const, protocol: "tcp" as const, port: 22, address: "::" };
+    const v4Other = { family: 4 as const, protocol: "tcp" as const, port: 80, address: "0.0.0.0" };
+
+    expect(
+      evaluateFirewall(v4Ssh, {
+        active: true,
+        v4: realV4LimitRules,
+        defaultInput: "deny",
+      }),
+    ).toBe("allow");
+
+    expect(
+      evaluateFirewall(v6Ssh, {
+        active: true,
+        ipv6Enabled: true,
+        v6: realV6LimitRules,
+        defaultInput: "deny",
+      }),
+    ).toBe("allow");
+
+    // Unrelated port still falls through to default deny.
+    expect(
+      evaluateFirewall(v4Other, {
+        active: true,
+        v4: realV4LimitRules,
+        defaultInput: "deny",
+      }),
+    ).toBe("deny");
+
+    // Arbitrary ACCEPT / DROP with -m conntrack or -m recent must stay "unknown".
+    expect(
+      evaluateFirewall(v4Ssh, {
+        active: true,
+        v4: "-A ufw-user-input -p tcp --dport 22 -m conntrack --ctstate NEW -j ACCEPT",
+        defaultInput: "deny",
+      }),
+    ).toBe("unknown");
+
+    expect(
+      evaluateFirewall(v4Ssh, {
+        active: true,
+        v4: "-A ufw-user-input -p tcp --dport 22 -m conntrack --ctstate NEW -j DROP",
+        defaultInput: "deny",
+      }),
+    ).toBe("unknown");
+
+    expect(
+      evaluateFirewall(v4Ssh, {
+        active: true,
+        v4: "-A ufw-user-input -p tcp --dport 22 -m recent --set -j ACCEPT",
+        defaultInput: "deny",
+      }),
+    ).toBe("unknown");
+
+    // countUnusedAllowRules handles real 3-line ufw limit rules cleanly without indeterminate coverage:
+    // 1. Active SSH listener on v4 + v6 -> firewall_ufw passes with complete rule_audit.
+    const withSshListener = await harness({
+      commands: {
+        sockets: okResult(
+          ss(
+            'tcp   LISTEN 0      128    0.0.0.0:22    0.0.0.0:*    users:(("sshd",pid=101,fd=3))',
+            'tcp   LISTEN 0      128    [::]:22       [::]:*       users:(("sshd",pid=101,fd=4))',
+          ),
+        ),
+      },
+      files: {
+        "ufw-v4": realV4LimitRules,
+        "ufw-v6": realV6LimitRules,
+      },
+    }).collector.collect("scan-ufw-real-limit-used", settings());
+
+    const usedCheck = checkById(withSshListener, "firewall_ufw");
+    expect(usedCheck.status).toBe("pass");
+    expect(usedCheck.sourceCoverage.rule_audit).toBe("complete");
+    expect(usedCheck.sourceCoverage.ufw_v4).toBe("complete");
+    expect(usedCheck.sourceCoverage.ufw_v6).toBe("complete");
+
+    // 2. No SSH listener -> counts 1 unused allow rule per family (not indeterminate, not double-counted).
+    const withoutSshListener = await harness({
+      commands: {
+        sockets: okResult(
+          ss('tcp   LISTEN 0      128    127.0.0.1:6969    0.0.0.0:*    users:(("bun",pid=4242,fd=18))'),
+        ),
+      },
+      files: {
+        "ufw-v4": realV4LimitRules,
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ufw-real-limit-unused", settings());
+
+    const unusedCheck = checkById(withoutSshListener, "firewall_ufw");
+    expect(unusedCheck.status).toBe("warn");
+    expect(unusedCheck.sourceCoverage.rule_audit).toBe("complete");
+    const unusedEv = withoutSshListener.snapshot.evidence.find(
+      (e) => e.id === unusedCheck.evidenceIds[0],
+    );
+    expect(unusedEv?.facts.unusedAllowRuleCount).toBe(1);
+    expect(unusedEv?.facts.indeterminateAllowRuleCount).toBe(0);
   });
 
   test("finding 5: UDP always gets publication none, absent Tailscale binary treats TCP publication as none, and failed/timeout stays unknown", async () => {

@@ -552,6 +552,7 @@ interface ParsedUfwRule {
   source?: string;
   destination?: string;
   jump?: string;
+  hasTarget: boolean;
   indeterminate: boolean;
 }
 
@@ -632,6 +633,18 @@ function portMatchesRanges(port: number, ranges: readonly PortRange[]): boolean 
 
 const KNOWN_SAFE_MODULES = new Set(["comment", "tcp", "udp", "multiport"]);
 
+const UFW_RATE_LIMIT_DROP_JUMPS = new Set(["ufw-user-limit", "ufw6-user-limit"]);
+
+const UFW_RATE_LIMIT_ACCEPT_JUMPS = new Set([
+  "ufw-user-limit-accept",
+  "ufw6-user-limit-accept",
+]);
+
+const UFW_RATE_LIMIT_ALLOW_JUMPS = new Set([
+  ...UFW_RATE_LIMIT_DROP_JUMPS,
+  ...UFW_RATE_LIMIT_ACCEPT_JUMPS,
+]);
+
 function parseUfwChainRules(rulesText: string, chainName: string): ParsedUfwRule[] {
   const rules: ParsedUfwRule[] = [];
 
@@ -648,8 +661,11 @@ function parseUfwChainRules(rulesText: string, chainName: string): ParsedUfwRule
       continue;
     }
 
-    const rule: ParsedUfwRule = { indeterminate: false };
+    const rule: ParsedUfwRule = { hasTarget: false, indeterminate: false };
     let negated = false;
+    let hasRateLimitMatch = false;
+    let sawConntrackModule = false;
+    let sawRecentModule = false;
 
     for (let i = 2; i < tokens.length; i++) {
       const tok = tokens[i]!;
@@ -735,6 +751,7 @@ function parseUfwChainRules(rulesText: string, chainName: string): ParsedUfwRule
       }
 
       if (tok === "-j" || tok === "--jump") {
+        rule.hasTarget = true;
         if (!next) {
           rule.indeterminate = true;
           break;
@@ -744,12 +761,63 @@ function parseUfwChainRules(rulesText: string, chainName: string): ParsedUfwRule
         continue;
       }
 
+      if (tok === "-g" || tok === "--goto") {
+        rule.hasTarget = true;
+        rule.indeterminate = true;
+        if (next !== undefined) i++;
+        continue;
+      }
+
       if (tok === "-m" || tok === "--match") {
         if (!next) {
           rule.indeterminate = true;
           break;
         }
-        if (!KNOWN_SAFE_MODULES.has(next.toLowerCase())) {
+        const mod = next.toLowerCase();
+        if (mod === "conntrack") {
+          sawConntrackModule = true;
+          hasRateLimitMatch = true;
+        } else if (mod === "recent") {
+          sawRecentModule = true;
+          hasRateLimitMatch = true;
+        } else if (!KNOWN_SAFE_MODULES.has(mod)) {
+          rule.indeterminate = true;
+        }
+        i++;
+        continue;
+      }
+
+      if (tok === "--ctstate") {
+        if (!next) {
+          rule.indeterminate = true;
+          break;
+        }
+        if (sawConntrackModule && next.toUpperCase() === "NEW") {
+          hasRateLimitMatch = true;
+        } else {
+          rule.indeterminate = true;
+        }
+        i++;
+        continue;
+      }
+
+      if (tok === "--set" || tok === "--update") {
+        if (sawRecentModule) {
+          hasRateLimitMatch = true;
+        } else {
+          rule.indeterminate = true;
+        }
+        continue;
+      }
+
+      if (tok === "--seconds" || tok === "--hitcount") {
+        if (!next) {
+          rule.indeterminate = true;
+          break;
+        }
+        if (sawRecentModule && /^\d+$/.test(next)) {
+          hasRateLimitMatch = true;
+        } else {
           rule.indeterminate = true;
         }
         i++;
@@ -761,7 +829,7 @@ function parseUfwChainRules(rulesText: string, chainName: string): ParsedUfwRule
         continue;
       }
 
-      // Any other option (e.g. --sport, --ctstate, --limit, --reject-with)
+      // Any other option (e.g. --sport, --limit, --reject-with)
       if (tok === "--reject-with") {
         if (next !== undefined) i++;
         continue;
@@ -773,18 +841,21 @@ function parseUfwChainRules(rulesText: string, chainName: string): ParsedUfwRule
       }
     }
 
+    // Allow conntrack/recent rate-limit matches only on non-terminating (no -j) rules
+    // or UFW rate-limit jumps; arbitrary ACCEPT/DROP rules using them stay indeterminate.
+    if (
+      hasRateLimitMatch &&
+      rule.hasTarget &&
+      !(rule.jump !== undefined && UFW_RATE_LIMIT_ALLOW_JUMPS.has(rule.jump))
+    ) {
+      rule.indeterminate = true;
+    }
+
     rules.push(rule);
   }
 
   return rules;
 }
-
-const UFW_RATE_LIMIT_ALLOW_JUMPS = new Set([
-  "ufw-user-limit",
-  "ufw-user-limit-accept",
-  "ufw6-user-limit",
-  "ufw6-user-limit-accept",
-]);
 
 export function evaluateFirewall(
   listener: Pick<Listener, "family" | "protocol" | "port" | "address" | "interfaceName">,
@@ -837,6 +908,11 @@ export function evaluateFirewall(
   const rules = parseUfwChainRules(rulesText, chainName);
 
   for (const rule of rules) {
+    // Non-terminating rules (no -j/-g, e.g. accounting or `recent --set`) never terminate the chain.
+    if (!rule.hasTarget) {
+      continue;
+    }
+
     // Check protocol match first: an irrelevant protocol never blocks evaluation.
     if (rule.protocol !== undefined && rule.protocol !== "all") {
       if (rule.protocol !== listener.protocol) {
@@ -1060,6 +1136,10 @@ function countUnusedAllowRules(
   let indeterminateCount = 0;
 
   for (const rule of rules) {
+    // Non-terminating rules (no -j/-g, e.g. accounting or `recent --set`) cannot accept traffic.
+    if (!rule.hasTarget) {
+      continue;
+    }
     if (rule.protocol === "other") {
       continue;
     }
@@ -1068,12 +1148,25 @@ function countUnusedAllowRules(
       rule.jump === "REJECT" ||
       rule.jump === "RETURN" ||
       rule.jump === "LOG" ||
-      rule.jump === "ufw-user-logging-input"
+      rule.jump === "ufw-user-logging-input" ||
+      rule.jump === "ufw6-user-logging-input"
     ) {
       continue;
     }
 
-    if (rule.jump !== "ACCEPT") {
+    // ufw-user-limit / ufw6-user-limit is the throttle/reject half of `ufw limit`,
+    // paired with ufw-user-limit-accept / ufw6-user-limit-accept (audited below).
+    if (rule.jump !== undefined && UFW_RATE_LIMIT_DROP_JUMPS.has(rule.jump)) {
+      if (rule.indeterminate) {
+        indeterminateCount++;
+      }
+      continue;
+    }
+
+    const isAllowJump =
+      rule.jump === "ACCEPT" ||
+      (rule.jump !== undefined && UFW_RATE_LIMIT_ACCEPT_JUMPS.has(rule.jump));
+    if (!isAllowJump) {
       indeterminateCount++;
       continue;
     }
@@ -1721,7 +1814,7 @@ function parseSshdConfig(
     dropIns !== null ? [...dropIns].sort((a, b) => lexicalCompare(a.name, b.name)) : null;
 
   const processLines = (text: string, allowInclude: boolean) => {
-    let inMatch = false;
+    let matchScope: "none" | "all" | "conditional" = "none";
     for (const rawLine of text.split(/\r?\n/)) {
       const directive = parseSshdDirective(rawLine);
       if (!directive) continue;
@@ -1730,13 +1823,13 @@ function parseSshdConfig(
       const lowerVal = value.toLowerCase();
 
       if (key === "match") {
-        inMatch = true;
+        matchScope = lowerVal === "all" ? "all" : "conditional";
         continue;
       }
 
       if (key === "include") {
         includeReferenced = true;
-        if (!allowInclude || inMatch) {
+        if (!allowInclude || matchScope !== "none") {
           hasUnhandledInclude = true;
           continue;
         }
@@ -1768,7 +1861,24 @@ function parseSshdConfig(
         continue;
       }
 
-      if (inMatch) {
+      if (matchScope === "all") {
+        // `Match all` applies to every connection and overrides global settings for loosening directives.
+        if (key === "passwordauthentication" && lowerVal === "yes") {
+          globals.set("passwordauthentication", "yes");
+        } else if (key === "permitrootlogin" && lowerVal !== "no") {
+          if (lowerVal === "yes" || globals.get("permitrootlogin") !== "yes") {
+            globals.set("permitrootlogin", lowerVal);
+          }
+        } else if (
+          (key === "kbdinteractiveauthentication" || key === "challengeresponseauthentication") &&
+          lowerVal === "yes"
+        ) {
+          globals.set("kbdinteractiveauthentication", "yes");
+        }
+        continue;
+      }
+
+      if (matchScope === "conditional") {
         if (
           (key === "passwordauthentication" && lowerVal === "yes") ||
           (key === "permitrootlogin" && lowerVal !== "no") ||
