@@ -49,6 +49,7 @@ export interface PostureFilePaths {
 
 export interface FirewallInputs {
   active: boolean | null;
+  ipv6Enabled?: boolean | null;
   v4?: string | null;
   v6?: string | null;
   defaultInput?: "allow" | "deny" | "unknown" | null;
@@ -77,9 +78,17 @@ export interface ClassifyListenersOptions {
   evidenceIdForListener: (listener: Listener, index: number) => string;
 }
 
+export interface TailscaleBackendTarget {
+  host: string | null;
+  family: 4 | 6 | "localhost" | "any";
+  port: number;
+}
+
 export interface TailscalePublications {
   servePorts: ReadonlySet<number>;
   funnelPorts: ReadonlySet<number>;
+  serveTargets: readonly TailscaleBackendTarget[];
+  funnelTargets: readonly TailscaleBackendTarget[];
   serveCoverage: Coverage;
   funnelCoverage: Coverage;
 }
@@ -336,6 +345,70 @@ function ipv4InCidr(ip: string, cidr: string): boolean | null {
   if (prefix === 0) return true;
   const mask = (~0 << (32 - prefix)) >>> 0;
   return ((ipNum & mask) >>> 0) === ((netNum & mask) >>> 0);
+}
+
+function ipv6ToBigInt(ip: string): bigint | null {
+  const trimmed = ip.trim().toLowerCase();
+  if (!trimmed || !trimmed.includes(":")) return null;
+
+  const parseGroups = (part: string): number[] | null => {
+    if (!part) return [];
+    const tokens = part.split(":");
+    const groups: number[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const tok = tokens[i]!;
+      if (tok.includes(".")) {
+        if (i !== tokens.length - 1) return null;
+        const v4 = parseIpv4ToUint32(tok);
+        if (v4 === null) return null;
+        groups.push((v4 >>> 16) & 0xffff, v4 & 0xffff);
+      } else {
+        if (!/^[0-9a-f]{1,4}$/.test(tok)) return null;
+        groups.push(Number.parseInt(tok, 16));
+      }
+    }
+    return groups;
+  };
+
+  const doubleColonParts = trimmed.split("::");
+  if (doubleColonParts.length > 2) return null;
+
+  let groups: number[];
+  if (doubleColonParts.length === 2) {
+    const left = parseGroups(doubleColonParts[0]!);
+    const right = parseGroups(doubleColonParts[1]!);
+    if (!left || !right) return null;
+    const missing = 8 - (left.length + right.length);
+    if (missing < 1) return null;
+    groups = [...left, ...Array<number>(missing).fill(0), ...right];
+  } else {
+    const parsed = parseGroups(trimmed);
+    if (!parsed || parsed.length !== 8) return null;
+    groups = parsed;
+  }
+
+  let value = 0n;
+  for (const g of groups) {
+    value = (value << 16n) | BigInt(g);
+  }
+  return value;
+}
+
+function ipv6InCidr(ip: string, cidr: string): boolean | null {
+  const [netStr, prefixStr, extra] = cidr.split("/");
+  if (!netStr || extra !== undefined) return null;
+  const ipVal = ipv6ToBigInt(ip);
+  const netVal = ipv6ToBigInt(netStr);
+  if (ipVal === null || netVal === null) return null;
+  const prefix = prefixStr === undefined ? 128 : Number(prefixStr);
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 128) return null;
+  if (prefix === 0) return true;
+  const shift = BigInt(128 - prefix);
+  return (ipVal >> shift) === (netVal >> shift);
+}
+
+function isPureIpv6Loopback(ip: string): boolean {
+  return ipv6ToBigInt(ip) === 1n;
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +793,15 @@ export function evaluateFirewall(
   }
 
   const family = listener.family;
+  if (family === 6) {
+    if (inputs.ipv6Enabled === false) {
+      return "allow";
+    }
+    if (inputs.ipv6Enabled === null) {
+      return "unknown";
+    }
+  }
+
   const rulesText = family === 4 ? inputs.v4 : inputs.v6;
   if (rulesText == null || rulesText.trim().length === 0) {
     return "unknown";
@@ -756,10 +838,9 @@ export function evaluateFirewall(
         if (matched === false) continue;
         if (matched === null) return "unknown";
       } else {
-        const destBase = rule.destination.split("/")[0]?.toLowerCase();
-        if (destBase !== listener.address.toLowerCase()) {
-          return "unknown";
-        }
+        const matched = ipv6InCidr(listener.address, rule.destination);
+        if (matched === false) continue;
+        if (matched === null) return "unknown";
       }
     }
 
@@ -843,7 +924,8 @@ export function parseUfwDefault(text: string): ParsedUfwDefault {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
 
-    const policyMatch = /^DEFAULT_INPUT_POLICY\s*=\s*["']?([A-Za-z_]+)["']?/.exec(line);
+    const policyMatch =
+      /^DEFAULT_INPUT_POLICY\s*=\s*["']?([A-Za-z_]+)["']?(?:\s*(?:#.*)?)?$/.exec(line);
     if (policyMatch) {
       const policy = policyMatch[1]!.toUpperCase();
       if (policy === "ACCEPT") defaultInput = "allow";
@@ -851,7 +933,7 @@ export function parseUfwDefault(text: string): ParsedUfwDefault {
       continue;
     }
 
-    const ipv6Match = /^IPV6\s*=\s*["']?(yes|no)["']?/i.exec(line);
+    const ipv6Match = /^IPV6\s*=\s*["']?(yes|no)["']?(?:\s*(?:#.*)?)?$/i.exec(line);
     if (ipv6Match) {
       ipv6Enabled = ipv6Match[1]!.toLowerCase() === "yes";
     }
@@ -860,28 +942,81 @@ export function parseUfwDefault(text: string): ParsedUfwDefault {
   return { defaultInput, ipv6Enabled };
 }
 
+function listenerMatchesAllowRule(
+  listener: Listener,
+  rule: ParsedUfwRule,
+  family: 4 | 6,
+): boolean {
+  if (listener.family !== family && listener.family !== "unspecified") {
+    return false;
+  }
+
+  if (
+    rule.protocol !== undefined &&
+    rule.protocol !== "all" &&
+    rule.protocol !== listener.protocol
+  ) {
+    return false;
+  }
+
+  if (!rule.dports || !portMatchesRanges(listener.port, rule.dports)) {
+    return false;
+  }
+
+  if (rule.inInterface !== undefined) {
+    if (listener.interfaceName !== undefined) {
+      if (!interfaceMatches(rule.inInterface, listener.interfaceName)) {
+        return false;
+      }
+    } else if (isLoopbackAddress(listener.address, listener.family)) {
+      if (!interfaceMatches(rule.inInterface, "lo")) {
+        return false;
+      }
+    } else if (!isWildcardAddress(listener.address)) {
+      if (isTailnetListener(listener)) {
+        if (!/^tailscale/i.test(rule.inInterface)) {
+          return false;
+        }
+      } else if (
+        interfaceMatches(rule.inInterface, "lo") ||
+        /^tailscale/i.test(rule.inInterface)
+      ) {
+        return false;
+      }
+    }
+  }
+
+  if (rule.destination !== undefined && !isAllSourcesCidr(rule.destination, family)) {
+    if (listener.family !== "unspecified" && !isWildcardAddress(listener.address)) {
+      const matched =
+        family === 4
+          ? ipv4InCidr(listener.address, rule.destination)
+          : ipv6InCidr(listener.address, rule.destination);
+      if (matched === false) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 function countUnusedAllowRules(
   rulesText: string,
   chainName: string,
+  family: 4 | 6,
   listeners: readonly Listener[],
 ): { totalRules: number; unusedCount: number } {
   const rules = parseUfwChainRules(rulesText, chainName);
   let unusedCount = 0;
 
   for (const rule of rules) {
-    if (rule.jump !== "ACCEPT" || !rule.dports || rule.dports.length === 0) {
+    if (rule.jump !== "ACCEPT" || !rule.dports || rule.dports.length === 0 || rule.indeterminate) {
       continue;
     }
-    const hasMatchingListener = listeners.some((listener) => {
-      if (
-        rule.protocol !== undefined &&
-        rule.protocol !== "all" &&
-        rule.protocol !== listener.protocol
-      ) {
-        return false;
-      }
-      return portMatchesRanges(listener.port, rule.dports!);
-    });
+    const hasMatchingListener = listeners.some((listener) =>
+      listenerMatchesAllowRule(listener, rule, family),
+    );
     if (!hasMatchingListener) {
       unusedCount++;
     }
@@ -894,45 +1029,151 @@ function countUnusedAllowRules(
 // Tailscale Serve / Funnel parsing & classifyListeners
 // ---------------------------------------------------------------------------
 
-function extractPortFromTarget(target: string): number | null {
+function parseTailscaleBackendTarget(target: string): TailscaleBackendTarget | null {
   const trimmed = target.trim();
   if (!trimmed) return null;
 
-  // Handle URLs like http://127.0.0.1:8080, https://[::1]:8443/path, http+insecure://localhost:3000
-  const urlMatch = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/(?:\[[^\]]+\]|[^/:]+):(\d{1,5})(?:[/?#]|$)/.exec(
-    trimmed,
-  );
+  const normalizeHost = (
+    rawHost: string,
+    isBracketed: boolean,
+    port: number,
+  ): TailscaleBackendTarget | null => {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+    const host = rawHost.trim().toLowerCase();
+    if (!host) return null;
+
+    if (!isBracketed && host === "localhost") {
+      return { host: "localhost", family: "localhost", port };
+    }
+    if (isBracketed || host.includes(":")) {
+      if (ipv6ToBigInt(host) === null) return null;
+      return { host, family: 6, port };
+    }
+    if (parseIpv4ToUint32(host) !== null) {
+      return { host, family: 4, port };
+    }
+    // Reject non-local / remote hostnames.
+    return null;
+  };
+
+  // URL form: http://127.0.0.1:8080, https://[::1]:8443/path, http+insecure://localhost:3000
+  const urlMatch =
+    /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/(?:\[([^\]]+)\]|([^/:@#?]+)):(\d{1,5})(?:[/?#]|$)/.exec(
+      trimmed,
+    );
   if (urlMatch) {
-    const port = Number(urlMatch[1]);
-    return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+    const bracketedHost = urlMatch[1];
+    const plainHost = urlMatch[2];
+    const port = Number(urlMatch[3]);
+    return normalizeHost(bracketedHost ?? plainHost ?? "", bracketedHost !== undefined, port);
   }
 
-  // Handle host:port like 127.0.0.1:8443 or [::1]:8443
-  const hostPortMatch = /^(?:\[[^\]]+\]|[^/:]+):(\d{1,5})$/.exec(trimmed);
+  // Host:port form: 127.0.0.1:8443, [::1]:8443, localhost:8443
+  const hostPortMatch = /^(?:\[([^\]]+)\]|([^/:@#?]+)):(\d{1,5})$/.exec(trimmed);
   if (hostPortMatch) {
-    const port = Number(hostPortMatch[1]);
-    return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+    const bracketedHost = hostPortMatch[1];
+    const plainHost = hostPortMatch[2];
+    const port = Number(hostPortMatch[3]);
+    return normalizeHost(bracketedHost ?? plainHost ?? "", bracketedHost !== undefined, port);
   }
 
-  // Bare port number
-  if (/^\d{1,5}$/.test(trimmed)) {
-    const port = Number(trimmed);
-    return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+  // Port-only form: "8080" or ":8080"
+  const portOnlyMatch = /^:?(\d{1,5})$/.exec(trimmed);
+  if (portOnlyMatch) {
+    const port = Number(portOnlyMatch[1]);
+    return Number.isInteger(port) && port >= 1 && port <= 65535
+      ? { host: null, family: "any", port }
+      : null;
   }
 
   return null;
 }
 
-function collectPortsFromTailscaleJson(
+function tailscaleTargetMatchesListener(
+  target: TailscaleBackendTarget,
+  listener: Listener,
+  knownLocalV4: ReadonlySet<number>,
+  knownLocalV6: ReadonlySet<bigint>,
+): boolean {
+  if (target.port !== listener.port) return false;
+
+  if (target.family === "any" || target.host === null) {
+    return true;
+  }
+
+  if (target.family === "localhost") {
+    return isLoopbackAddress(listener.address, listener.family) || isWildcardAddress(listener.address);
+  }
+
+  if (target.family === 4) {
+    const targetNum = parseIpv4ToUint32(target.host);
+    if (targetNum === null) return false;
+
+    if (isLoopbackAddress(target.host, 4)) {
+      if (listener.family === 4) {
+        return (
+          parseIpv4ToUint32(listener.address) === targetNum ||
+          isWildcardAddress(listener.address)
+        );
+      }
+      return listener.family === "unspecified" && isWildcardAddress(listener.address);
+    }
+
+    if (targetNum === 0) {
+      return listener.family === 4 || listener.family === "unspecified";
+    }
+
+    // Explicit non-loopback IPv4: match exact listener IP, or wildcard only when observed locally.
+    if (listener.family === 4 && parseIpv4ToUint32(listener.address) === targetNum) {
+      return true;
+    }
+    if (
+      (listener.family === 4 || listener.family === "unspecified") &&
+      isWildcardAddress(listener.address)
+    ) {
+      return knownLocalV4.has(targetNum);
+    }
+    return false;
+  }
+
+  // target.family === 6
+  const targetVal = ipv6ToBigInt(target.host);
+  if (targetVal === null) return false;
+
+  if (targetVal === 1n) {
+    if (listener.family === 6) {
+      return isPureIpv6Loopback(listener.address) || isWildcardAddress(listener.address);
+    }
+    return listener.family === "unspecified" && isWildcardAddress(listener.address);
+  }
+
+  if (targetVal === 0n) {
+    return listener.family === 6 || listener.family === "unspecified";
+  }
+
+  // Explicit non-loopback IPv6: match exact listener IP, or wildcard only when observed locally.
+  if (listener.family === 6 && ipv6ToBigInt(listener.address) === targetVal) {
+    return true;
+  }
+  if (
+    (listener.family === 6 || listener.family === "unspecified") &&
+    isWildcardAddress(listener.address)
+  ) {
+    return knownLocalV6.has(targetVal);
+  }
+  return false;
+}
+
+function collectTargetsFromTailscaleJson(
   rawJson: unknown,
   funnelOnly: boolean,
-): { serve: Set<number>; funnel: Set<number> } | null {
+): { serve: TailscaleBackendTarget[]; funnel: TailscaleBackendTarget[] } | null {
   if (typeof rawJson !== "object" || rawJson === null || Array.isArray(rawJson)) {
     return null;
   }
   const obj = rawJson as Record<string, unknown>;
-  const serve = new Set<number>();
-  const funnel = new Set<number>();
+  const serve: TailscaleBackendTarget[] = [];
+  const funnel: TailscaleBackendTarget[] = [];
 
   const allowFunnelMap = new Map<string, boolean>();
   if (typeof obj.AllowFunnel === "object" && obj.AllowFunnel !== null && !Array.isArray(obj.AllowFunnel)) {
@@ -959,12 +1200,12 @@ function collectPortsFromTailscaleJson(
         }
         const proxy = (handler as Record<string, unknown>).Proxy;
         if (typeof proxy !== "string") continue;
-        const port = extractPortFromTarget(proxy);
-        if (port === null) continue;
+        const parsedTarget = parseTailscaleBackendTarget(proxy);
+        if (parsedTarget === null) continue;
         if (isFunnelHost) {
-          funnel.add(port);
+          funnel.push(parsedTarget);
         } else if (!funnelOnly) {
-          serve.add(port);
+          serve.push(parsedTarget);
         }
       }
     }
@@ -977,15 +1218,15 @@ function collectPortsFromTailscaleJson(
       }
       const forward = (tcpConfig as Record<string, unknown>).TCPForward;
       if (typeof forward !== "string") continue;
-      const port = extractPortFromTarget(forward);
-      if (port === null) continue;
+      const parsedTarget = parseTailscaleBackendTarget(forward);
+      if (parsedTarget === null) continue;
       const isFunnelTcp = [...allowFunnelMap.entries()].some(
         ([hostPort, allowed]) => allowed && hostPort.endsWith(`:${listenPort}`),
       );
       if (isFunnelTcp) {
-        funnel.add(port);
+        funnel.push(parsedTarget);
       } else if (!funnelOnly) {
-        serve.add(port);
+        serve.push(parsedTarget);
       }
     }
   }
@@ -999,17 +1240,25 @@ export function parseTailscalePublications(
 ): TailscalePublications {
   const servePorts = new Set<number>();
   const funnelPorts = new Set<number>();
+  const serveTargets: TailscaleBackendTarget[] = [];
+  const funnelTargets: TailscaleBackendTarget[] = [];
   let serveCoverage: Coverage = "unavailable";
   let funnelCoverage: Coverage = "unavailable";
 
   if (serveResult?.status === "ok") {
     try {
       const parsed = JSON.parse(serveResult.stdout || "{}");
-      const extracted = collectPortsFromTailscaleJson(parsed, false);
+      const extracted = collectTargetsFromTailscaleJson(parsed, false);
       if (extracted) {
         serveCoverage = "complete";
-        for (const p of extracted.serve) servePorts.add(p);
-        for (const p of extracted.funnel) funnelPorts.add(p);
+        for (const t of extracted.serve) {
+          serveTargets.push(t);
+          servePorts.add(t.port);
+        }
+        for (const t of extracted.funnel) {
+          funnelTargets.push(t);
+          funnelPorts.add(t.port);
+        }
       }
     } catch {
       serveCoverage = "unavailable";
@@ -1019,21 +1268,36 @@ export function parseTailscalePublications(
   if (funnelResult?.status === "ok") {
     try {
       const parsed = JSON.parse(funnelResult.stdout || "{}");
-      const extracted = collectPortsFromTailscaleJson(parsed, true);
+      const extracted = collectTargetsFromTailscaleJson(parsed, true);
       if (extracted) {
         funnelCoverage = "complete";
-        for (const p of extracted.funnel) funnelPorts.add(p);
+        for (const t of extracted.funnel) {
+          funnelTargets.push(t);
+          funnelPorts.add(t.port);
+        }
       }
     } catch {
       funnelCoverage = "unavailable";
     }
   }
 
-  return { servePorts, funnelPorts, serveCoverage, funnelCoverage };
+  return { servePorts, funnelPorts, serveTargets, funnelTargets, serveCoverage, funnelCoverage };
 }
 
 export function classifyListeners(options: ClassifyListenersOptions): ExposureEntry[] {
   const { listeners, firewall, publications, expectedPorts, evidenceIdForListener } = options;
+
+  const knownLocalV4 = new Set<number>();
+  const knownLocalV6 = new Set<bigint>();
+  for (const listener of listeners) {
+    if (listener.family === 4 && !isWildcardAddress(listener.address)) {
+      const num = parseIpv4ToUint32(listener.address);
+      if (num !== null) knownLocalV4.add(num);
+    } else if (listener.family === 6 && !isWildcardAddress(listener.address)) {
+      const val = ipv6ToBigInt(listener.address);
+      if (val !== null) knownLocalV6.add(val);
+    }
+  }
 
   const preliminary = listeners.map((listener, index) => {
     const firewallV4: ExposureEntry["firewallV4"] =
@@ -1050,15 +1314,22 @@ export function classifyListeners(options: ClassifyListenersOptions): ExposureEn
           ? "na"
           : "unknown";
 
+    const hasFunnelTarget = publications.funnelTargets.some((target) =>
+      tailscaleTargetMatchesListener(target, listener, knownLocalV4, knownLocalV6),
+    );
+    const hasServeTarget = publications.serveTargets.some((target) =>
+      tailscaleTargetMatchesListener(target, listener, knownLocalV4, knownLocalV6),
+    );
+
     let publication: ExposureEntry["publication"];
     if (listener.protocol !== "tcp") {
       publication =
         publications.serveCoverage === "complete" && publications.funnelCoverage === "complete"
           ? "none"
           : "unknown";
-    } else if (publications.funnelPorts.has(listener.port)) {
+    } else if (hasFunnelTarget) {
       publication = "funnel";
-    } else if (publications.servePorts.has(listener.port)) {
+    } else if (hasServeTarget) {
       publication = publications.funnelCoverage === "complete" ? "serve" : "unknown";
     } else if (
       publications.serveCoverage === "complete" &&
@@ -1112,7 +1383,12 @@ export function classifyListeners(options: ClassifyListenersOptions): ExposureEn
     } else {
       const fw = listener.family === 4 ? firewallV4 : firewallV6;
       if (fw === "deny") {
-        reachability = publication === "serve" ? "tailnet" : "blocked_by_ufw";
+        reachability =
+          publication === "serve"
+            ? "tailnet"
+            : publication === "unknown"
+              ? "unknown"
+              : "blocked_by_ufw";
       } else if (fw === "allow") {
         reachability =
           v4AllowedKeys.has(key) && v6AllowedKeys.has(key) ? "exposed_v4_v6" : "exposed_lan";
@@ -1149,17 +1425,54 @@ interface ParsedSshdConfig {
   hasUnhandledInclude: boolean;
 }
 
-function isSshdDropInPattern(pattern: string): boolean {
+function extractSshdDropInGlob(pattern: string): string | null {
   const normalized = pattern.trim().replace(/^["']|["']$/g, "");
-  return (
-    normalized === "/etc/ssh/sshd_config.d/*.conf" ||
-    normalized === "sshd_config.d/*.conf" ||
-    normalized.startsWith("/etc/ssh/sshd_config.d/") ||
-    normalized.startsWith("sshd_config.d/")
-  );
+  let remainder: string | null = null;
+  if (normalized.startsWith("/etc/ssh/sshd_config.d/")) {
+    remainder = normalized.slice("/etc/ssh/sshd_config.d/".length);
+  } else if (normalized.startsWith("sshd_config.d/")) {
+    remainder = normalized.slice("sshd_config.d/".length);
+  }
+  if (!remainder || remainder.includes("/") || remainder === "." || remainder === "..") {
+    return null;
+  }
+  return remainder;
 }
 
-function parseSshdDirective(line: string): { key: string; value: string } | null {
+function hasGlobMeta(pattern: string): boolean {
+  return /[*?[]/.test(pattern);
+}
+
+function matchGlob(pattern: string, candidate: string): boolean {
+  const collapsed = pattern.replace(/\*+/g, "*");
+  let regex = "^";
+  for (let i = 0; i < collapsed.length; i++) {
+    const ch = collapsed[i]!;
+    if (ch === "*") {
+      regex += ".*";
+    } else if (ch === "?") {
+      regex += ".";
+    } else if (ch === "[") {
+      const close = collapsed.indexOf("]", i + 1);
+      if (close > i + 1) {
+        let content = collapsed.slice(i + 1, close);
+        if (content.startsWith("!")) {
+          content = "^" + content.slice(1);
+        }
+        regex += `[${content.replace(/[\\[\]]/g, "\\$&")}]`;
+        i = close;
+      } else {
+        regex += "\\[";
+      }
+    } else {
+      regex += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  regex += "$";
+  return new RegExp(regex).test(candidate);
+}
+
+function parseSshdDirective(line: string): { key: string; value: string; rawValue: string } | null {
   // Strip comments (respecting quotes)
   let clean = "";
   let inQuote = false;
@@ -1184,9 +1497,11 @@ function parseSshdDirective(line: string): { key: string; value: string } | null
 
   const match = /^([A-Za-z][A-Za-z0-9]*)(?:[\s=]+)(.+)$/.exec(trimmed);
   if (!match) return null;
+  const rawValue = match[2]!.trim();
   return {
     key: match[1]!.toLowerCase(),
-    value: match[2]!.trim().replace(/^["']|["']$/g, ""),
+    value: rawValue.replace(/^["']|["']$/g, ""),
+    rawValue,
   };
 }
 
@@ -1210,7 +1525,7 @@ function parseSshdConfig(
       const directive = parseSshdDirective(rawLine);
       if (!directive) continue;
 
-      const { key, value } = directive;
+      const { key, value, rawValue } = directive;
       const lowerVal = value.toLowerCase();
 
       if (key === "match") {
@@ -1218,19 +1533,35 @@ function parseSshdConfig(
         continue;
       }
 
-      if (key === "include" && allowInclude && !inMatch) {
+      if (key === "include") {
         includeReferenced = true;
-        const patterns = value.split(/\s+/).filter(Boolean);
+        if (!allowInclude || inMatch) {
+          hasUnhandledInclude = true;
+          continue;
+        }
+        const patterns = tokenizeRule(rawValue);
+        if (!patterns || patterns.length === 0) {
+          hasUnhandledInclude = true;
+          continue;
+        }
         for (const pattern of patterns) {
-          if (isSshdDropInPattern(pattern)) {
-            if (sortedDropIns === null) {
-              dropInsMissing = true;
-            } else {
-              for (const dropIn of sortedDropIns) {
-                processLines(dropIn.text, false);
-              }
-            }
-          } else {
+          const filePattern = extractSshdDropInGlob(pattern);
+          if (filePattern === null) {
+            hasUnhandledInclude = true;
+            continue;
+          }
+          if (sortedDropIns === null) {
+            dropInsMissing = true;
+            continue;
+          }
+          const matched = sortedDropIns.filter((dropIn) => matchGlob(filePattern, dropIn.name));
+          for (const dropIn of matched) {
+            processLines(dropIn.text, false);
+          }
+          const isGlob = hasGlobMeta(filePattern);
+          if (!filePattern.endsWith(".conf") && (isGlob || matched.length === 0)) {
+            hasUnhandledInclude = true;
+          } else if (!isGlob && matched.length === 0) {
             hasUnhandledInclude = true;
           }
         }
@@ -1849,8 +2180,18 @@ export class PostureCollector {
         ? ufwStatusParsed.defaultInput
         : ufwDefaultParsed?.defaultInput ?? "unknown";
 
+    const ufwDefaultCoverage: Coverage =
+      ufwDefaultText === null
+        ? "unavailable"
+        : ufwDefaultParsed !== null &&
+            ufwDefaultParsed.ipv6Enabled !== null &&
+            ufwDefaultParsed.defaultInput !== "unknown"
+          ? "complete"
+          : "partial";
+
     const firewallInputs: FirewallInputs = {
       active: ufwStatusParsed ? ufwStatusParsed.active : null,
+      ipv6Enabled: ufwDefaultParsed ? ufwDefaultParsed.ipv6Enabled : null,
       v4: ufwV4Text,
       v6: ufwV6Text,
       defaultInput: effectiveDefaultInput,
@@ -1927,22 +2268,39 @@ export class PostureCollector {
 
       switch (id) {
         case "firewall_ufw": {
-          const sourceCoverage: Record<string, Coverage> = {
-            ufw_status: ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null ? "complete" : "unavailable",
-            ufw_default: ufwDefaultText !== null ? "complete" : "unavailable",
-            ufw_v4: ufwV4Text !== null && ufwV4Text.trim().length > 0 ? "complete" : "unavailable",
-            ufw_v6: ufwV6Text !== null && ufwV6Text.trim().length > 0 ? "complete" : "unavailable",
-            sockets: socketsAvailable ? "complete" : "unavailable",
-          };
+          const v4RulesComplete = ufwV4Text !== null && ufwV4Text.trim().length > 0;
+          const v6RulesComplete = ufwV6Text !== null && ufwV6Text.trim().length > 0;
+          const v6Enabled = ufwDefaultParsed?.ipv6Enabled ?? null;
 
           const v4Stats =
-            socketsAvailable && ufwV4Text !== null && ufwV4Text.trim().length > 0
-              ? countUnusedAllowRules(ufwV4Text, "ufw-user-input", listeners)
+            socketsAvailable && v4RulesComplete
+              ? countUnusedAllowRules(ufwV4Text!, "ufw-user-input", 4, listeners)
               : null;
           const v6Stats =
-            socketsAvailable && ufwV6Text !== null && ufwV6Text.trim().length > 0
-              ? countUnusedAllowRules(ufwV6Text, "ufw6-user-input", listeners)
+            socketsAvailable && v6RulesComplete && v6Enabled === true
+              ? countUnusedAllowRules(ufwV6Text!, "ufw6-user-input", 6, listeners)
               : null;
+
+          const unusedRulesCoverageComplete =
+            socketsAvailable &&
+            v4RulesComplete &&
+            (v6Enabled === false || (v6Enabled === true && v6RulesComplete));
+
+          const sourceCoverage: Record<string, Coverage> = {
+            ufw_status:
+              ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
+                ? "complete"
+                : "unavailable",
+            ufw_default: ufwDefaultCoverage,
+            ufw_v4: v4RulesComplete ? "complete" : "unavailable",
+            ufw_v6: v6RulesComplete ? "complete" : "unavailable",
+            sockets: socketsAvailable ? "complete" : "unavailable",
+            rule_audit: unusedRulesCoverageComplete
+              ? "complete"
+              : v4Stats || v6Stats
+                ? "partial"
+                : "unavailable",
+          };
 
           const unusedAllowRuleCount = (v4Stats?.unusedCount ?? 0) + (v6Stats?.unusedCount ?? 0);
 
@@ -1950,7 +2308,7 @@ export class PostureCollector {
             criterion: "firewall_ufw",
             active: firewallInputs.active,
             defaultInput: effectiveDefaultInput,
-            ipv6Enabled: ufwDefaultParsed?.ipv6Enabled ?? null,
+            ipv6Enabled: v6Enabled,
             v4RuleCount: v4Stats?.totalRules ?? null,
             v6RuleCount: v6Stats?.totalRules ?? null,
             unusedAllowRuleCount: v4Stats || v6Stats ? unusedAllowRuleCount : null,
@@ -1982,6 +2340,10 @@ export class PostureCollector {
             status = "warn";
             summary = "UFW is active, but the default incoming policy could not be verified.";
             addFinding(id, "unknown_default", "warning", summary, [evId]);
+          } else if (!unusedRulesCoverageComplete) {
+            status = "unknown";
+            summary =
+              "UFW firewall is active with default deny incoming; unused allow rules could not be fully verified.";
           } else {
             status = "pass";
             summary = "UFW firewall is active with default deny incoming and no unused allow rules.";
@@ -2007,6 +2369,7 @@ export class PostureCollector {
               ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
                 ? "complete"
                 : "unavailable",
+            ufw_default: ufwDefaultCoverage,
             ufw_v4: ufwV4Text !== null && ufwV4Text.trim().length > 0 ? "complete" : "unavailable",
             ufw_v6: ufwV6Text !== null && ufwV6Text.trim().length > 0 ? "complete" : "unavailable",
             tailscale_serve: publications.serveCoverage,
@@ -2107,6 +2470,15 @@ export class PostureCollector {
             sshd_main: sshdMainText !== null ? "complete" : "unavailable",
             sshd_dropins: sshDropInsResult !== null ? "complete" : "unavailable",
             sockets: socketsAvailable ? "complete" : "unavailable",
+            ufw_status:
+              ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
+                ? "complete"
+                : "unavailable",
+            ufw_default: ufwDefaultCoverage,
+            ufw_v4: ufwV4Text !== null && ufwV4Text.trim().length > 0 ? "complete" : "unavailable",
+            ufw_v6: ufwV6Text !== null && ufwV6Text.trim().length > 0 ? "complete" : "unavailable",
+            tailscale_serve: publications.serveCoverage,
+            tailscale_funnel: publications.funnelCoverage,
           };
 
           if (sshdMainText === null) {
@@ -2137,22 +2509,27 @@ export class PostureCollector {
           }
 
           const sshPorts = new Set<number>(parsed.ports);
-          const exposedSshEntries = exposure.filter(
+          const sshEntries = exposure.filter((entry) => sshPorts.has(entry.listener.port));
+          const exposedSshEntries = sshEntries.filter(
             (entry) =>
-              sshPorts.has(entry.listener.port) &&
-              (entry.reachability === "exposed_lan" ||
-                entry.reachability === "exposed_v4_v6" ||
-                entry.publication === "funnel"),
+              entry.reachability === "exposed_lan" ||
+              entry.reachability === "exposed_v4_v6" ||
+              entry.publication === "funnel",
           );
+          const indeterminateSshEntries = sshEntries.filter(
+            (entry) => entry.reachability === "unknown" || entry.publication === "unknown",
+          );
+          const sshReachabilityVerified = socketsAvailable && indeterminateSshEntries.length === 0;
 
           // OpenSSH defaults when unspecified: PasswordAuthentication=yes, PermitRootLogin=prohibit-password
+          const includeCoverageIncomplete = parsed.dropInsMissing || parsed.hasUnhandledInclude;
           const passwordEnabled =
             parsed.passwordAuthentication === "yes" ||
-            (parsed.passwordAuthentication === null && !parsed.dropInsMissing);
+            (parsed.passwordAuthentication === null && !includeCoverageIncomplete);
           const rootLoginAllowed = parsed.permitRootLogin === "yes";
           const rootLoginNotDisabled =
             parsed.permitRootLogin !== "no" &&
-            !(parsed.permitRootLogin === null && parsed.dropInsMissing);
+            !(parsed.permitRootLogin === null && includeCoverageIncomplete);
           const kbdInteractiveEnabled = parsed.kbdInteractiveAuthentication === "yes";
 
           const evId = addEvidence("criterion", "ssh_hardening", {
@@ -2161,10 +2538,16 @@ export class PostureCollector {
             passwordAuthentication: parsed.passwordAuthentication,
             kbdInteractiveAuthentication: parsed.kbdInteractiveAuthentication,
             hasMatchLoosening: parsed.hasMatchLoosening,
-            exposedOutsideTailnetCount: exposedSshEntries.length,
+            hasUnhandledInclude: parsed.hasUnhandledInclude,
+            exposedOutsideTailnetCount: sshReachabilityVerified ? exposedSshEntries.length : null,
+            indeterminateSshListenerCount: socketsAvailable ? indeterminateSshEntries.length : null,
           });
 
-          const checkEvidenceIds = [evId, ...exposedSshEntries.flatMap((e) => e.evidenceIds)];
+          const checkEvidenceIds = [
+            evId,
+            ...exposedSshEntries.flatMap((e) => e.evidenceIds),
+            ...indeterminateSshEntries.flatMap((e) => e.evidenceIds),
+          ];
           const issues: { slug: string; severity: Severity; text: string }[] = [];
 
           if (passwordEnabled) {
@@ -2180,7 +2563,7 @@ export class PostureCollector {
               severity: "critical",
               text: "SSH root login is globally permitted.",
             });
-          } else if (rootLoginNotDisabled && !parsed.dropInsMissing) {
+          } else if (rootLoginNotDisabled && !includeCoverageIncomplete) {
             issues.push({
               slug: "root_login_unrestricted",
               severity: "warning",
@@ -2218,6 +2601,10 @@ export class PostureCollector {
           } else if (parsed.dropInsMissing) {
             status = "unknown";
             summary = "SSH drop-in configuration directory could not be read.";
+          } else if (parsed.hasUnhandledInclude) {
+            status = "unknown";
+            summary =
+              "SSH configuration contains unresolved Include directives; full hardening could not be verified.";
           } else if (parsed.hasMatchLoosening) {
             status = "warn";
             summary =
@@ -2225,8 +2612,9 @@ export class PostureCollector {
             addFinding(id, "match_loosening", "warning", summary, [evId]);
           } else {
             status = "pass";
-            summary =
-              "SSH disables root and password authentication and is not exposed outside Tailnet.";
+            summary = sshReachabilityVerified
+              ? "SSH disables root and password authentication and is not exposed outside Tailnet."
+              : "SSH disables root and password authentication; port exposure could not be verified.";
           }
 
           checks.push({
@@ -2247,12 +2635,6 @@ export class PostureCollector {
           const archAuditRes = commandResults.get("arch_audit");
           const pacmanLogText = fileResults.get("pacman-log") ?? null;
 
-          const sourceCoverage: Record<string, Coverage> = {
-            updates: updatesRes?.status === "ok" ? "complete" : "unavailable",
-            pacman_log: pacmanLogText !== null ? "complete" : "unavailable",
-            arch_audit: archAuditRes?.status === "ok" ? "complete" : "unavailable",
-          };
-
           const parsedUpdates =
             updatesRes?.status === "ok"
               ? parsePacmanUpdates(updatesRes.stdout, updatesRes.exitCode)
@@ -2269,6 +2651,17 @@ export class PostureCollector {
           const auditParsed =
             archAuditRes?.status === "ok" ? parseArchAudit(archAuditRes.stdout) : null;
 
+          const sourceCoverage: Record<string, Coverage> = {
+            updates: updatesRes?.status === "ok" ? "complete" : "unavailable",
+            pacman_log:
+              pacmanLogText === null
+                ? "unavailable"
+                : lastUpgradeAt !== null
+                  ? "complete"
+                  : "partial",
+            arch_audit: archAuditRes?.status === "ok" ? "complete" : "unavailable",
+          };
+
           const evId = addEvidence("criterion", "package_updates", {
             criterion: "package_updates",
             pendingCount: parsedUpdates?.totalCount ?? null,
@@ -2277,19 +2670,6 @@ export class PostureCollector {
             advisoryCount: auditParsed?.advisoryCount ?? null,
             highAdvisoryCount: auditParsed?.highOrCriticalCount ?? null,
           });
-
-          if (parsedUpdates === null) {
-            checks.push({
-              id,
-              category: meta.category,
-              title: meta.title,
-              status: "unknown",
-              summary: "Pending package updates could not be checked.",
-              evidenceIds: [evId],
-              sourceCoverage,
-            });
-            break;
-          }
 
           const issues: { slug: string; severity: Severity; text: string }[] = [];
 
@@ -2300,18 +2680,20 @@ export class PostureCollector {
               text: `arch-audit reported ${auditParsed.advisoryCount} upgradable security advisory(ies).`,
             });
           }
-          if (parsedUpdates.kernelCount > 0) {
-            issues.push({
-              slug: "kernel_updates",
-              severity: "warning",
-              text: `${parsedUpdates.kernelCount} pending kernel update(s) (${parsedUpdates.totalCount} total pending packages).`,
-            });
-          } else if (parsedUpdates.totalCount > 0) {
-            issues.push({
-              slug: "pending_updates",
-              severity: "warning",
-              text: `${parsedUpdates.totalCount} pending package update(s) available.`,
-            });
+          if (parsedUpdates !== null) {
+            if (parsedUpdates.kernelCount > 0) {
+              issues.push({
+                slug: "kernel_updates",
+                severity: "warning",
+                text: `${parsedUpdates.kernelCount} pending kernel update(s) (${parsedUpdates.totalCount} total pending packages).`,
+              });
+            } else if (parsedUpdates.totalCount > 0) {
+              issues.push({
+                slug: "pending_updates",
+                severity: "warning",
+                text: `${parsedUpdates.totalCount} pending package update(s) available.`,
+              });
+            }
           }
           if (isStaleUpgrade) {
             issues.push({
@@ -2327,14 +2709,32 @@ export class PostureCollector {
 
           if (issues.length > 0) {
             status = issues.some((i) => i.severity === "critical") ? "fail" : "warn";
-            summary = issues.map((i) => i.text).join(" ");
+            summary =
+              issues.map((i) => i.text).join(" ") +
+              (parsedUpdates === null ? " Pending package updates could not be checked." : "");
             remediation = "Upgrade system packages and reboot if a kernel update is installed.";
             for (const issue of issues) {
               addFinding(id, issue.slug, issue.severity, issue.text, [evId]);
             }
+          } else if (parsedUpdates === null) {
+            status = "unknown";
+            summary = "Pending package updates could not be checked.";
           } else {
             status = "pass";
-            summary = "Packages are up to date with recent upgrade history and no advisories.";
+            const hasUpgradeHistory = lastUpgradeAt !== null;
+            const hasArchAudit = auditParsed !== null;
+            if (hasUpgradeHistory && hasArchAudit) {
+              summary = "Packages are up to date with recent upgrade history and no advisories.";
+            } else if (hasUpgradeHistory) {
+              summary =
+                "Packages are up to date with recent upgrade history (arch-audit unavailable).";
+            } else if (hasArchAudit) {
+              summary =
+                "No pending package updates or advisories detected (upgrade history unavailable).";
+            } else {
+              summary =
+                "No pending package updates detected (upgrade history and arch-audit unavailable).";
+            }
           }
 
           checks.push({
@@ -2589,10 +2989,11 @@ export class PostureCollector {
 
           const checkEvidenceIds = [evId];
           const unitEvidenceIds: string[] = [];
+          let unitIndex = 0;
 
           const recordUnitEvidence = (scope: string, units: readonly ParsedUnit[]) => {
             for (const u of units) {
-              const unitEvId = addEvidence("unit", `${scope}:${u.unit}`, {
+              const unitEvId = addEvidence("unit", String(unitIndex++), {
                 scope,
                 unit: u.unit,
                 load: u.load,

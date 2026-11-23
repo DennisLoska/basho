@@ -145,7 +145,7 @@ const SYSCTL_SAFE = [
 
 const DEFAULT_FILES: Record<FileSource, string | null> = {
   "ufw-v4": "-A ufw-user-input -p tcp --dport 6969 -j ACCEPT",
-  "ufw-v6": "-A ufw6-user-input -p tcp --dport 6969 -j ACCEPT",
+  "ufw-v6": "-A ufw6-user-input -j RETURN",
   "ufw-default": UFW_DEFAULT_DROP,
   "sshd-main": HARDENED_SSHD,
   "pacman-log": `${pacmanStamp(2)} [ALPM] upgraded bash (5.2.026-1 -> 5.3.0-1)`,
@@ -1345,5 +1345,346 @@ describe("createPostureFiles", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("PostureCollector spec hardening regressions", () => {
+  test("finding 1: treats IPV6=no as IPv6 UFW inactive (allow) and missing IPV6 as unknown", async () => {
+    const dualSockets = okResult(
+      ss(
+        "tcp   LISTEN 0      128    0.0.0.0:8188    0.0.0.0:*",
+        "tcp   LISTEN 0      128    [::]:8188       [::]:*",
+      ),
+    );
+
+    const disabledV6 = await harness({
+      commands: { sockets: dualSockets },
+      files: {
+        "ufw-default": 'IPV6=no\nDEFAULT_INPUT_POLICY="DROP"',
+        "ufw-v4": "-A ufw-user-input -j RETURN",
+        "ufw-v6": "-A ufw6-user-input -p tcp --dport 8188 -j DROP",
+      },
+    }).collector.collect("scan-ipv6-off", settings());
+
+    const v4EntryOff = disabledV6.exposure.find((e) => e.listener.family === 4)!;
+    const v6EntryOff = disabledV6.exposure.find((e) => e.listener.family === 6)!;
+    expect(v4EntryOff.firewallV4).toBe("deny");
+    expect(v4EntryOff.reachability).toBe("blocked_by_ufw");
+    expect(v6EntryOff.firewallV6).toBe("allow");
+    expect(v6EntryOff.reachability).toBe("exposed_lan");
+
+    const missingIpv6Setting = await harness({
+      commands: { sockets: dualSockets },
+      files: {
+        "ufw-default": 'DEFAULT_INPUT_POLICY="DROP"',
+        "ufw-v4": "-A ufw-user-input -j RETURN",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ipv6-missing", settings());
+
+    const v4EntryMissing = missingIpv6Setting.exposure.find((e) => e.listener.family === 4)!;
+    const v6EntryMissing = missingIpv6Setting.exposure.find((e) => e.listener.family === 6)!;
+    expect(v4EntryMissing.firewallV4).toBe("deny");
+    expect(v4EntryMissing.reachability).toBe("blocked_by_ufw");
+    expect(v6EntryMissing.firewallV6).toBe("unknown");
+    expect(v6EntryMissing.reachability).toBe("unknown");
+  });
+
+  test("finding 2: keeps reachability unknown for UFW-denied non-loopback listeners when publication is unknown", async () => {
+    const result = await harness({
+      commands: {
+        sockets: okResult(
+          ss(
+            "tcp   LISTEN 0      128    0.0.0.0:7000    0.0.0.0:*",
+            "tcp   LISTEN 0      128    [::]:7001       [::]:*",
+          ),
+        ),
+        tailscale_serve: UNAVAILABLE,
+        tailscale_funnel: UNAVAILABLE,
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -j RETURN",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-pub-unknown", settings());
+
+    const v4Entry = entryByPort(result, 7000);
+    expect(v4Entry.firewallV4).toBe("deny");
+    expect(v4Entry.publication).toBe("unknown");
+    expect(v4Entry.reachability).toBe("unknown");
+
+    const v6Entry = entryByPort(result, 7001);
+    expect(v6Entry.firewallV6).toBe("deny");
+    expect(v6Entry.publication).toBe("unknown");
+    expect(v6Entry.reachability).toBe("unknown");
+  });
+
+  test("finding 3: matches Tailscale Serve/Funnel backend host, family, and rejects remote hosts", async () => {
+    const result = await harness({
+      commands: {
+        sockets: okResult(
+          ss(
+            "tcp   LISTEN 0      128    127.0.0.1:8080       0.0.0.0:*",
+            "tcp   LISTEN 0      128    [::1]:8080           [::]:*",
+            "tcp   LISTEN 0      128    [::1]:8081           [::]:*",
+            "tcp   LISTEN 0      128    127.0.0.1:8081       0.0.0.0:*",
+            "tcp   LISTEN 0      128    0.0.0.0:8082         0.0.0.0:*",
+            "tcp   LISTEN 0      128    192.168.1.50:8083    0.0.0.0:*",
+            "tcp   LISTEN 0      128    127.0.0.1:8084       0.0.0.0:*",
+            "tcp   LISTEN 0      128    [::1]:8084           [::]:*",
+            "tcp   LISTEN 0      128    127.0.0.1:8085       0.0.0.0:*",
+          ),
+        ),
+        tailscale_serve: okResult(
+          JSON.stringify({
+            Web: {
+              "host.ts.net:443": {
+                Handlers: {
+                  "/v4": { Proxy: "http://127.0.0.1:8080" },
+                  "/v6": { Proxy: "http://[::1]:8081" },
+                  "/remote": { Proxy: "http://198.51.100.9:8082" },
+                  "/explicit": { Proxy: "http://192.168.1.50:8083" },
+                  "/localhost": { Proxy: "http://localhost:8084" },
+                },
+              },
+            },
+            TCP: {
+              "8085": { TCPForward: "8085" },
+            },
+          }),
+        ),
+        tailscale_funnel: okResult("{}"),
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -j RETURN",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ts-backends", settings());
+
+    const byAddrPort = (addr: string, port: number) =>
+      result.exposure.find((e) => e.listener.address === addr && e.listener.port === port)!;
+
+    // 127.0.0.1 matches IPv4 loopback only, not ::1
+    expect(byAddrPort("127.0.0.1", 8080).publication).toBe("serve");
+    expect(byAddrPort("::1", 8080).publication).toBe("none");
+
+    // [::1] matches IPv6 loopback only, not 127.0.0.1
+    expect(byAddrPort("::1", 8081).publication).toBe("serve");
+    expect(byAddrPort("127.0.0.1", 8081).publication).toBe("none");
+
+    // Remote host 198.51.100.9 is rejected and never matches 0.0.0.0 wildcard
+    expect(byAddrPort("0.0.0.0", 8082).publication).toBe("none");
+
+    // Explicit local IP matches matching listener IP
+    expect(byAddrPort("192.168.1.50", 8083).publication).toBe("serve");
+
+    // localhost matches both IPv4 and IPv6 loopback
+    expect(byAddrPort("127.0.0.1", 8084).publication).toBe("serve");
+    expect(byAddrPort("::1", 8084).publication).toBe("serve");
+
+    // Port-only TCPForward matches port
+    expect(byAddrPort("127.0.0.1", 8085).publication).toBe("serve");
+  });
+
+  test("finding 4: matches unused UFW allow rules by family, destination IP, interface, and suppresses on incomplete coverage", async () => {
+    // IPv6 allow rule with only IPv4 listener on same port is unused
+    const v6Mismatch = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    127.0.0.1:6969    0.0.0.0:*")),
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -p tcp --dport 6969 -j ACCEPT",
+        "ufw-v6": "-A ufw6-user-input -p tcp --dport 6969 -j ACCEPT",
+      },
+    }).collector.collect("scan-ufw-v6-unused", settings());
+    expect(checkById(v6Mismatch, "firewall_ufw").status).toBe("warn");
+
+    // Destination IP mismatch is flagged as unused
+    const destMismatch = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    127.0.0.1:6969    0.0.0.0:*")),
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -d 192.168.1.50 -p tcp --dport 6969 -j ACCEPT",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ufw-dest-unused", settings());
+    expect(checkById(destMismatch, "firewall_ufw").status).toBe("warn");
+
+    // Interface scope mismatch is flagged as unused
+    const ifaceMismatch = await harness({
+      commands: {
+        sockets: okResult(
+          ss("tcp   LISTEN 0      128    100.101.102.103%tailscale0:22    0.0.0.0:*"),
+        ),
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -i eth0 -p tcp --dport 22 -j ACCEPT",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ufw-iface-unused", settings());
+    expect(checkById(ifaceMismatch, "firewall_ufw").status).toBe("warn");
+
+    // Matching interface + destination is NOT unused
+    const ifaceMatch = await harness({
+      commands: {
+        sockets: okResult(
+          ss("tcp   LISTEN 0      128    100.101.102.103%tailscale0:22    0.0.0.0:*"),
+        ),
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -i tailscale0 -d 100.101.102.103 -p tcp --dport 22 -j ACCEPT",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ufw-iface-match", settings());
+    expect(checkById(ifaceMatch, "firewall_ufw").status).toBe("pass");
+
+    // Suppress unused-rule findings when sockets are unavailable
+    const noSockets = await harness({
+      commands: { sockets: UNAVAILABLE },
+      files: {
+        "ufw-v4": "-A ufw-user-input -p tcp --dport 9999 -j ACCEPT",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ufw-no-sockets", settings());
+    const noSocketsCheck = checkById(noSockets, "firewall_ufw");
+    expect(findingsFor(noSockets, noSocketsCheck)).toHaveLength(0);
+  });
+
+  test("finding 5: firewall_ufw does not claim no unused rules when sockets or rule files are missing", async () => {
+    const missingSockets = await harness({
+      commands: { sockets: UNAVAILABLE },
+    }).collector.collect("scan-ufw-missing-sockets", settings());
+    const checkMissingSockets = checkById(missingSockets, "firewall_ufw");
+    expect(checkMissingSockets.summary.toLowerCase()).not.toContain("no unused");
+    expect(checkMissingSockets.status).toBe("unknown");
+    expect(checkMissingSockets.sourceCoverage.sockets).toBe("unavailable");
+
+    const missingV6 = await harness({
+      files: { "ufw-v6": null },
+    }).collector.collect("scan-ufw-missing-v6", settings());
+    const checkMissingV6 = checkById(missingV6, "firewall_ufw");
+    expect(checkMissingV6.summary.toLowerCase()).not.toContain("no unused");
+    expect(checkMissingV6.status).toBe("unknown");
+    expect(checkMissingV6.sourceCoverage.ufw_v6).toBe("unavailable");
+  });
+
+  test("finding 6: ssh_hardening matches Include patterns selectively and marks unresolved includes partial", async () => {
+    const selective = await harness({
+      files: { "sshd-main": "Include /etc/ssh/sshd_config.d/10-hardening.conf" },
+      dropIns: [
+        {
+          name: "05-weak.conf",
+          text: "PasswordAuthentication yes\nPermitRootLogin yes",
+        },
+        {
+          name: "10-hardening.conf",
+          text: "PasswordAuthentication no\nPermitRootLogin no\nKbdInteractiveAuthentication no",
+        },
+      ],
+    }).collector.collect("scan-ssh-selective-include", settings());
+    const selectiveCheck = checkById(selective, "ssh_hardening");
+    expect(selectiveCheck.status).toBe("pass");
+    expect(selectiveCheck.sourceCoverage.sshd_dropins).toBe("complete");
+
+    const unresolved = await harness({
+      files: {
+        "sshd-main": [
+          "Include /etc/ssh/sshd_config.d/99-missing.conf",
+          "PasswordAuthentication no",
+          "PermitRootLogin no",
+          "KbdInteractiveAuthentication no",
+        ].join("\n"),
+      },
+      dropIns: [],
+    }).collector.collect("scan-ssh-unresolved-include", settings());
+    const unresolvedCheck = checkById(unresolved, "ssh_hardening");
+    expect(unresolvedCheck.sourceCoverage.sshd_dropins).toBe("partial");
+    expect(unresolvedCheck.status).not.toBe("pass");
+  });
+
+  test("finding 7: ssh_hardening tracks firewall/publication coverage and narrows summary when exposure is unverified", async () => {
+    const noSockets = await harness({
+      commands: { sockets: UNAVAILABLE },
+    }).collector.collect("scan-ssh-no-sockets", settings());
+    const noSocketsCheck = checkById(noSockets, "ssh_hardening");
+    expect(noSocketsCheck.sourceCoverage.ufw_status).toBe("complete");
+    expect(noSocketsCheck.sourceCoverage.tailscale_serve).toBe("complete");
+    expect(noSocketsCheck.sourceCoverage.tailscale_funnel).toBe("complete");
+    expect(noSocketsCheck.sourceCoverage.sockets).toBe("unavailable");
+    expect(noSocketsCheck.summary.toLowerCase()).not.toContain("not exposed outside tailnet");
+
+    const unknownPort22 = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    0.0.0.0:22    0.0.0.0:*")),
+        ufw_status: UNAVAILABLE,
+      },
+    }).collector.collect("scan-ssh-port22-unknown", settings());
+    const unknownPort22Check = checkById(unknownPort22, "ssh_hardening");
+    expect(unknownPort22Check.sourceCoverage.ufw_status).toBe("unavailable");
+    expect(unknownPort22Check.summary.toLowerCase()).not.toContain("not exposed outside tailnet");
+  });
+
+  test("finding 8: package_updates still evaluates stale pacman-log and arch-audit when pacman -Qu is unavailable", async () => {
+    const staleResult = await harness({
+      commands: { updates: UNAVAILABLE },
+      files: {
+        "pacman-log": `${pacmanStamp(30)} [ALPM] upgraded bash (5.2.026-1 -> 5.3.0-1)`,
+      },
+    }).collector.collect("scan-pkg-stale-no-qu", settings());
+    const staleCheck = checkById(staleResult, "package_updates");
+    expect(staleCheck.status).toBe("warn");
+    expect(findingsFor(staleResult, staleCheck).length).toBeGreaterThan(0);
+    const staleEv = staleResult.snapshot.evidence.find((e) => e.id === staleCheck.evidenceIds[0])!;
+    expect(staleEv.facts.pendingCount).toBeNull();
+
+    const auditResult = await harness({
+      commands: {
+        updates: UNAVAILABLE,
+        arch_audit: okResult("Package: xz\nSeverity: High\nType: CVE-2024-3094\n"),
+      },
+    }).collector.collect("scan-pkg-audit-no-qu", settings());
+    const auditCheck = checkById(auditResult, "package_updates");
+    expect(auditCheck.status).toBe("fail");
+    expect(findingsFor(auditResult, auditCheck).length).toBeGreaterThan(0);
+    const auditEv = auditResult.snapshot.evidence.find((e) => e.id === auditCheck.evidenceIds[0])!;
+    expect(auditEv.facts.pendingCount).toBeNull();
+  });
+
+  test("finding 9: package_updates does not claim recent upgrade history when pacman-log is missing or unparseable", async () => {
+    const missingLog = await harness({
+      commands: { updates: okResult("", 1) },
+      files: { "pacman-log": null },
+    }).collector.collect("scan-pkg-no-log", settings());
+    const missingCheck = checkById(missingLog, "package_updates");
+    expect(missingCheck.sourceCoverage.pacman_log).toBe("unavailable");
+    expect(missingCheck.summary.toLowerCase()).not.toContain("recent upgrade history");
+
+    const unparseableLog = await harness({
+      commands: { updates: okResult("", 1) },
+      files: { "pacman-log": "not an alpm upgrade log\n" },
+    }).collector.collect("scan-pkg-bad-log", settings());
+    const unparseableCheck = checkById(unparseableLog, "package_updates");
+    expect(unparseableCheck.sourceCoverage.pacman_log).toBe("partial");
+    expect(unparseableCheck.summary.toLowerCase()).not.toContain("recent upgrade history");
+  });
+
+  test("finding 10: systemd unit evidence uses opaque scan-scoped IDs and keeps sanitized unit name in facts", async () => {
+    const result = await harness({
+      commands: {
+        system_failed: okResult("secret-service@prod.service loaded failed failed Secret Service"),
+        user_failed: okResult("my-timer.service loaded failed failed My Timer"),
+      },
+    }).collector.collect("scan-unit-ids", settings());
+
+    const unitEvidence = result.snapshot.evidence.filter((e) => e.kind === "unit");
+    expect(unitEvidence).toHaveLength(2);
+    for (const ev of unitEvidence) {
+      expect(ev.id).not.toContain("secret-service");
+      expect(ev.id).not.toContain("my-timer");
+      expect(ev.id).toMatch(/^ev:scan-unit-ids:unit:\d+$/);
+    }
+    expect(unitEvidence[0]!.facts.unit).toBe("secret-service@prod.service");
+    expect(unitEvidence[1]!.facts.unit).toBe("my-timer.service");
   });
 });
