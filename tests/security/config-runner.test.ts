@@ -748,6 +748,48 @@ test("journal after-cursor succeeds when runner stops a streaming command exceed
   }
 });
 
+test("journal after-cursor returns full page promptly and reaps child when exact page keeps stdout open", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+  let spawned: ReturnType<typeof Bun.spawn> | undefined;
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) => {
+    spawned = realSpawn(
+      ["/bin/sh", "-c", 'printf \'{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n\'; exec sleep 10'],
+      options as Parameters<typeof Bun.spawn>[1],
+    );
+    return spawned;
+  }) as typeof Bun.spawn);
+
+  try {
+    const startedAt = performance.now();
+    const result = await createCommandRunner({ timeoutMs: 500 }).run({
+      kind: "journal",
+      after: "s=abc123",
+      limit: 2,
+    });
+    const elapsedMs = performance.now() - startedAt;
+
+    expect(result).toEqual({
+      status: "ok",
+      stdout: '{"MESSAGE":"one"}\n{"MESSAGE":"two"}',
+      exitCode: 0,
+    });
+    expect(elapsedMs).toBeLessThan(1_000);
+    expect(spawned).toBeDefined();
+    expect(spawned!.signalCode).toBe("SIGKILL");
+    let alive = true;
+    try {
+      process.kill(spawned!.pid, 0);
+    } catch {
+      alive = false;
+    }
+    expect(alive).toBe(false);
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+  }
+});
+
 test("abort returns promptly when a grandchild keeps stdout and stderr pipes open", async () => {
   const dir = mkdtempSync(join(tmpdir(), "basho-runner-abort-"));
   const pidFile = join(dir, "grandchild.pid");

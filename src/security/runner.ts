@@ -5,6 +5,7 @@ const TRUSTED_SEARCH_PATH =
 
 const MAX_OUTPUT_BYTES = 256 * 1024;
 const COMMAND_TIMEOUT_MS = 5_000;
+const DEFAULT_PAGE_SETTLE_MS = 50;
 const MAX_CURSOR_LENGTH = 512;
 const MAX_JOURNAL_LIMIT = 1_000;
 
@@ -113,12 +114,26 @@ async function readBoundedJsonLines(
   maxLines: number,
   onLimitReached: () => void,
   registerCancel?: (cancel: () => void) => void,
+  pageSettleMs: number = DEFAULT_PAGE_SETTLE_MS,
 ): Promise<{ text: string; reachedLimit: boolean }> {
+  if (!Number.isFinite(pageSettleMs) || pageSettleMs < 0) {
+    throw new RangeError("pageSettleMs must be a non-negative finite number");
+  }
   const reader = stream.getReader();
   let canceled = false;
+  let settleTimerId: ReturnType<typeof setTimeout> | undefined;
+  let abortSettleWait: (() => void) | undefined;
+  const clearSettleTimer = () => {
+    if (settleTimerId !== undefined) {
+      clearTimeout(settleTimerId);
+      settleTimerId = undefined;
+    }
+  };
   const cancel = () => {
     if (canceled) return;
     canceled = true;
+    clearSettleTimer();
+    abortSettleWait?.();
     try {
       void reader.cancel().catch(() => {});
     } catch {
@@ -132,21 +147,80 @@ async function readBoundedJsonLines(
   let pending = "";
   const lines: string[] = [];
   let reachedLimit = false;
+  let settleDeadlineMs: number | undefined;
   try {
     for (;;) {
-      const { done, value } = await reader.read();
-      if (done) {
-        pending += decoder.decode();
-        // Never emit a trailing unterminated/truncated line; only complete newline-delimited records.
-        return { text: lines.join("\n"), reachedLimit };
-      }
       if (lines.length >= maxLines) {
+        if (settleDeadlineMs === undefined) {
+          settleDeadlineMs = performance.now() + pageSettleMs;
+        }
+        const remainingMs = Math.max(0, settleDeadlineMs - performance.now());
+        if (canceled) {
+          return { text: lines.join("\n"), reachedLimit };
+        }
+        const readPromise = reader.read();
+        type SettleOutcome =
+          | { kind: "read"; result: Awaited<typeof readPromise> }
+          | { kind: "timeout" }
+          | { kind: "canceled" };
+        const settleOutcome = await new Promise<SettleOutcome>((resolve, reject) => {
+          let settled = false;
+          const finish = (outcome: SettleOutcome) => {
+            if (settled) return;
+            settled = true;
+            abortSettleWait = undefined;
+            clearSettleTimer();
+            resolve(outcome);
+          };
+
+          abortSettleWait = () => finish({ kind: "canceled" });
+          settleTimerId = setTimeout(() => finish({ kind: "timeout" }), remainingMs);
+
+          readPromise.then(
+            (result) => finish({ kind: "read", result }),
+            (error) => {
+              if (settled) return;
+              settled = true;
+              abortSettleWait = undefined;
+              clearSettleTimer();
+              reject(error);
+            },
+          );
+        });
+
+        if (settleOutcome.kind === "canceled") {
+          return { text: lines.join("\n"), reachedLimit };
+        }
+        if (settleOutcome.kind === "timeout") {
+          reachedLimit = true;
+          onLimitReached();
+          cancel();
+          return { text: lines.join("\n"), reachedLimit };
+        }
+        const { done, value } = settleOutcome.result;
+        if (done) {
+          pending += decoder.decode();
+          return { text: lines.join("\n"), reachedLimit };
+        }
         if (value.byteLength === 0) {
+          if (performance.now() >= settleDeadlineMs) {
+            reachedLimit = true;
+            onLimitReached();
+            cancel();
+            return { text: lines.join("\n"), reachedLimit };
+          }
           continue;
         }
         reachedLimit = true;
         onLimitReached();
         cancel();
+        return { text: lines.join("\n"), reachedLimit };
+      }
+
+      const { done, value } = await reader.read();
+      if (done) {
+        pending += decoder.decode();
+        // Never emit a trailing unterminated/truncated line; only complete newline-delimited records.
         return { text: lines.join("\n"), reachedLimit };
       }
       bytes += value.byteLength;
@@ -172,7 +246,7 @@ async function readBoundedJsonLines(
               return { text: lines.join("\n"), reachedLimit };
             }
             // Exactly maxLines complete lines arrived with no extra bytes yet:
-            // wait for either EOF (honoring the child's actual exit code/signal)
+            // wait up to pageSettleMs for EOF (honoring the child's actual exit code/signal)
             // or an additional byte confirming more records exist.
             break;
           }
@@ -182,7 +256,13 @@ async function readBoundedJsonLines(
     }
   } finally {
     canceled = true;
-    reader.releaseLock();
+    abortSettleWait = undefined;
+    clearSettleTimer();
+    try {
+      reader.releaseLock();
+    } catch {
+      // Lock may still have a pending read if stopped on settle timeout/cancel.
+    }
   }
 }
 
