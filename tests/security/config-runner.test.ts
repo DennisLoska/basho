@@ -1345,3 +1345,27 @@ test("direct child exit terminates lingering descendants that closed stdout and 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("block_devices recipe requests MOUNTPOINTS column from lsblk", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockImplementation((cmd) =>
+    cmd === "lsblk" ? "/usr/bin/lsblk" : null,
+  );
+  let seenArgv: unknown;
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((argv, options) => {
+    seenArgv = argv;
+    return realSpawn(
+      ["/bin/sh", "-c", "printf '{\"blockdevices\":[]}\\n'; exit 0"],
+      options as Parameters<typeof Bun.spawn>[1],
+    );
+  }) as typeof Bun.spawn);
+
+  try {
+    const result = await createCommandRunner().run({ kind: "block_devices" });
+    expect(result.status).toBe("ok");
+    expect(seenArgv).toEqual(["/usr/bin/lsblk", "-J", "-o", "NAME,TYPE,FSTYPE,MOUNTPOINTS"]);
+  } finally {
+    spawnSpy.mockRestore();
+    whichSpy.mockRestore();
+  }
+});

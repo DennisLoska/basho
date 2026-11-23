@@ -460,21 +460,21 @@ describe("evaluateFirewall", () => {
   test("returns unknown for relevant rule syntax it cannot evaluate", () => {
     const listener = { family: 4 as const, protocol: "tcp" as const, port: 8188, address: "0.0.0.0" };
 
-    // A jump into ufw's rate-limit chain cannot be resolved to allow or deny statically.
+    // A jump into an unknown custom chain cannot be resolved to allow or deny statically.
     expect(
       evaluateFirewall(listener, {
         active: true,
-        v4: "-A ufw-user-input -p tcp --dport 8188 -j ufw-user-limit",
+        v4: "-A ufw-user-input -p tcp --dport 8188 -j CUSTOM_CHAIN",
         defaultInput: "allow",
       }),
     ).toBe("unknown");
   });
 
-  test("returns unknown for an unspecified bind family", () => {
+  test("returns unknown for an unspecified bind family when neither stack allows and one is unknown", () => {
     expect(
       evaluateFirewall(
         { family: "unspecified", protocol: "tcp", port: 3003, address: "*" },
-        { active: true, v4: "-A ufw-user-input -p tcp --dport 3003 -j ACCEPT", defaultInput: "deny" },
+        { active: true, v4: "-A ufw-user-input -p tcp --dport 6969 -j ACCEPT", defaultInput: "deny" },
       ),
     ).toBe("unknown");
   });
@@ -796,12 +796,12 @@ describe("PostureCollector network_exposure", () => {
     expect(entryByPort(result, 9443).reachability).toBe("tailnet");
   });
 
-  test("leaves wildcard binds unknown when publication tools are unavailable", async () => {
+  test("leaves wildcard binds unknown when publication tools fail", async () => {
     const { collector } = harness({
       commands: {
         sockets: okResult(ss("tcp   LISTEN 0      128    *:3003    *:*")),
-        tailscale_serve: UNAVAILABLE,
-        tailscale_funnel: UNAVAILABLE,
+        tailscale_serve: { status: "failed" },
+        tailscale_funnel: { status: "failed" },
       },
     });
     const result = await collector.collect("scan-wildcard", settings());
@@ -1406,8 +1406,8 @@ describe("PostureCollector spec hardening regressions", () => {
             "tcp   LISTEN 0      128    [::]:7001       [::]:*",
           ),
         ),
-        tailscale_serve: UNAVAILABLE,
-        tailscale_funnel: UNAVAILABLE,
+        tailscale_serve: { status: "failed" },
+        tailscale_funnel: { status: "failed" },
       },
       files: {
         "ufw-v4": "-A ufw-user-input -j RETURN",
@@ -1764,8 +1764,8 @@ describe("PostureCollector spec re-review regressions (findings 1-6)", () => {
             "tcp   LISTEN 0      128    [fd7a:115c:a1e0::1]%tailscale0:443 [::]:*",
           ),
         ),
-        tailscale_serve: UNAVAILABLE,
-        tailscale_funnel: UNAVAILABLE,
+        tailscale_serve: { status: "failed" },
+        tailscale_funnel: { status: "failed" },
       },
       files: {
         "ufw-v4": "-A ufw-user-input -p tcp --dport 6969 -j ACCEPT",
@@ -1981,5 +1981,408 @@ describe("PostureCollector spec re-review regressions (findings 1-6)", () => {
     const checkUnmatched = checkById(unmatchedPrefixGlob, "ssh_hardening");
     expect(checkUnmatched.sourceCoverage.sshd_dropins).toBe("partial");
     expect(checkUnmatched.status).toBe("unknown");
+  });
+});
+
+describe("PostureCollector Stage 2 code quality regressions", () => {
+  test("finding 1: specific non-loopback listener without interfaceName is unknown on interface-scoped UFW rules", () => {
+    const rule = "-A ufw-user-input -i eth0 -p tcp --dport 8080 -j ACCEPT";
+
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 8080, address: "192.168.1.10" },
+        { active: true, v4: rule, defaultInput: "deny" },
+      ),
+    ).toBe("unknown");
+
+    expect(
+      evaluateFirewall(
+        { family: 6, protocol: "tcp", port: 8080, address: "2001:db8::10" },
+        {
+          active: true,
+          ipv6Enabled: true,
+          v6: "-A ufw6-user-input -i eth0 -p tcp --dport 8080 -j ACCEPT",
+          defaultInput: "deny",
+        },
+      ),
+    ).toBe("unknown");
+
+    // Loopback without interfaceName still skips non-lo interface-scoped rules.
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 8080, address: "127.0.0.1" },
+        { active: true, v4: rule, defaultInput: "deny" },
+      ),
+    ).toBe("deny");
+
+    // Non-matching destination CIDR still skips interface-scoped rules cleanly.
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 8080, address: "192.168.1.10" },
+        {
+          active: true,
+          v4: "-A ufw-user-input -i eth0 -d 10.0.0.5 -p tcp --dport 8080 -j ACCEPT",
+          defaultInput: "deny",
+        },
+      ),
+    ).toBe("deny");
+  });
+
+  test("finding 2: walks Tailscale Foreground and Services configs and downgrades unrecognized top-level keys to partial", async () => {
+    const foregroundFunnel = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    127.0.0.1:3000    0.0.0.0:*")),
+        tailscale_serve: okResult("{}"),
+        tailscale_funnel: okResult(
+          JSON.stringify({
+            Foreground: {
+              "fg-session-1": {
+                TCP: { "443": { HTTPS: true } },
+                Web: {
+                  "host.tailnet.ts.net:443": {
+                    Handlers: { "/": { Proxy: "http://127.0.0.1:3000" } },
+                  },
+                },
+                AllowFunnel: { "host.tailnet.ts.net:443": true },
+              },
+            },
+          }),
+        ),
+      },
+    }).collector.collect("scan-ts-foreground", settings());
+
+    const fgEntry = entryByPort(foregroundFunnel, 3000);
+    expect(fgEntry.publication).toBe("funnel");
+    expect(fgEntry.reachability).toBe("exposed_v4_v6");
+    expect(checkById(foregroundFunnel, "network_exposure").sourceCoverage.tailscale_funnel).toBe(
+      "complete",
+    );
+
+    const servicesServe = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    127.0.0.1:4000    0.0.0.0:*")),
+        tailscale_serve: okResult(
+          JSON.stringify({
+            Services: {
+              "svc:app": {
+                Web: {
+                  "app.tailnet.ts.net:443": {
+                    Handlers: { "/": { Proxy: "http://127.0.0.1:4000" } },
+                  },
+                },
+              },
+            },
+          }),
+        ),
+        tailscale_funnel: okResult("{}"),
+      },
+    }).collector.collect("scan-ts-services", settings());
+
+    const svcEntry = entryByPort(servicesServe, 4000);
+    expect(svcEntry.publication).toBe("serve");
+    expect(svcEntry.reachability).toBe("tailnet");
+
+    const unknownTopLevel = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    127.0.0.1:6969    0.0.0.0:*")),
+        tailscale_serve: okResult(JSON.stringify({ Web: {}, FutureSchemaKey: { foo: "bar" } })),
+        tailscale_funnel: okResult("{}"),
+      },
+    }).collector.collect("scan-ts-unknown-key", settings());
+
+    const netCheck = checkById(unknownTopLevel, "network_exposure");
+    expect(netCheck.sourceCoverage.tailscale_serve).toBe("partial");
+    expect(entryByPort(unknownTopLevel, 6969).publication).toBe("unknown");
+  });
+
+  test("finding 3: SSH applies KbdInteractiveAuthentication default yes, flags Match all loosening, and does not hide defaults on empty Include glob", async () => {
+    // 1. Unset KbdInteractiveAuthentication defaults to yes and flags warning.
+    const unsetKbd = await harness({
+      files: {
+        "sshd-main": ["Port 22", "PermitRootLogin no", "PasswordAuthentication no"].join("\n"),
+      },
+    }).collector.collect("scan-ssh-default-kbd", settings());
+    const unsetKbdCheck = checkById(unsetKbd, "ssh_hardening");
+    expect(unsetKbdCheck.status).not.toBe("pass");
+    expect(findingsFor(unsetKbd, unsetKbdCheck).some((f) => f.id.includes("kbd_interactive"))).toBe(
+      true,
+    );
+
+    // 2. Match all keeps inMatch true so loosening directives after Match all are not ignored.
+    const matchAll = await harness({
+      files: {
+        "sshd-main": [
+          "PasswordAuthentication no",
+          "PermitRootLogin no",
+          "KbdInteractiveAuthentication no",
+          "Match all",
+          "  PasswordAuthentication yes",
+        ].join("\n"),
+      },
+    }).collector.collect("scan-ssh-match-all", settings());
+    const matchAllCheck = checkById(matchAll, "ssh_hardening");
+    expect(matchAllCheck.status).not.toBe("pass");
+    expect(findingsFor(matchAll, matchAllCheck).length).toBeGreaterThan(0);
+
+    // 3. Zero-match Include *.conf when dropIns is [] (readable empty dir) still flags default auth yes.
+    const emptyIncludeWithDefaults = await harness({
+      files: {
+        "sshd-main": "Include /etc/ssh/sshd_config.d/*.conf\nPort 22\n",
+      },
+      dropIns: [],
+    }).collector.collect("scan-ssh-empty-include-defaults", settings());
+    const emptyIncCheck = checkById(emptyIncludeWithDefaults, "ssh_hardening");
+    expect(emptyIncCheck.status).toBe("fail");
+    expect(emptyIncCheck.sourceCoverage.sshd_dropins).toBe("partial");
+    const emptyIncFindings = findingsFor(emptyIncludeWithDefaults, emptyIncCheck);
+    expect(emptyIncFindings.some((f) => f.id.includes("password_auth"))).toBe(true);
+    expect(emptyIncFindings.some((f) => f.id.includes("kbd_interactive"))).toBe(true);
+  });
+
+  test("finding 4: evaluateFirewall treats ufw-user-limit and ufw-user-limit-accept as allow", () => {
+    const v4Listener = { family: 4 as const, protocol: "tcp" as const, port: 22, address: "0.0.0.0" };
+    const v6Listener = { family: 6 as const, protocol: "tcp" as const, port: 22, address: "::" };
+
+    expect(
+      evaluateFirewall(v4Listener, {
+        active: true,
+        v4: "-A ufw-user-input -p tcp --dport 22 -j ufw-user-limit",
+        defaultInput: "deny",
+      }),
+    ).toBe("allow");
+
+    expect(
+      evaluateFirewall(v4Listener, {
+        active: true,
+        v4: "-A ufw-user-input -p tcp --dport 22 -j ufw-user-limit-accept",
+        defaultInput: "deny",
+      }),
+    ).toBe("allow");
+
+    expect(
+      evaluateFirewall(v6Listener, {
+        active: true,
+        ipv6Enabled: true,
+        v6: "-A ufw6-user-input -p tcp --dport 22 -j ufw6-user-limit",
+        defaultInput: "deny",
+      }),
+    ).toBe("allow");
+
+    expect(
+      evaluateFirewall(v6Listener, {
+        active: true,
+        ipv6Enabled: true,
+        v6: "-A ufw6-user-input -p tcp --dport 22 -j ufw6-user-limit-accept",
+        defaultInput: "deny",
+      }),
+    ).toBe("allow");
+  });
+
+  test("finding 5: UDP always gets publication none, absent Tailscale binary treats TCP publication as none, and failed/timeout stays unknown", async () => {
+    // UDP stays publication: none even when Tailscale commands fail.
+    const udpFailedTs = await harness({
+      commands: {
+        sockets: okResult(ss("udp   UNCONN 0      0      0.0.0.0:41641    0.0.0.0:*")),
+        tailscale_serve: { status: "failed" },
+        tailscale_funnel: { status: "timeout" },
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -j RETURN",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-udp-pub-none", settings());
+
+    const udpEntry = entryByPort(udpFailedTs, 41641);
+    expect(udpEntry.publication).toBe("none");
+    expect(udpEntry.reachability).toBe("blocked_by_ufw");
+
+    // Both tailscale_serve and tailscale_funnel unavailable (binary absent): TCP loopback is local_only.
+    const noTailscale = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    127.0.0.1:6969    0.0.0.0:*")),
+        tailscale_serve: UNAVAILABLE,
+        tailscale_funnel: UNAVAILABLE,
+      },
+    }).collector.collect("scan-no-tailscale", settings());
+
+    const localEntry = entryByPort(noTailscale, 6969);
+    expect(localEntry.publication).toBe("none");
+    expect(localEntry.reachability).toBe("local_only");
+    const netCheck = checkById(noTailscale, "network_exposure");
+    expect(netCheck.status).toBe("pass");
+    expect(netCheck.sourceCoverage.tailscale_serve).toBe("unavailable");
+    expect(netCheck.sourceCoverage.tailscale_funnel).toBe("unavailable");
+
+    // Failed/timeout Tailscale still produces publication: unknown for TCP.
+    const failedTailscale = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    127.0.0.1:6969    0.0.0.0:*")),
+        tailscale_serve: { status: "timeout" },
+        tailscale_funnel: { status: "failed" },
+      },
+    }).collector.collect("scan-failed-tailscale", settings());
+
+    expect(entryByPort(failedTailscale, 6969).publication).toBe("unknown");
+    expect(entryByPort(failedTailscale, 6969).reachability).toBe("unknown");
+  });
+
+  test("finding 6: unspecified wildcard listeners evaluate both v4 and v6 firewalls", async () => {
+    const bothDenied = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    *:3003    *:*")),
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -j RETURN",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-unspec-denied", settings());
+
+    const deniedEntry = entryByPort(bothDenied, 3003);
+    expect(deniedEntry.firewallV4).toBe("deny");
+    expect(deniedEntry.firewallV6).toBe("deny");
+    expect(deniedEntry.reachability).toBe("blocked_by_ufw");
+
+    const v4Allowed = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    *:3003    *:*")),
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -p tcp --dport 3003 -j ACCEPT",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-unspec-v4-allow", settings());
+
+    const v4Entry = entryByPort(v4Allowed, 3003);
+    expect(v4Entry.firewallV4).toBe("allow");
+    expect(v4Entry.firewallV6).toBe("deny");
+    expect(v4Entry.reachability).toBe("exposed_lan");
+
+    const bothAllowed = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    *:3003    *:*")),
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -p tcp --dport 3003 -j ACCEPT",
+        "ufw-v6": "-A ufw6-user-input -p tcp --dport 3003 -j ACCEPT",
+      },
+    }).collector.collect("scan-unspec-both-allow", settings());
+
+    const bothEntry = entryByPort(bothAllowed, 3003);
+    expect(bothEntry.firewallV4).toBe("allow");
+    expect(bothEntry.firewallV6).toBe("allow");
+    expect(bothEntry.reachability).toBe("exposed_v4_v6");
+
+    expect(
+      evaluateFirewall(
+        { family: "unspecified", protocol: "tcp", port: 3003, address: "*" },
+        {
+          active: true,
+          ipv6Enabled: true,
+          v4: "-A ufw-user-input -j RETURN",
+          v6: "-A ufw6-user-input -j RETURN",
+          defaultInput: "deny",
+        },
+      ),
+    ).toBe("deny");
+    expect(
+      evaluateFirewall(
+        { family: "unspecified", protocol: "tcp", port: 3003, address: "*" },
+        {
+          active: true,
+          ipv6Enabled: true,
+          v4: "-A ufw-user-input -p tcp --dport 3003 -j ACCEPT",
+          v6: "-A ufw6-user-input -j RETURN",
+          defaultInput: "deny",
+        },
+      ),
+    ).toBe("allow");
+  });
+
+  test("finding 7: process_and_timers excludes loopback listeners and dedupes by (protocol, port, pid)", async () => {
+    const loopbackOnly = await harness({
+      commands: {
+        sockets: okResult(
+          ss(
+            'tcp   LISTEN 0      128    127.0.0.1:9123    0.0.0.0:*    users:(("dev-srv",pid=7001,fd=5))',
+            'tcp   LISTEN 0      128    127.0.1.1:9124    0.0.0.0:*    users:(("dev-srv",pid=7001,fd=6))',
+            'tcp   LISTEN 0      128    [::1]:9125        [::]:*       users:(("dev-srv",pid=7001,fd=7))',
+          ),
+        ),
+        processes: okResult("  7001     1  1000     50 dev-srv"),
+      },
+    }).collector.collect("scan-proc-loopback", settings());
+
+    const loopbackCheck = checkById(loopbackOnly, "process_and_timers");
+    expect(loopbackCheck.status).toBe("pass");
+    expect(findingsFor(loopbackOnly, loopbackCheck)).toHaveLength(0);
+
+    const dualStack = await harness({
+      commands: {
+        sockets: okResult(
+          ss(
+            'tcp   LISTEN 0      128    0.0.0.0:5321    0.0.0.0:*    users:(("weird",pid=5150,fd=3))',
+            'tcp   LISTEN 0      128    [::]:5321       [::]:*       users:(("weird",pid=5150,fd=4))',
+            'udp   UNCONN 0      0      0.0.0.0:5321    0.0.0.0:*    users:(("weird",pid=5150,fd=5))',
+          ),
+        ),
+        processes: okResult("  5150     1  1000     120 weird"),
+      },
+    }).collector.collect("scan-proc-dedupe", settings());
+
+    const dualCheck = checkById(dualStack, "process_and_timers");
+    expect(dualCheck.status).toBe("warn");
+    const procEv = dualStack.snapshot.evidence.filter((e) => e.kind === "process");
+    // tcp:5321:5150 deduped once + udp:5321:5150 once = 2 total (not 3).
+    expect(procEv).toHaveLength(2);
+    expect(
+      dualStack.snapshot.evidence.find((e) => e.facts.criterion === "process_and_timers")?.facts
+        .unexpectedListenerCount,
+    ).toBe(2);
+  });
+
+  test("finding 8: disk_and_boot handles lsblk MOUNTPOINTS array for btrfs-on-LUKS subvolumes", async () => {
+    const btrfsLuks = await harness({
+      commands: {
+        block_devices: okResult(
+          JSON.stringify({
+            blockdevices: [
+              {
+                name: "nvme0n1",
+                type: "disk",
+                fstype: null,
+                mountpoints: [null],
+                children: [
+                  {
+                    name: "nvme0n1p1",
+                    type: "part",
+                    fstype: "vfat",
+                    mountpoints: ["/boot"],
+                  },
+                  {
+                    name: "nvme0n1p2",
+                    type: "part",
+                    fstype: "crypto_LUKS",
+                    mountpoints: [null],
+                    children: [
+                      {
+                        name: "root",
+                        type: "crypt",
+                        fstype: "btrfs",
+                        mountpoints: ["/var/log", "/var/cache/pacman/pkg", "/home", "/"],
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          }),
+        ),
+      },
+    }).collector.collect("scan-btrfs-mountpoints", settings());
+
+    const check = checkById(btrfsLuks, "disk_and_boot");
+    expect(check.status).toBe("pass");
+    const ev = btrfsLuks.snapshot.evidence.find((e) => e.id === check.evidenceIds[0]);
+    expect(ev?.facts.rootEncrypted).toBe(true);
   });
 });

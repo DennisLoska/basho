@@ -319,7 +319,7 @@ function buildRecipe(request: CommandRequest): BuiltRecipe {
       };
     case "block_devices":
       return {
-        argv: ["lsblk", "-J", "-o", "NAME,TYPE,FSTYPE,MOUNTPOINT"],
+        argv: ["lsblk", "-J", "-o", "NAME,TYPE,FSTYPE,MOUNTPOINTS"],
         benignExitCodes: [0],
         includeUserRuntimeEnv: false,
       };

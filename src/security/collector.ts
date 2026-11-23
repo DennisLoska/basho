@@ -91,6 +91,7 @@ export interface TailscalePublications {
   funnelTargets: readonly TailscaleBackendTarget[];
   serveCoverage: Coverage;
   funnelCoverage: Coverage;
+  tailscaleAbsent?: boolean;
 }
 
 const DEFAULT_CONCURRENCY = 4;
@@ -280,8 +281,8 @@ function isLoopbackAddress(address: string, family: Listener["family"]): boolean
     return num !== null && ((num >>> 24) & 0xff) === 127;
   }
   if (family === 6) {
+    if (isPureIpv6Loopback(address)) return true;
     const lower = address.toLowerCase();
-    if (lower === "::1" || lower === "0:0:0:0:0:0:0:1") return true;
     if (lower.startsWith("::ffff:")) {
       const mapped = parseIpv4ToUint32(lower.slice("::ffff:".length));
       return mapped !== null && ((mapped >>> 24) & 0xff) === 127;
@@ -778,6 +779,13 @@ function parseUfwChainRules(rulesText: string, chainName: string): ParsedUfwRule
   return rules;
 }
 
+const UFW_RATE_LIMIT_ALLOW_JUMPS = new Set([
+  "ufw-user-limit",
+  "ufw-user-limit-accept",
+  "ufw6-user-limit",
+  "ufw6-user-limit-accept",
+]);
+
 export function evaluateFirewall(
   listener: Pick<Listener, "family" | "protocol" | "port" | "address" | "interfaceName">,
   inputs: FirewallInputs,
@@ -789,6 +797,24 @@ export function evaluateFirewall(
     return "allow";
   }
   if (listener.family === "unspecified") {
+    const v4 = evaluateFirewall(
+      {
+        ...listener,
+        family: 4,
+        address: listener.address === "*" ? "0.0.0.0" : listener.address,
+      },
+      inputs,
+    );
+    const v6 = evaluateFirewall(
+      {
+        ...listener,
+        family: 6,
+        address: listener.address === "*" ? "::" : listener.address,
+      },
+      inputs,
+    );
+    if (v4 === "allow" || v6 === "allow") return "allow";
+    if (v4 === "deny" && v6 === "deny") return "deny";
     return "unknown";
   }
 
@@ -825,17 +851,21 @@ export function evaluateFirewall(
 
     // Interface-scoped rules:
     // - If the listener has an explicit interfaceName, match/mismatch normally.
-    // - If a wildcard listener has no interfaceName, an interface-scoped rule is indeterminate
-    //   rather than skipped to default policy.
+    // - Loopback listeners only match lo.
+    // - Any non-loopback listener without interfaceName (wildcard or specific IP) cannot prove
+    //   which interface owns its address, so a matching interface-scoped rule is indeterminate.
+    let interfaceIndeterminate = false;
     if (rule.inInterface !== undefined) {
       if (listener.interfaceName !== undefined) {
         if (!interfaceMatches(rule.inInterface, listener.interfaceName)) {
           continue;
         }
-      } else if (isWildcardAddress(listener.address)) {
-        return "unknown";
+      } else if (isLoopbackAddress(listener.address, listener.family)) {
+        if (!interfaceMatches(rule.inInterface, "lo")) {
+          continue;
+        }
       } else {
-        continue;
+        interfaceIndeterminate = true;
       }
     }
 
@@ -853,6 +883,10 @@ export function evaluateFirewall(
         if (matched === false) continue;
         if (matched === null) return "unknown";
       }
+    }
+
+    if (interfaceIndeterminate) {
+      return "unknown";
     }
 
     // Unconditional RETURN ends the user-input chain and falls back to defaultInput.
@@ -877,14 +911,17 @@ export function evaluateFirewall(
       return "unknown";
     }
 
-    if (rule.jump === "ACCEPT") {
+    if (
+      rule.jump === "ACCEPT" ||
+      (rule.jump !== undefined && UFW_RATE_LIMIT_ALLOW_JUMPS.has(rule.jump))
+    ) {
       return "allow";
     }
     if (rule.jump === "DROP" || rule.jump === "REJECT") {
       return "deny";
     }
 
-    // Non-terminal or unknown jump target (e.g. ufw-user-limit) on a matching rule.
+    // Non-terminal or unknown jump target on a matching rule.
     return "unknown";
   }
 
@@ -1216,74 +1253,129 @@ function tailscaleTargetMatchesListener(
   return "no_match";
 }
 
+const KNOWN_TAILSCALE_SERVE_KEYS = new Set([
+  "Web",
+  "TCP",
+  "AllowFunnel",
+  "Foreground",
+  "Services",
+]);
+const MAX_TAILSCALE_CONFIG_DEPTH = 4;
+
 function collectTargetsFromTailscaleJson(
   rawJson: unknown,
   funnelOnly: boolean,
-): { serve: TailscaleBackendTarget[]; funnel: TailscaleBackendTarget[] } | null {
+): {
+  serve: TailscaleBackendTarget[];
+  funnel: TailscaleBackendTarget[];
+  hasUnknownKeys: boolean;
+} | null {
   if (typeof rawJson !== "object" || rawJson === null || Array.isArray(rawJson)) {
     return null;
   }
-  const obj = rawJson as Record<string, unknown>;
+
   const serve: TailscaleBackendTarget[] = [];
   const funnel: TailscaleBackendTarget[] = [];
+  let hasUnknownKeys = false;
 
-  const allowFunnelMap = new Map<string, boolean>();
-  if (typeof obj.AllowFunnel === "object" && obj.AllowFunnel !== null && !Array.isArray(obj.AllowFunnel)) {
-    for (const [hostPort, allowed] of Object.entries(obj.AllowFunnel as Record<string, unknown>)) {
-      if (allowed === true) {
-        allowFunnelMap.set(hostPort, true);
+  const visitConfig = (
+    config: Record<string, unknown>,
+    inheritedAllowFunnel: ReadonlyMap<string, boolean>,
+    depth: number,
+  ) => {
+    for (const key of Object.keys(config)) {
+      if (!KNOWN_TAILSCALE_SERVE_KEYS.has(key)) {
+        hasUnknownKeys = true;
       }
     }
-  }
 
-  if (typeof obj.Web === "object" && obj.Web !== null && !Array.isArray(obj.Web)) {
-    for (const [hostPort, webConfig] of Object.entries(obj.Web as Record<string, unknown>)) {
-      if (typeof webConfig !== "object" || webConfig === null || Array.isArray(webConfig)) {
-        continue;
+    const allowFunnelMap = new Map<string, boolean>(inheritedAllowFunnel);
+    if (config.AllowFunnel !== undefined && config.AllowFunnel !== null) {
+      if (typeof config.AllowFunnel === "object" && !Array.isArray(config.AllowFunnel)) {
+        for (const [hostPort, allowed] of Object.entries(
+          config.AllowFunnel as Record<string, unknown>,
+        )) {
+          if (typeof allowed === "boolean") {
+            allowFunnelMap.set(hostPort, allowed);
+          }
+        }
+      } else {
+        hasUnknownKeys = true;
       }
-      const handlers = (webConfig as Record<string, unknown>).Handlers;
-      if (typeof handlers !== "object" || handlers === null || Array.isArray(handlers)) {
-        continue;
-      }
-      const isFunnelHost = allowFunnelMap.get(hostPort) === true;
-      for (const handler of Object.values(handlers as Record<string, unknown>)) {
-        if (typeof handler !== "object" || handler === null || Array.isArray(handler)) {
+    }
+
+    if (typeof config.Web === "object" && config.Web !== null && !Array.isArray(config.Web)) {
+      for (const [hostPort, webConfig] of Object.entries(config.Web as Record<string, unknown>)) {
+        if (typeof webConfig !== "object" || webConfig === null || Array.isArray(webConfig)) {
           continue;
         }
-        const proxy = (handler as Record<string, unknown>).Proxy;
-        if (typeof proxy !== "string") continue;
-        const parsedTarget = parseTailscaleBackendTarget(proxy);
+        const handlers = (webConfig as Record<string, unknown>).Handlers;
+        if (typeof handlers !== "object" || handlers === null || Array.isArray(handlers)) {
+          continue;
+        }
+        const isFunnelHost = allowFunnelMap.get(hostPort) === true;
+        for (const handler of Object.values(handlers as Record<string, unknown>)) {
+          if (typeof handler !== "object" || handler === null || Array.isArray(handler)) {
+            continue;
+          }
+          const proxy = (handler as Record<string, unknown>).Proxy;
+          if (typeof proxy !== "string") continue;
+          const parsedTarget = parseTailscaleBackendTarget(proxy);
+          if (parsedTarget === null) continue;
+          if (isFunnelHost) {
+            funnel.push(parsedTarget);
+          } else if (!funnelOnly) {
+            serve.push(parsedTarget);
+          }
+        }
+      }
+    }
+
+    if (typeof config.TCP === "object" && config.TCP !== null && !Array.isArray(config.TCP)) {
+      for (const [listenPort, tcpConfig] of Object.entries(
+        config.TCP as Record<string, unknown>,
+      )) {
+        if (typeof tcpConfig !== "object" || tcpConfig === null || Array.isArray(tcpConfig)) {
+          continue;
+        }
+        const forward = (tcpConfig as Record<string, unknown>).TCPForward;
+        if (typeof forward !== "string") continue;
+        const parsedTarget = parseTailscaleBackendTarget(forward);
         if (parsedTarget === null) continue;
-        if (isFunnelHost) {
+        const isFunnelTcp = [...allowFunnelMap.entries()].some(
+          ([hostPort, allowed]) => allowed && hostPort.endsWith(`:${listenPort}`),
+        );
+        if (isFunnelTcp) {
           funnel.push(parsedTarget);
         } else if (!funnelOnly) {
           serve.push(parsedTarget);
         }
       }
     }
-  }
 
-  if (typeof obj.TCP === "object" && obj.TCP !== null && !Array.isArray(obj.TCP)) {
-    for (const [listenPort, tcpConfig] of Object.entries(obj.TCP as Record<string, unknown>)) {
-      if (typeof tcpConfig !== "object" || tcpConfig === null || Array.isArray(tcpConfig)) {
-        continue;
+    const visitNestedMap = (nested: unknown) => {
+      if (nested === undefined || nested === null) return;
+      if (typeof nested !== "object" || Array.isArray(nested)) {
+        hasUnknownKeys = true;
+        return;
       }
-      const forward = (tcpConfig as Record<string, unknown>).TCPForward;
-      if (typeof forward !== "string") continue;
-      const parsedTarget = parseTailscaleBackendTarget(forward);
-      if (parsedTarget === null) continue;
-      const isFunnelTcp = [...allowFunnelMap.entries()].some(
-        ([hostPort, allowed]) => allowed && hostPort.endsWith(`:${listenPort}`),
-      );
-      if (isFunnelTcp) {
-        funnel.push(parsedTarget);
-      } else if (!funnelOnly) {
-        serve.push(parsedTarget);
+      if (depth >= MAX_TAILSCALE_CONFIG_DEPTH) {
+        hasUnknownKeys = true;
+        return;
       }
-    }
-  }
+      for (const child of Object.values(nested as Record<string, unknown>)) {
+        if (typeof child === "object" && child !== null && !Array.isArray(child)) {
+          visitConfig(child as Record<string, unknown>, allowFunnelMap, depth + 1);
+        }
+      }
+    };
 
-  return { serve, funnel };
+    visitNestedMap(config.Foreground);
+    visitNestedMap(config.Services);
+  };
+
+  visitConfig(rawJson as Record<string, unknown>, new Map(), 0);
+  return { serve, funnel, hasUnknownKeys };
 }
 
 export function parseTailscalePublications(
@@ -1296,13 +1388,15 @@ export function parseTailscalePublications(
   const funnelTargets: TailscaleBackendTarget[] = [];
   let serveCoverage: Coverage = "unavailable";
   let funnelCoverage: Coverage = "unavailable";
+  const tailscaleAbsent =
+    serveResult?.status === "unavailable" && funnelResult?.status === "unavailable";
 
   if (serveResult?.status === "ok") {
     try {
       const parsed = JSON.parse(serveResult.stdout || "{}");
       const extracted = collectTargetsFromTailscaleJson(parsed, false);
       if (extracted) {
-        serveCoverage = "complete";
+        serveCoverage = extracted.hasUnknownKeys ? "partial" : "complete";
         for (const t of extracted.serve) {
           serveTargets.push(t);
           servePorts.add(t.port);
@@ -1322,7 +1416,7 @@ export function parseTailscalePublications(
       const parsed = JSON.parse(funnelResult.stdout || "{}");
       const extracted = collectTargetsFromTailscaleJson(parsed, true);
       if (extracted) {
-        funnelCoverage = "complete";
+        funnelCoverage = extracted.hasUnknownKeys ? "partial" : "complete";
         for (const t of extracted.funnel) {
           funnelTargets.push(t);
           funnelPorts.add(t.port);
@@ -1333,7 +1427,15 @@ export function parseTailscalePublications(
     }
   }
 
-  return { servePorts, funnelPorts, serveTargets, funnelTargets, serveCoverage, funnelCoverage };
+  return {
+    servePorts,
+    funnelPorts,
+    serveTargets,
+    funnelTargets,
+    serveCoverage,
+    funnelCoverage,
+    tailscaleAbsent,
+  };
 }
 
 export function classifyListeners(options: ClassifyListenersOptions): ExposureEntry[] {
@@ -1355,16 +1457,30 @@ export function classifyListeners(options: ClassifyListenersOptions): ExposureEn
     const firewallV4: ExposureEntry["firewallV4"] =
       listener.family === 4
         ? evaluateFirewall(listener, firewall)
-        : listener.family === 6
-          ? "na"
-          : "unknown";
+        : listener.family === "unspecified"
+          ? evaluateFirewall(
+              {
+                ...listener,
+                family: 4,
+                address: listener.address === "*" ? "0.0.0.0" : listener.address,
+              },
+              firewall,
+            )
+          : "na";
 
     const firewallV6: ExposureEntry["firewallV6"] =
       listener.family === 6
         ? evaluateFirewall(listener, firewall)
-        : listener.family === 4
-          ? "na"
-          : "unknown";
+        : listener.family === "unspecified"
+          ? evaluateFirewall(
+              {
+                ...listener,
+                family: 6,
+                address: listener.address === "*" ? "::" : listener.address,
+              },
+              firewall,
+            )
+          : "na";
 
     let funnelMatch: TailscaleTargetMatch = "no_match";
     for (const target of publications.funnelTargets) {
@@ -1392,10 +1508,9 @@ export function classifyListeners(options: ClassifyListenersOptions): ExposureEn
 
     let publication: ExposureEntry["publication"];
     if (listener.protocol !== "tcp") {
-      publication =
-        publications.serveCoverage === "complete" && publications.funnelCoverage === "complete"
-          ? "none"
-          : "unknown";
+      publication = "none";
+    } else if (publications.tailscaleAbsent) {
+      publication = "none";
     } else if (funnelMatch === "match") {
       publication = "funnel";
     } else if (funnelMatch === "unknown" || publications.funnelCoverage !== "complete") {
@@ -1428,9 +1543,10 @@ export function classifyListeners(options: ClassifyListenersOptions): ExposureEn
   for (const item of preliminary) {
     if (item.loopback || item.tailnet) continue;
     const key = `${item.listener.protocol}:${item.listener.port}`;
-    if (item.listener.family === 4 && item.firewallV4 === "allow") {
+    if (item.firewallV4 === "allow") {
       v4AllowedKeys.add(key);
-    } else if (item.listener.family === 6 && item.firewallV6 === "allow") {
+    }
+    if (item.firewallV6 === "allow") {
       v6AllowedKeys.add(key);
     }
   }
@@ -1452,7 +1568,21 @@ export function classifyListeners(options: ClassifyListenersOptions): ExposureEn
     } else if (tailnet) {
       reachability = publication === "unknown" ? "unknown" : "tailnet";
     } else if (listener.family === "unspecified") {
-      reachability = "unknown";
+      if (firewallV4 === "allow" && firewallV6 === "allow") {
+        reachability = "exposed_v4_v6";
+      } else if (firewallV4 === "allow" || firewallV6 === "allow") {
+        reachability =
+          v4AllowedKeys.has(key) && v6AllowedKeys.has(key) ? "exposed_v4_v6" : "exposed_lan";
+      } else if (firewallV4 === "deny" && firewallV6 === "deny") {
+        reachability =
+          publication === "serve"
+            ? "tailnet"
+            : publication === "unknown"
+              ? "unknown"
+              : "blocked_by_ufw";
+      } else {
+        reachability = "unknown";
+      }
     } else {
       const fw = listener.family === 4 ? firewallV4 : firewallV6;
       if (fw === "deny") {
@@ -1496,6 +1626,7 @@ interface ParsedSshdConfig {
   includeReferenced: boolean;
   dropInsMissing: boolean;
   hasUnhandledInclude: boolean;
+  hasUnmatchedDropInInclude: boolean;
 }
 
 function extractSshdDropInGlob(pattern: string): string | null {
@@ -1510,10 +1641,6 @@ function extractSshdDropInGlob(pattern: string): string | null {
     return null;
   }
   return remainder;
-}
-
-function hasGlobMeta(pattern: string): boolean {
-  return /[*?[]/.test(pattern);
 }
 
 function matchGlob(pattern: string, candidate: string): boolean {
@@ -1588,6 +1715,7 @@ function parseSshdConfig(
   let includeReferenced = false;
   let dropInsMissing = false;
   let hasUnhandledInclude = false;
+  let hasUnmatchedDropInInclude = false;
 
   const sortedDropIns =
     dropIns !== null ? [...dropIns].sort((a, b) => lexicalCompare(a.name, b.name)) : null;
@@ -1602,7 +1730,7 @@ function parseSshdConfig(
       const lowerVal = value.toLowerCase();
 
       if (key === "match") {
-        inMatch = lowerVal !== "all";
+        inMatch = true;
         continue;
       }
 
@@ -1631,9 +1759,10 @@ function parseSshdConfig(
           for (const dropIn of matched) {
             processLines(dropIn.text, false);
           }
-          const isGlob = hasGlobMeta(filePattern);
-          if (matched.length === 0 || (isGlob && !filePattern.endsWith(".conf"))) {
+          if (!filePattern.endsWith(".conf")) {
             hasUnhandledInclude = true;
+          } else if (matched.length === 0) {
+            hasUnmatchedDropInInclude = true;
           }
         }
         continue;
@@ -1682,6 +1811,7 @@ function parseSshdConfig(
     includeReferenced,
     dropInsMissing,
     hasUnhandledInclude,
+    hasUnmatchedDropInInclude,
   };
 }
 
@@ -2094,6 +2224,984 @@ const CRITERION_META: Record<CriterionId, { category: Category | "host"; title: 
   process_and_timers: { category: "host", title: "Processes & User Timers" },
 };
 
+interface EvaluationContext {
+  capturedAt: number;
+  commandResults: ReadonlyMap<SimpleCommandKind, CommandResult>;
+  fileResults: ReadonlyMap<PostureFileSource, string | null>;
+  sshDropInsResult: readonly SshDropIn[] | null;
+  socketsAvailable: boolean;
+  listeners: readonly Listener[];
+  ufwStatusRes: CommandResult | undefined;
+  ufwStatusParsed: ParsedUfwStatus | null;
+  ufwDefaultParsed: ParsedUfwDefault | null;
+  ufwDefaultCoverage: Coverage;
+  ufwV4Text: string | null;
+  ufwV6Text: string | null;
+  effectiveDefaultInput: "allow" | "deny" | "unknown";
+  firewallInputs: FirewallInputs;
+  publications: TailscalePublications;
+  expectedPortSet: ReadonlySet<number>;
+  exposure: readonly ExposureEntry[];
+  addEvidence: (kind: Evidence["kind"], slug: string, facts: Facts) => string;
+  addFinding: (
+    criterionId: CriterionId,
+    slug: string,
+    severity: Severity,
+    summary: string,
+    evidenceIds: string[],
+  ) => void;
+}
+
+function evaluateFirewallUfw(ctx: EvaluationContext): PostureCheck {
+  const id: CriterionId = "firewall_ufw";
+  const meta = CRITERION_META[id];
+  const {
+    socketsAvailable,
+    listeners,
+    ufwStatusRes,
+    ufwStatusParsed,
+    ufwDefaultParsed,
+    ufwDefaultCoverage,
+    ufwV4Text,
+    ufwV6Text,
+    effectiveDefaultInput,
+    firewallInputs,
+    addEvidence,
+    addFinding,
+  } = ctx;
+
+  const v4RulesComplete = ufwV4Text !== null && ufwV4Text.trim().length > 0;
+  const v6RulesComplete = ufwV6Text !== null && ufwV6Text.trim().length > 0;
+  const v6Enabled = ufwDefaultParsed?.ipv6Enabled ?? null;
+
+  const v4Stats =
+    socketsAvailable && v4RulesComplete
+      ? countUnusedAllowRules(ufwV4Text!, "ufw-user-input", 4, listeners)
+      : null;
+  const v6Stats =
+    socketsAvailable && v6RulesComplete && v6Enabled === true
+      ? countUnusedAllowRules(ufwV6Text!, "ufw6-user-input", 6, listeners)
+      : null;
+
+  const indeterminateAllowRuleCount =
+    (v4Stats?.indeterminateCount ?? 0) + (v6Stats?.indeterminateCount ?? 0);
+
+  const unusedRulesCoverageComplete =
+    socketsAvailable &&
+    v4RulesComplete &&
+    (v6Enabled === false || (v6Enabled === true && v6RulesComplete)) &&
+    indeterminateAllowRuleCount === 0;
+
+  const sourceCoverage: Record<string, Coverage> = {
+    ufw_status:
+      ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
+        ? "complete"
+        : "unavailable",
+    ufw_default: ufwDefaultCoverage,
+    ufw_v4: !v4RulesComplete
+      ? "unavailable"
+      : (v4Stats?.indeterminateCount ?? 0) > 0
+        ? "partial"
+        : "complete",
+    ufw_v6: !v6RulesComplete
+      ? "unavailable"
+      : (v6Stats?.indeterminateCount ?? 0) > 0
+        ? "partial"
+        : "complete",
+    sockets: socketsAvailable ? "complete" : "unavailable",
+    rule_audit: unusedRulesCoverageComplete
+      ? "complete"
+      : v4Stats || v6Stats
+        ? "partial"
+        : "unavailable",
+  };
+
+  const unusedAllowRuleCount = (v4Stats?.unusedCount ?? 0) + (v6Stats?.unusedCount ?? 0);
+
+  const evId = addEvidence("criterion", "firewall_ufw", {
+    criterion: "firewall_ufw",
+    active: firewallInputs.active,
+    defaultInput: effectiveDefaultInput,
+    ipv6Enabled: v6Enabled,
+    v4RuleCount: v4Stats?.totalRules ?? null,
+    v6RuleCount: v6Stats?.totalRules ?? null,
+    unusedAllowRuleCount: v4Stats || v6Stats ? unusedAllowRuleCount : null,
+    indeterminateAllowRuleCount: v4Stats || v6Stats ? indeterminateAllowRuleCount : null,
+  });
+
+  let status: PostureCheck["status"];
+  let summary: string;
+  let remediation: string | undefined;
+
+  if (firewallInputs.active === null) {
+    status = "unknown";
+    summary = "UFW status could not be determined.";
+  } else if (!firewallInputs.active) {
+    status = "fail";
+    summary = "UFW firewall is inactive.";
+    remediation = "Enable UFW with default deny incoming policy (`ufw enable`).";
+    addFinding(id, "inactive", "critical", summary, [evId]);
+  } else if (effectiveDefaultInput === "allow") {
+    status = "fail";
+    summary = "UFW default incoming policy is set to allow.";
+    remediation = "Set default incoming policy to deny (`ufw default deny incoming`).";
+    addFinding(id, "default_allow", "critical", summary, [evId]);
+  } else if (unusedAllowRuleCount > 0) {
+    status = "warn";
+    summary = `UFW has ${unusedAllowRuleCount} allow rule(s) with no matching active listener.`;
+    remediation = "Review and remove unused UFW allow rules.";
+    addFinding(id, "unused_rules", "warning", summary, [evId]);
+  } else if (effectiveDefaultInput === "unknown") {
+    status = "warn";
+    summary = "UFW is active, but the default incoming policy could not be verified.";
+    addFinding(id, "unknown_default", "warning", summary, [evId]);
+  } else if (!unusedRulesCoverageComplete) {
+    status = "unknown";
+    summary =
+      "UFW firewall is active with default deny incoming; unused allow rules could not be fully verified.";
+  } else {
+    status = "pass";
+    summary = "UFW firewall is active with default deny incoming and no unused allow rules.";
+  }
+
+  return {
+    id,
+    category: meta.category,
+    title: meta.title,
+    status,
+    summary,
+    ...(remediation ? { remediation } : {}),
+    evidenceIds: [evId],
+    sourceCoverage,
+  };
+}
+
+function evaluateNetworkExposure(ctx: EvaluationContext): PostureCheck {
+  const id: CriterionId = "network_exposure";
+  const meta = CRITERION_META[id];
+  const {
+    socketsAvailable,
+    ufwStatusRes,
+    ufwStatusParsed,
+    ufwDefaultCoverage,
+    ufwV4Text,
+    ufwV6Text,
+    publications,
+    exposure,
+    addEvidence,
+    addFinding,
+  } = ctx;
+
+  const sourceCoverage: Record<string, Coverage> = {
+    sockets: socketsAvailable ? "complete" : "unavailable",
+    ufw_status:
+      ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
+        ? "complete"
+        : "unavailable",
+    ufw_default: ufwDefaultCoverage,
+    ufw_v4: ufwV4Text !== null && ufwV4Text.trim().length > 0 ? "complete" : "unavailable",
+    ufw_v6: ufwV6Text !== null && ufwV6Text.trim().length > 0 ? "complete" : "unavailable",
+    tailscale_serve: publications.serveCoverage,
+    tailscale_funnel: publications.funnelCoverage,
+  };
+
+  if (!socketsAvailable) {
+    const evId = addEvidence("criterion", "network_exposure", {
+      criterion: "network_exposure",
+      listenerCount: null,
+      exposedCount: null,
+      unexpectedExposedCount: null,
+      funnelCount: null,
+      unknownCount: null,
+    });
+    return {
+      id,
+      category: meta.category,
+      title: meta.title,
+      status: "unknown",
+      summary: "Listening sockets could not be inspected.",
+      evidenceIds: [evId],
+      sourceCoverage,
+    };
+  }
+
+  const unexpectedExposed = exposure.filter(
+    (entry) =>
+      !entry.expected &&
+      (entry.reachability === "exposed_v4_v6" || entry.reachability === "exposed_lan"),
+  );
+  const funneledEntries = exposure.filter((entry) => entry.publication === "funnel");
+  const unknownEntries = exposure.filter((entry) => entry.reachability === "unknown");
+  const exposedCount = exposure.filter(
+    (entry) => entry.reachability === "exposed_v4_v6" || entry.reachability === "exposed_lan",
+  ).length;
+
+  const evId = addEvidence("criterion", "network_exposure", {
+    criterion: "network_exposure",
+    listenerCount: exposure.length,
+    exposedCount,
+    unexpectedExposedCount: unexpectedExposed.length,
+    funnelCount: funneledEntries.length,
+    unknownCount: unknownEntries.length,
+  });
+
+  const checkEvidenceIds = [evId];
+  let status: PostureCheck["status"];
+  let summary: string;
+  let remediation: string | undefined;
+
+  if (unexpectedExposed.length > 0) {
+    const flaggedIds = unexpectedExposed.flatMap((entry) => entry.evidenceIds);
+    checkEvidenceIds.push(...flaggedIds);
+    const hasPublicOrDualStack = unexpectedExposed.some(
+      (entry) => entry.publication === "funnel" || entry.reachability === "exposed_v4_v6",
+    );
+    status = hasPublicOrDualStack ? "fail" : "warn";
+    summary = `${unexpectedExposed.length} unexpected listener(s) are network-exposed.`;
+    remediation =
+      "Bind services to loopback/Tailnet, restrict UFW rules, or register expected ports.";
+    addFinding(
+      id,
+      "unexpected_exposure",
+      hasPublicOrDualStack ? "critical" : "warning",
+      summary,
+      [evId, ...flaggedIds],
+    );
+  } else if (unknownEntries.length > 0) {
+    const unknownIds = unknownEntries.flatMap((entry) => entry.evidenceIds);
+    checkEvidenceIds.push(...unknownIds);
+    status = "warn";
+    summary = `${unknownEntries.length} listener(s) have indeterminate network reachability.`;
+    addFinding(id, "unknown_reachability", "warning", summary, [evId, ...unknownIds]);
+  } else {
+    status = "pass";
+    summary = "No unexpected listeners are exposed beyond loopback or Tailnet.";
+  }
+
+  return {
+    id,
+    category: meta.category,
+    title: meta.title,
+    status,
+    summary,
+    ...(remediation ? { remediation } : {}),
+    evidenceIds: checkEvidenceIds,
+    sourceCoverage,
+  };
+}
+
+function evaluateSshHardening(ctx: EvaluationContext): PostureCheck {
+  const id: CriterionId = "ssh_hardening";
+  const meta = CRITERION_META[id];
+  const {
+    fileResults,
+    sshDropInsResult,
+    socketsAvailable,
+    ufwStatusRes,
+    ufwStatusParsed,
+    ufwDefaultCoverage,
+    ufwV4Text,
+    ufwV6Text,
+    publications,
+    exposure,
+    addEvidence,
+    addFinding,
+  } = ctx;
+
+  const sshdMainText = fileResults.get("sshd-main") ?? null;
+  const sourceCoverage: Record<string, Coverage> = {
+    sshd_main: sshdMainText !== null ? "complete" : "unavailable",
+    sshd_dropins: sshDropInsResult !== null ? "complete" : "unavailable",
+    sockets: socketsAvailable ? "complete" : "unavailable",
+    ufw_status:
+      ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
+        ? "complete"
+        : "unavailable",
+    ufw_default: ufwDefaultCoverage,
+    ufw_v4: ufwV4Text !== null && ufwV4Text.trim().length > 0 ? "complete" : "unavailable",
+    ufw_v6: ufwV6Text !== null && ufwV6Text.trim().length > 0 ? "complete" : "unavailable",
+    tailscale_serve: publications.serveCoverage,
+    tailscale_funnel: publications.funnelCoverage,
+  };
+
+  if (sshdMainText === null) {
+    const evId = addEvidence("criterion", "ssh_hardening", {
+      criterion: "ssh_hardening",
+      readable: false,
+    });
+    return {
+      id,
+      category: meta.category,
+      title: meta.title,
+      status: "unknown",
+      summary: "OpenSSH server configuration could not be read.",
+      evidenceIds: [evId],
+      sourceCoverage,
+    };
+  }
+
+  const parsed = parseSshdConfig(sshdMainText, sshDropInsResult);
+  if (parsed.hasMatchLoosening) {
+    sourceCoverage.sshd_main = "partial";
+  }
+  if (parsed.dropInsMissing) {
+    sourceCoverage.sshd_dropins = "unavailable";
+  } else if (parsed.hasUnhandledInclude || parsed.hasUnmatchedDropInInclude) {
+    sourceCoverage.sshd_dropins = "partial";
+  }
+
+  const sshPorts = new Set<number>(parsed.ports);
+  const sshEntries = exposure.filter((entry) => sshPorts.has(entry.listener.port));
+  const exposedSshEntries = sshEntries.filter(
+    (entry) =>
+      entry.reachability === "exposed_lan" ||
+      entry.reachability === "exposed_v4_v6" ||
+      entry.publication === "funnel",
+  );
+  const indeterminateSshEntries = sshEntries.filter(
+    (entry) => entry.reachability === "unknown" || entry.publication === "unknown",
+  );
+  const sshReachabilityVerified = socketsAvailable && indeterminateSshEntries.length === 0;
+
+  // OpenSSH defaults when unspecified:
+  // PasswordAuthentication=yes, KbdInteractiveAuthentication=yes, PermitRootLogin=prohibit-password.
+  // Only genuinely unreadable/out-of-scope includes can hide explicit overrides; a readable empty
+  // sshd_config.d directory matching zero *.conf files cannot hide directives.
+  const includeCouldHideDirectives = parsed.dropInsMissing || parsed.hasUnhandledInclude;
+  const passwordEnabled =
+    parsed.passwordAuthentication === "yes" ||
+    (parsed.passwordAuthentication === null && !includeCouldHideDirectives);
+  const rootLoginAllowed = parsed.permitRootLogin === "yes";
+  const rootLoginNotDisabled =
+    parsed.permitRootLogin !== "no" &&
+    !(parsed.permitRootLogin === null && includeCouldHideDirectives);
+  const kbdInteractiveEnabled =
+    parsed.kbdInteractiveAuthentication === "yes" ||
+    (parsed.kbdInteractiveAuthentication === null && !includeCouldHideDirectives);
+
+  const evId = addEvidence("criterion", "ssh_hardening", {
+    criterion: "ssh_hardening",
+    permitRootLogin: parsed.permitRootLogin,
+    passwordAuthentication: parsed.passwordAuthentication,
+    kbdInteractiveAuthentication: parsed.kbdInteractiveAuthentication,
+    hasMatchLoosening: parsed.hasMatchLoosening,
+    hasUnhandledInclude: parsed.hasUnhandledInclude || parsed.hasUnmatchedDropInInclude,
+    exposedOutsideTailnetCount: sshReachabilityVerified ? exposedSshEntries.length : null,
+    indeterminateSshListenerCount: socketsAvailable ? indeterminateSshEntries.length : null,
+  });
+
+  const checkEvidenceIds = [
+    evId,
+    ...exposedSshEntries.flatMap((e) => e.evidenceIds),
+    ...indeterminateSshEntries.flatMap((e) => e.evidenceIds),
+  ];
+  const issues: { slug: string; severity: Severity; text: string }[] = [];
+
+  if (passwordEnabled) {
+    issues.push({
+      slug: "password_auth",
+      severity: "critical",
+      text: "SSH password authentication is enabled.",
+    });
+  }
+  if (rootLoginAllowed) {
+    issues.push({
+      slug: "root_login",
+      severity: "critical",
+      text: "SSH root login is globally permitted.",
+    });
+  } else if (rootLoginNotDisabled && !includeCouldHideDirectives) {
+    issues.push({
+      slug: "root_login_unrestricted",
+      severity: "warning",
+      text: "SSH PermitRootLogin is not explicitly set to no.",
+    });
+  }
+  if (kbdInteractiveEnabled) {
+    issues.push({
+      slug: "kbd_interactive",
+      severity: "warning",
+      text: "SSH keyboard-interactive authentication is enabled.",
+    });
+  }
+  if (exposedSshEntries.length > 0) {
+    issues.push({
+      slug: "exposed_outside_tailnet",
+      severity: "warning",
+      text: "SSH port is reachable outside loopback and Tailnet.",
+    });
+  }
+  if (parsed.hasMatchLoosening) {
+    issues.push({
+      slug: "match_loosening",
+      severity: "warning",
+      text: "Global SSH directives are hardened, but Match-scoped blocks loosen authentication.",
+    });
+  }
+
+  let status: PostureCheck["status"];
+  let summary: string;
+  let remediation: string | undefined;
+
+  if (issues.length > 0) {
+    const hasCritical = issues.some((issue) => issue.severity === "critical");
+    status = hasCritical ? "fail" : "warn";
+    summary = issues.map((issue) => issue.text).join(" ");
+    remediation =
+      "Disable PasswordAuthentication, KbdInteractiveAuthentication, and PermitRootLogin, and restrict SSH to Tailnet/loopback.";
+    for (const issue of issues) {
+      addFinding(id, issue.slug, issue.severity, issue.text, checkEvidenceIds);
+    }
+  } else if (parsed.dropInsMissing) {
+    status = "unknown";
+    summary = "SSH drop-in configuration directory could not be read.";
+  } else if (parsed.hasUnhandledInclude || parsed.hasUnmatchedDropInInclude) {
+    status = "unknown";
+    summary =
+      "SSH configuration contains unresolved Include directives; full hardening could not be verified.";
+  } else {
+    status = "pass";
+    summary = sshReachabilityVerified
+      ? "SSH disables root and password authentication and is not exposed outside Tailnet."
+      : "SSH disables root and password authentication; port exposure could not be verified.";
+  }
+
+  return {
+    id,
+    category: meta.category,
+    title: meta.title,
+    status,
+    summary,
+    ...(remediation ? { remediation } : {}),
+    evidenceIds: checkEvidenceIds,
+    sourceCoverage,
+  };
+}
+
+function evaluatePackageUpdates(ctx: EvaluationContext): PostureCheck {
+  const id: CriterionId = "package_updates";
+  const meta = CRITERION_META[id];
+  const { capturedAt, commandResults, fileResults, addEvidence, addFinding } = ctx;
+
+  const updatesRes = commandResults.get("updates");
+  const archAuditRes = commandResults.get("arch_audit");
+  const pacmanLogText = fileResults.get("pacman-log") ?? null;
+
+  const parsedUpdates =
+    updatesRes?.status === "ok" ? parsePacmanUpdates(updatesRes.stdout, updatesRes.exitCode) : null;
+  const lastUpgradeAt = pacmanLogText !== null ? parsePacmanLogLastUpgrade(pacmanLogText) : null;
+  const daysSinceUpgrade =
+    lastUpgradeAt !== null ? Math.floor((capturedAt - lastUpgradeAt) / DAY_MS) : null;
+  const isStaleUpgrade =
+    lastUpgradeAt !== null && capturedAt - lastUpgradeAt > STALE_UPGRADE_DAYS * DAY_MS;
+
+  const auditParsed = archAuditRes?.status === "ok" ? parseArchAudit(archAuditRes.stdout) : null;
+
+  const sourceCoverage: Record<string, Coverage> = {
+    updates: updatesRes?.status === "ok" ? "complete" : "unavailable",
+    pacman_log:
+      pacmanLogText === null ? "unavailable" : lastUpgradeAt !== null ? "complete" : "partial",
+    arch_audit: archAuditRes?.status === "ok" ? "complete" : "unavailable",
+  };
+
+  const evId = addEvidence("criterion", "package_updates", {
+    criterion: "package_updates",
+    pendingCount: parsedUpdates?.totalCount ?? null,
+    kernelUpdateCount: parsedUpdates?.kernelCount ?? null,
+    daysSinceLastUpgrade: daysSinceUpgrade,
+    advisoryCount: auditParsed?.advisoryCount ?? null,
+    highAdvisoryCount: auditParsed?.highOrCriticalCount ?? null,
+  });
+
+  const issues: { slug: string; severity: Severity; text: string }[] = [];
+
+  if (auditParsed && auditParsed.advisoryCount > 0) {
+    issues.push({
+      slug: "arch_audit",
+      severity: auditParsed.highOrCriticalCount > 0 ? "critical" : "warning",
+      text: `arch-audit reported ${auditParsed.advisoryCount} upgradable security advisory(ies).`,
+    });
+  }
+  if (parsedUpdates !== null) {
+    if (parsedUpdates.kernelCount > 0) {
+      issues.push({
+        slug: "kernel_updates",
+        severity: "warning",
+        text: `${parsedUpdates.kernelCount} pending kernel update(s) (${parsedUpdates.totalCount} total pending packages).`,
+      });
+    } else if (parsedUpdates.totalCount > 0) {
+      issues.push({
+        slug: "pending_updates",
+        severity: "warning",
+        text: `${parsedUpdates.totalCount} pending package update(s) available.`,
+      });
+    }
+  }
+  if (isStaleUpgrade) {
+    issues.push({
+      slug: "stale_upgrades",
+      severity: "warning",
+      text: `Last recorded package upgrade was ${daysSinceUpgrade} days ago (threshold: ${STALE_UPGRADE_DAYS} days).`,
+    });
+  }
+
+  let status: PostureCheck["status"];
+  let summary: string;
+  let remediation: string | undefined;
+
+  if (issues.length > 0) {
+    status = issues.some((i) => i.severity === "critical") ? "fail" : "warn";
+    summary =
+      issues.map((i) => i.text).join(" ") +
+      (parsedUpdates === null ? " Pending package updates could not be checked." : "");
+    remediation = "Upgrade system packages and reboot if a kernel update is installed.";
+    for (const issue of issues) {
+      addFinding(id, issue.slug, issue.severity, issue.text, [evId]);
+    }
+  } else if (parsedUpdates === null) {
+    status = "unknown";
+    summary = "Pending package updates could not be checked.";
+  } else {
+    status = "pass";
+    const hasUpgradeHistory = lastUpgradeAt !== null;
+    const hasArchAudit = auditParsed !== null;
+    if (hasUpgradeHistory && hasArchAudit) {
+      summary = "Packages are up to date with recent upgrade history and no advisories.";
+    } else if (hasUpgradeHistory) {
+      summary = "Packages are up to date with recent upgrade history (arch-audit unavailable).";
+    } else if (hasArchAudit) {
+      summary = "No pending package updates or advisories detected (upgrade history unavailable).";
+    } else {
+      summary =
+        "No pending package updates detected (upgrade history and arch-audit unavailable).";
+    }
+  }
+
+  return {
+    id,
+    category: meta.category,
+    title: meta.title,
+    status,
+    summary,
+    ...(remediation ? { remediation } : {}),
+    evidenceIds: [evId],
+    sourceCoverage,
+  };
+}
+
+function evaluateDiskAndBoot(ctx: EvaluationContext): PostureCheck {
+  const id: CriterionId = "disk_and_boot";
+  const meta = CRITERION_META[id];
+  const { commandResults, addEvidence, addFinding } = ctx;
+
+  const blockRes = commandResults.get("block_devices");
+  const bootRes = commandResults.get("boot_status");
+
+  const blockParsed = blockRes?.status === "ok" ? parseBlockDevices(blockRes.stdout) : null;
+  const bootParsed = bootRes?.status === "ok" ? parseBootStatus(bootRes.stdout) : null;
+
+  const bootFieldsComplete =
+    bootParsed !== null && bootParsed.secureBoot !== "unknown" && bootParsed.tpm2 !== "unknown";
+
+  const sourceCoverage: Record<string, Coverage> = {
+    block_devices: blockParsed !== null ? "complete" : "unavailable",
+    boot_status:
+      bootParsed === null ? "unavailable" : bootFieldsComplete ? "complete" : "partial",
+  };
+
+  const evId = addEvidence("criterion", "disk_and_boot", {
+    criterion: "disk_and_boot",
+    rootEncrypted: blockParsed?.rootEncrypted ?? null,
+    unencryptedSecondaryCount: blockParsed?.unencryptedSecondaryCount ?? null,
+    secureBoot: bootParsed?.secureBoot ?? null,
+    tpm2: bootParsed?.tpm2 ?? null,
+  });
+
+  if (blockParsed === null && bootParsed === null) {
+    return {
+      id,
+      category: meta.category,
+      title: meta.title,
+      status: "unknown",
+      summary: "Disk encryption and boot security status could not be inspected.",
+      evidenceIds: [evId],
+      sourceCoverage,
+    };
+  }
+
+  const issues: { slug: string; severity: Severity; text: string }[] = [];
+
+  if (blockParsed?.rootEncrypted === false) {
+    issues.push({
+      slug: "unencrypted_root",
+      severity: "critical",
+      text: "Root filesystem is not encrypted with LUKS.",
+    });
+  }
+  if (blockParsed && blockParsed.unencryptedSecondaryCount > 0) {
+    issues.push({
+      slug: "unencrypted_secondary",
+      severity: "warning",
+      text: `${blockParsed.unencryptedSecondaryCount} unencrypted secondary mounted volume(s) detected.`,
+    });
+  }
+  if (bootParsed?.secureBoot === "disabled") {
+    issues.push({
+      slug: "secure_boot_disabled",
+      severity: "warning",
+      text: "UEFI Secure Boot is disabled.",
+    });
+  }
+  if (bootParsed?.tpm2 === "no") {
+    issues.push({
+      slug: "tpm2_missing",
+      severity: "warning",
+      text: "TPM2 support is not available.",
+    });
+  }
+  if (bootParsed !== null && !bootFieldsComplete) {
+    issues.push({
+      slug: "boot_fields_missing",
+      severity: "warning",
+      text: "Secure Boot or TPM2 fields were missing from bootctl status.",
+    });
+  }
+
+  let status: PostureCheck["status"];
+  let summary: string;
+  let remediation: string | undefined;
+
+  if (issues.length > 0) {
+    status = issues.some((i) => i.severity === "critical") ? "fail" : "warn";
+    summary = issues.map((i) => i.text).join(" ");
+    remediation =
+      "Ensure root and secondary data volumes use LUKS encryption and enable UEFI Secure Boot with TPM2.";
+    for (const issue of issues) {
+      addFinding(id, issue.slug, issue.severity, issue.text, [evId]);
+    }
+  } else if (blockParsed === null || bootParsed === null || blockParsed.rootEncrypted === null) {
+    status = "unknown";
+    summary = "Disk encryption or boot status coverage is incomplete.";
+  } else {
+    status = "pass";
+    summary = "Root and mounted data volumes are encrypted with Secure Boot and TPM2 enabled.";
+  }
+
+  return {
+    id,
+    category: meta.category,
+    title: meta.title,
+    status,
+    summary,
+    ...(remediation ? { remediation } : {}),
+    evidenceIds: [evId],
+    sourceCoverage,
+  };
+}
+
+function evaluateKernelSysctl(ctx: EvaluationContext): PostureCheck {
+  const id: CriterionId = "kernel_sysctl";
+  const meta = CRITERION_META[id];
+  const { commandResults, addEvidence, addFinding } = ctx;
+
+  const sysctlRes = commandResults.get("sysctl");
+  const parsed = sysctlRes?.status === "ok" ? parseSysctl(sysctlRes.stdout) : null;
+
+  const coverage: Coverage =
+    parsed === null || parsed.observed.size === 0
+      ? "unavailable"
+      : parsed.missingKeys.length > 0
+        ? "partial"
+        : "complete";
+
+  const sourceCoverage: Record<string, Coverage> = { sysctl: coverage };
+
+  const facts: Record<string, string | number | boolean | null> = {
+    criterion: "kernel_sysctl",
+    observedCount: parsed?.observed.size ?? 0,
+    missingCount: parsed?.missingKeys.length ?? SYSCTL_POLICIES.length,
+    unsafeCount: parsed?.unsafeKeys.length ?? 0,
+  };
+  for (const policy of SYSCTL_POLICIES) {
+    facts[policy.key] = parsed?.observed.get(policy.key) ?? null;
+  }
+
+  const evId = addEvidence("criterion", "kernel_sysctl", facts);
+
+  let status: PostureCheck["status"];
+  let summary: string;
+  let remediation: string | undefined;
+
+  if (coverage === "unavailable") {
+    status = "unknown";
+    summary = "Kernel sysctl hardening parameters could not be read.";
+  } else if (parsed!.unsafeKeys.length > 0) {
+    status = parsed!.unsafeKeys.length >= 3 ? "fail" : "warn";
+    summary = `${parsed!.unsafeKeys.length} kernel sysctl parameter(s) have unsafe values: ${parsed!.unsafeKeys.join(", ")}.`;
+    remediation = "Persist hardened sysctl values under /etc/sysctl.d/99-hardening.conf.";
+    addFinding(id, "unsafe_sysctl", status === "fail" ? "critical" : "warning", summary, [evId]);
+  } else {
+    status = "pass";
+    summary =
+      coverage === "partial"
+        ? `All ${parsed!.observed.size} observed kernel sysctl parameters meet hardening defaults (${parsed!.missingKeys.length} unavailable).`
+        : "All kernel sysctl hardening parameters meet expected values.";
+  }
+
+  return {
+    id,
+    category: meta.category,
+    title: meta.title,
+    status,
+    summary,
+    ...(remediation ? { remediation } : {}),
+    evidenceIds: [evId],
+    sourceCoverage,
+  };
+}
+
+function evaluateSystemdHealth(ctx: EvaluationContext): PostureCheck {
+  const id: CriterionId = "systemd_health";
+  const meta = CRITERION_META[id];
+  const { commandResults, addEvidence, addFinding } = ctx;
+
+  const sysFailedRes = commandResults.get("system_failed");
+  const userFailedRes = commandResults.get("user_failed");
+  const snapperRes = commandResults.get("snapper_health");
+  const limineRes = commandResults.get("limine_health");
+
+  const sourceCoverage: Record<string, Coverage> = {
+    system_failed: sysFailedRes?.status === "ok" ? "complete" : "unavailable",
+    user_failed: userFailedRes?.status === "ok" ? "complete" : "unavailable",
+    snapper_health: snapperRes?.status === "ok" ? "complete" : "unavailable",
+    limine_health: limineRes?.status === "ok" ? "complete" : "unavailable",
+  };
+
+  const allUnavailable =
+    sysFailedRes?.status !== "ok" &&
+    userFailedRes?.status !== "ok" &&
+    snapperRes?.status !== "ok" &&
+    limineRes?.status !== "ok";
+
+  const systemFailed =
+    sysFailedRes?.status === "ok" ? parseSystemdUnits(sysFailedRes.stdout) : [];
+  const userFailed = userFailedRes?.status === "ok" ? parseSystemdUnits(userFailedRes.stdout) : [];
+  const snapperDegraded =
+    snapperRes?.status === "ok"
+      ? parseSystemdUnits(snapperRes.stdout).filter(
+          (u) => u.active === "failed" || u.sub === "failed" || u.load === "error",
+        )
+      : [];
+  const limineDegraded =
+    limineRes?.status === "ok"
+      ? parseSystemdUnits(limineRes.stdout).filter(
+          (u) => u.active === "failed" || u.sub === "failed" || u.load === "error",
+        )
+      : [];
+
+  const evId = addEvidence("criterion", "systemd_health", {
+    criterion: "systemd_health",
+    systemFailedCount: sysFailedRes?.status === "ok" ? systemFailed.length : null,
+    userFailedCount: userFailedRes?.status === "ok" ? userFailed.length : null,
+    snapperDegradedCount: snapperRes?.status === "ok" ? snapperDegraded.length : null,
+    limineDegradedCount: limineRes?.status === "ok" ? limineDegraded.length : null,
+  });
+
+  if (allUnavailable) {
+    return {
+      id,
+      category: meta.category,
+      title: meta.title,
+      status: "unknown",
+      summary: "Systemd unit health could not be queried.",
+      evidenceIds: [evId],
+      sourceCoverage,
+    };
+  }
+
+  const checkEvidenceIds = [evId];
+  const unitEvidenceIds: string[] = [];
+  let unitIndex = 0;
+
+  const recordUnitEvidence = (scope: string, units: readonly ParsedUnit[]) => {
+    for (const u of units) {
+      const unitEvId = addEvidence("unit", String(unitIndex++), {
+        scope,
+        unit: u.unit,
+        load: u.load,
+        active: u.active,
+        sub: u.sub,
+      });
+      unitEvidenceIds.push(unitEvId);
+      checkEvidenceIds.push(unitEvId);
+    }
+  };
+
+  recordUnitEvidence("system", systemFailed);
+  recordUnitEvidence("user", userFailed);
+  recordUnitEvidence("snapper", snapperDegraded);
+  recordUnitEvidence("limine", limineDegraded);
+
+  const totalIssues =
+    systemFailed.length + userFailed.length + snapperDegraded.length + limineDegraded.length;
+
+  let status: PostureCheck["status"];
+  let summary: string;
+  let remediation: string | undefined;
+
+  if (totalIssues > 0) {
+    status = systemFailed.length > 0 ? "fail" : "warn";
+    const parts: string[] = [];
+    if (systemFailed.length > 0) parts.push(`${systemFailed.length} failed system unit(s)`);
+    if (userFailed.length > 0) parts.push(`${userFailed.length} failed user unit(s)`);
+    if (snapperDegraded.length > 0) parts.push(`${snapperDegraded.length} degraded Snapper unit(s)`);
+    if (limineDegraded.length > 0) parts.push(`${limineDegraded.length} degraded Limine unit(s)`);
+    summary = `Systemd reported ${parts.join(", ")}.`;
+    remediation = "Inspect failed units with `systemctl status` and resolve underlying errors.";
+    addFinding(
+      id,
+      "degraded_units",
+      status === "fail" ? "critical" : "warning",
+      summary,
+      [evId, ...unitEvidenceIds],
+    );
+  } else {
+    status = "pass";
+    summary = "No failed system, user, Snapper, or Limine units detected.";
+  }
+
+  return {
+    id,
+    category: meta.category,
+    title: meta.title,
+    status,
+    summary,
+    ...(remediation ? { remediation } : {}),
+    evidenceIds: checkEvidenceIds,
+    sourceCoverage,
+  };
+}
+
+function evaluateProcessAndTimers(ctx: EvaluationContext): PostureCheck {
+  const id: CriterionId = "process_and_timers";
+  const meta = CRITERION_META[id];
+  const {
+    capturedAt,
+    commandResults,
+    socketsAvailable,
+    listeners,
+    expectedPortSet,
+    addEvidence,
+    addFinding,
+  } = ctx;
+
+  const procRes = commandResults.get("processes");
+  const timersRes = commandResults.get("user_timers");
+
+  const sourceCoverage: Record<string, Coverage> = {
+    processes: procRes?.status === "ok" ? "complete" : "unavailable",
+    user_timers: timersRes?.status === "ok" ? "complete" : "unavailable",
+    sockets: socketsAvailable ? "complete" : "unavailable",
+  };
+
+  const processMap = procRes?.status === "ok" ? parseProcesses(procRes.stdout, capturedAt) : null;
+  const userTimers = timersRes?.status === "ok" ? parseUserTimers(timersRes.stdout) : null;
+
+  const unexpectedListeners: Listener[] = [];
+  if (socketsAvailable) {
+    const seen = new Set<string>();
+    for (const listener of listeners) {
+      if (expectedPortSet.has(listener.port)) continue;
+      if (isLoopbackAddress(listener.address, listener.family)) continue;
+      const dedupeKey = `${listener.protocol}:${listener.port}:${listener.pid ?? ""}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      unexpectedListeners.push(listener);
+    }
+  }
+
+  const evId = addEvidence("criterion", "process_and_timers", {
+    criterion: "process_and_timers",
+    processCount: processMap?.size ?? null,
+    userTimerCount: userTimers?.length ?? null,
+    unexpectedListenerCount: socketsAvailable ? unexpectedListeners.length : null,
+  });
+
+  if (processMap === null && userTimers === null && !socketsAvailable) {
+    return {
+      id,
+      category: meta.category,
+      title: meta.title,
+      status: "unknown",
+      summary: "Process, timer, and socket inventory could not be collected.",
+      evidenceIds: [evId],
+      sourceCoverage,
+    };
+  }
+
+  const checkEvidenceIds = [evId];
+  const flaggedProcessEvIds: string[] = [];
+
+  for (let i = 0; i < unexpectedListeners.length; i++) {
+    const listener = unexpectedListeners[i]!;
+    const proc = listener.pid !== undefined ? processMap?.get(listener.pid) : undefined;
+    const parent = proc !== undefined ? processMap?.get(proc.ppid) : undefined;
+    const comm = proc?.comm ?? listener.process ?? null;
+
+    const procEvId = addEvidence("process", `unexpected:${listener.port}:${i}`, {
+      comm,
+      pid: proc?.pid ?? listener.pid ?? null,
+      uid: proc?.uid ?? null,
+      startedAt: proc?.startedAt ?? null,
+      parentComm: parent?.comm ?? null,
+      protocol: listener.protocol,
+      port: listener.port,
+    });
+    flaggedProcessEvIds.push(procEvId);
+    checkEvidenceIds.push(procEvId);
+  }
+
+  let status: PostureCheck["status"];
+  let summary: string;
+  let remediation: string | undefined;
+
+  if (unexpectedListeners.length > 0) {
+    status = "warn";
+    summary = `${unexpectedListeners.length} process(es) are listening on unexpected ports.`;
+    remediation =
+      "Verify the owning processes and either stop unauthorized listeners or enroll their ports.";
+    addFinding(id, "unexpected_socket_owners", "warning", summary, [evId, ...flaggedProcessEvIds]);
+  } else if (processMap === null || !socketsAvailable) {
+    status = "unknown";
+    summary = "Process or socket inventory is unavailable.";
+  } else {
+    status = "pass";
+    summary = "All socket-owning processes listen only on expected ports.";
+  }
+
+  return {
+    id,
+    category: meta.category,
+    title: meta.title,
+    status,
+    summary,
+    ...(remediation ? { remediation } : {}),
+    evidenceIds: checkEvidenceIds,
+    sourceCoverage,
+  };
+}
+
+const CRITERION_EVALUATORS: Record<CriterionId, (ctx: EvaluationContext) => PostureCheck> = {
+  firewall_ufw: evaluateFirewallUfw,
+  network_exposure: evaluateNetworkExposure,
+  ssh_hardening: evaluateSshHardening,
+  package_updates: evaluatePackageUpdates,
+  disk_and_boot: evaluateDiskAndBoot,
+  kernel_sysctl: evaluateKernelSysctl,
+  systemd_health: evaluateSystemdHealth,
+  process_and_timers: evaluateProcessAndTimers,
+};
+
 export class PostureCollector {
   private readonly runner: CommandRunner;
   private readonly files: PostureFiles;
@@ -2319,13 +3427,33 @@ export class PostureCollector {
       });
     }
 
-    // Evaluate all 8 criteria in exact criterionIds order.
-    const checks: PostureCheck[] = [];
+    const ctx: EvaluationContext = {
+      capturedAt,
+      commandResults,
+      fileResults,
+      sshDropInsResult,
+      socketsAvailable,
+      listeners,
+      ufwStatusRes,
+      ufwStatusParsed,
+      ufwDefaultParsed,
+      ufwDefaultCoverage,
+      ufwV4Text,
+      ufwV6Text,
+      effectiveDefaultInput,
+      firewallInputs,
+      publications,
+      expectedPortSet,
+      exposure,
+      addEvidence,
+      addFinding,
+    };
 
-    for (const id of criterionIds) {
+    // Evaluate all 8 criteria in exact criterionIds order.
+    const checks: PostureCheck[] = criterionIds.map((id) => {
       const meta = CRITERION_META[id];
       if (!enabled.has(id)) {
-        checks.push({
+        return {
           id,
           category: meta.category,
           title: meta.title,
@@ -2333,909 +3461,10 @@ export class PostureCollector {
           summary: `${meta.title} check is disabled.`,
           evidenceIds: [],
           sourceCoverage: { policy: "complete" },
-        });
-        continue;
+        };
       }
-
-      switch (id) {
-        case "firewall_ufw": {
-          const v4RulesComplete = ufwV4Text !== null && ufwV4Text.trim().length > 0;
-          const v6RulesComplete = ufwV6Text !== null && ufwV6Text.trim().length > 0;
-          const v6Enabled = ufwDefaultParsed?.ipv6Enabled ?? null;
-
-          const v4Stats =
-            socketsAvailable && v4RulesComplete
-              ? countUnusedAllowRules(ufwV4Text!, "ufw-user-input", 4, listeners)
-              : null;
-          const v6Stats =
-            socketsAvailable && v6RulesComplete && v6Enabled === true
-              ? countUnusedAllowRules(ufwV6Text!, "ufw6-user-input", 6, listeners)
-              : null;
-
-          const indeterminateAllowRuleCount =
-            (v4Stats?.indeterminateCount ?? 0) + (v6Stats?.indeterminateCount ?? 0);
-
-          const unusedRulesCoverageComplete =
-            socketsAvailable &&
-            v4RulesComplete &&
-            (v6Enabled === false || (v6Enabled === true && v6RulesComplete)) &&
-            indeterminateAllowRuleCount === 0;
-
-          const sourceCoverage: Record<string, Coverage> = {
-            ufw_status:
-              ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
-                ? "complete"
-                : "unavailable",
-            ufw_default: ufwDefaultCoverage,
-            ufw_v4: !v4RulesComplete
-              ? "unavailable"
-              : (v4Stats?.indeterminateCount ?? 0) > 0
-                ? "partial"
-                : "complete",
-            ufw_v6: !v6RulesComplete
-              ? "unavailable"
-              : (v6Stats?.indeterminateCount ?? 0) > 0
-                ? "partial"
-                : "complete",
-            sockets: socketsAvailable ? "complete" : "unavailable",
-            rule_audit: unusedRulesCoverageComplete
-              ? "complete"
-              : v4Stats || v6Stats
-                ? "partial"
-                : "unavailable",
-          };
-
-          const unusedAllowRuleCount = (v4Stats?.unusedCount ?? 0) + (v6Stats?.unusedCount ?? 0);
-
-          const evId = addEvidence("criterion", "firewall_ufw", {
-            criterion: "firewall_ufw",
-            active: firewallInputs.active,
-            defaultInput: effectiveDefaultInput,
-            ipv6Enabled: v6Enabled,
-            v4RuleCount: v4Stats?.totalRules ?? null,
-            v6RuleCount: v6Stats?.totalRules ?? null,
-            unusedAllowRuleCount: v4Stats || v6Stats ? unusedAllowRuleCount : null,
-            indeterminateAllowRuleCount: v4Stats || v6Stats ? indeterminateAllowRuleCount : null,
-          });
-
-          let status: PostureCheck["status"];
-          let summary: string;
-          let remediation: string | undefined;
-
-          if (firewallInputs.active === null) {
-            status = "unknown";
-            summary = "UFW status could not be determined.";
-          } else if (!firewallInputs.active) {
-            status = "fail";
-            summary = "UFW firewall is inactive.";
-            remediation = "Enable UFW with default deny incoming policy (`ufw enable`).";
-            addFinding(id, "inactive", "critical", summary, [evId]);
-          } else if (effectiveDefaultInput === "allow") {
-            status = "fail";
-            summary = "UFW default incoming policy is set to allow.";
-            remediation = "Set default incoming policy to deny (`ufw default deny incoming`).";
-            addFinding(id, "default_allow", "critical", summary, [evId]);
-          } else if (unusedAllowRuleCount > 0) {
-            status = "warn";
-            summary = `UFW has ${unusedAllowRuleCount} allow rule(s) with no matching active listener.`;
-            remediation = "Review and remove unused UFW allow rules.";
-            addFinding(id, "unused_rules", "warning", summary, [evId]);
-          } else if (effectiveDefaultInput === "unknown") {
-            status = "warn";
-            summary = "UFW is active, but the default incoming policy could not be verified.";
-            addFinding(id, "unknown_default", "warning", summary, [evId]);
-          } else if (!unusedRulesCoverageComplete) {
-            status = "unknown";
-            summary =
-              "UFW firewall is active with default deny incoming; unused allow rules could not be fully verified.";
-          } else {
-            status = "pass";
-            summary = "UFW firewall is active with default deny incoming and no unused allow rules.";
-          }
-
-          checks.push({
-            id,
-            category: meta.category,
-            title: meta.title,
-            status,
-            summary,
-            ...(remediation ? { remediation } : {}),
-            evidenceIds: [evId],
-            sourceCoverage,
-          });
-          break;
-        }
-
-        case "network_exposure": {
-          const sourceCoverage: Record<string, Coverage> = {
-            sockets: socketsAvailable ? "complete" : "unavailable",
-            ufw_status:
-              ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
-                ? "complete"
-                : "unavailable",
-            ufw_default: ufwDefaultCoverage,
-            ufw_v4: ufwV4Text !== null && ufwV4Text.trim().length > 0 ? "complete" : "unavailable",
-            ufw_v6: ufwV6Text !== null && ufwV6Text.trim().length > 0 ? "complete" : "unavailable",
-            tailscale_serve: publications.serveCoverage,
-            tailscale_funnel: publications.funnelCoverage,
-          };
-
-          if (!socketsAvailable) {
-            const evId = addEvidence("criterion", "network_exposure", {
-              criterion: "network_exposure",
-              listenerCount: null,
-              exposedCount: null,
-              unexpectedExposedCount: null,
-              funnelCount: null,
-              unknownCount: null,
-            });
-            checks.push({
-              id,
-              category: meta.category,
-              title: meta.title,
-              status: "unknown",
-              summary: "Listening sockets could not be inspected.",
-              evidenceIds: [evId],
-              sourceCoverage,
-            });
-            break;
-          }
-
-          const unexpectedExposed = exposure.filter(
-            (entry) =>
-              !entry.expected &&
-              (entry.reachability === "exposed_v4_v6" || entry.reachability === "exposed_lan"),
-          );
-          const funneledEntries = exposure.filter((entry) => entry.publication === "funnel");
-          const unknownEntries = exposure.filter((entry) => entry.reachability === "unknown");
-          const exposedCount = exposure.filter(
-            (entry) =>
-              entry.reachability === "exposed_v4_v6" || entry.reachability === "exposed_lan",
-          ).length;
-
-          const evId = addEvidence("criterion", "network_exposure", {
-            criterion: "network_exposure",
-            listenerCount: exposure.length,
-            exposedCount,
-            unexpectedExposedCount: unexpectedExposed.length,
-            funnelCount: funneledEntries.length,
-            unknownCount: unknownEntries.length,
-          });
-
-          const checkEvidenceIds = [evId];
-          let status: PostureCheck["status"];
-          let summary: string;
-          let remediation: string | undefined;
-
-          if (unexpectedExposed.length > 0) {
-            const flaggedIds = unexpectedExposed.flatMap((entry) => entry.evidenceIds);
-            checkEvidenceIds.push(...flaggedIds);
-            const hasPublicOrDualStack = unexpectedExposed.some(
-              (entry) => entry.publication === "funnel" || entry.reachability === "exposed_v4_v6",
-            );
-            status = hasPublicOrDualStack ? "fail" : "warn";
-            summary = `${unexpectedExposed.length} unexpected listener(s) are network-exposed.`;
-            remediation =
-              "Bind services to loopback/Tailnet, restrict UFW rules, or register expected ports.";
-            addFinding(
-              id,
-              "unexpected_exposure",
-              hasPublicOrDualStack ? "critical" : "warning",
-              summary,
-              [evId, ...flaggedIds],
-            );
-          } else if (unknownEntries.length > 0) {
-            const unknownIds = unknownEntries.flatMap((entry) => entry.evidenceIds);
-            checkEvidenceIds.push(...unknownIds);
-            status = "warn";
-            summary = `${unknownEntries.length} listener(s) have indeterminate network reachability.`;
-            addFinding(id, "unknown_reachability", "warning", summary, [evId, ...unknownIds]);
-          } else {
-            status = "pass";
-            summary = "No unexpected listeners are exposed beyond loopback or Tailnet.";
-          }
-
-          checks.push({
-            id,
-            category: meta.category,
-            title: meta.title,
-            status,
-            summary,
-            ...(remediation ? { remediation } : {}),
-            evidenceIds: checkEvidenceIds,
-            sourceCoverage,
-          });
-          break;
-        }
-
-        case "ssh_hardening": {
-          const sshdMainText = fileResults.get("sshd-main") ?? null;
-          const sourceCoverage: Record<string, Coverage> = {
-            sshd_main: sshdMainText !== null ? "complete" : "unavailable",
-            sshd_dropins: sshDropInsResult !== null ? "complete" : "unavailable",
-            sockets: socketsAvailable ? "complete" : "unavailable",
-            ufw_status:
-              ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
-                ? "complete"
-                : "unavailable",
-            ufw_default: ufwDefaultCoverage,
-            ufw_v4: ufwV4Text !== null && ufwV4Text.trim().length > 0 ? "complete" : "unavailable",
-            ufw_v6: ufwV6Text !== null && ufwV6Text.trim().length > 0 ? "complete" : "unavailable",
-            tailscale_serve: publications.serveCoverage,
-            tailscale_funnel: publications.funnelCoverage,
-          };
-
-          if (sshdMainText === null) {
-            const evId = addEvidence("criterion", "ssh_hardening", {
-              criterion: "ssh_hardening",
-              readable: false,
-            });
-            checks.push({
-              id,
-              category: meta.category,
-              title: meta.title,
-              status: "unknown",
-              summary: "OpenSSH server configuration could not be read.",
-              evidenceIds: [evId],
-              sourceCoverage,
-            });
-            break;
-          }
-
-          const parsed = parseSshdConfig(sshdMainText, sshDropInsResult);
-          if (parsed.hasMatchLoosening) {
-            sourceCoverage.sshd_main = "partial";
-          }
-          if (parsed.dropInsMissing) {
-            sourceCoverage.sshd_dropins = "unavailable";
-          } else if (parsed.hasUnhandledInclude) {
-            sourceCoverage.sshd_dropins = "partial";
-          }
-
-          const sshPorts = new Set<number>(parsed.ports);
-          const sshEntries = exposure.filter((entry) => sshPorts.has(entry.listener.port));
-          const exposedSshEntries = sshEntries.filter(
-            (entry) =>
-              entry.reachability === "exposed_lan" ||
-              entry.reachability === "exposed_v4_v6" ||
-              entry.publication === "funnel",
-          );
-          const indeterminateSshEntries = sshEntries.filter(
-            (entry) => entry.reachability === "unknown" || entry.publication === "unknown",
-          );
-          const sshReachabilityVerified = socketsAvailable && indeterminateSshEntries.length === 0;
-
-          // OpenSSH defaults when unspecified: PasswordAuthentication=yes, PermitRootLogin=prohibit-password
-          const includeCoverageIncomplete = parsed.dropInsMissing || parsed.hasUnhandledInclude;
-          const passwordEnabled =
-            parsed.passwordAuthentication === "yes" ||
-            (parsed.passwordAuthentication === null && !includeCoverageIncomplete);
-          const rootLoginAllowed = parsed.permitRootLogin === "yes";
-          const rootLoginNotDisabled =
-            parsed.permitRootLogin !== "no" &&
-            !(parsed.permitRootLogin === null && includeCoverageIncomplete);
-          const kbdInteractiveEnabled = parsed.kbdInteractiveAuthentication === "yes";
-
-          const evId = addEvidence("criterion", "ssh_hardening", {
-            criterion: "ssh_hardening",
-            permitRootLogin: parsed.permitRootLogin,
-            passwordAuthentication: parsed.passwordAuthentication,
-            kbdInteractiveAuthentication: parsed.kbdInteractiveAuthentication,
-            hasMatchLoosening: parsed.hasMatchLoosening,
-            hasUnhandledInclude: parsed.hasUnhandledInclude,
-            exposedOutsideTailnetCount: sshReachabilityVerified ? exposedSshEntries.length : null,
-            indeterminateSshListenerCount: socketsAvailable ? indeterminateSshEntries.length : null,
-          });
-
-          const checkEvidenceIds = [
-            evId,
-            ...exposedSshEntries.flatMap((e) => e.evidenceIds),
-            ...indeterminateSshEntries.flatMap((e) => e.evidenceIds),
-          ];
-          const issues: { slug: string; severity: Severity; text: string }[] = [];
-
-          if (passwordEnabled) {
-            issues.push({
-              slug: "password_auth",
-              severity: "critical",
-              text: "SSH password authentication is enabled.",
-            });
-          }
-          if (rootLoginAllowed) {
-            issues.push({
-              slug: "root_login",
-              severity: "critical",
-              text: "SSH root login is globally permitted.",
-            });
-          } else if (rootLoginNotDisabled && !includeCoverageIncomplete) {
-            issues.push({
-              slug: "root_login_unrestricted",
-              severity: "warning",
-              text: "SSH PermitRootLogin is not explicitly set to no.",
-            });
-          }
-          if (kbdInteractiveEnabled) {
-            issues.push({
-              slug: "kbd_interactive",
-              severity: "warning",
-              text: "SSH keyboard-interactive authentication is enabled.",
-            });
-          }
-          if (exposedSshEntries.length > 0) {
-            issues.push({
-              slug: "exposed_outside_tailnet",
-              severity: "warning",
-              text: "SSH port is reachable outside loopback and Tailnet.",
-            });
-          }
-
-          let status: PostureCheck["status"];
-          let summary: string;
-          let remediation: string | undefined;
-
-          if (issues.length > 0) {
-            const hasCritical = issues.some((issue) => issue.severity === "critical");
-            status = hasCritical ? "fail" : "warn";
-            summary = issues.map((issue) => issue.text).join(" ");
-            remediation =
-              "Disable PasswordAuthentication, KbdInteractiveAuthentication, and PermitRootLogin, and restrict SSH to Tailnet/loopback.";
-            for (const issue of issues) {
-              addFinding(id, issue.slug, issue.severity, issue.text, checkEvidenceIds);
-            }
-          } else if (parsed.dropInsMissing) {
-            status = "unknown";
-            summary = "SSH drop-in configuration directory could not be read.";
-          } else if (parsed.hasUnhandledInclude) {
-            status = "unknown";
-            summary =
-              "SSH configuration contains unresolved Include directives; full hardening could not be verified.";
-          } else if (parsed.hasMatchLoosening) {
-            status = "warn";
-            summary =
-              "Global SSH directives are hardened, but Match-scoped blocks loosen authentication.";
-            addFinding(id, "match_loosening", "warning", summary, [evId]);
-          } else {
-            status = "pass";
-            summary = sshReachabilityVerified
-              ? "SSH disables root and password authentication and is not exposed outside Tailnet."
-              : "SSH disables root and password authentication; port exposure could not be verified.";
-          }
-
-          checks.push({
-            id,
-            category: meta.category,
-            title: meta.title,
-            status,
-            summary,
-            ...(remediation ? { remediation } : {}),
-            evidenceIds: checkEvidenceIds,
-            sourceCoverage,
-          });
-          break;
-        }
-
-        case "package_updates": {
-          const updatesRes = commandResults.get("updates");
-          const archAuditRes = commandResults.get("arch_audit");
-          const pacmanLogText = fileResults.get("pacman-log") ?? null;
-
-          const parsedUpdates =
-            updatesRes?.status === "ok"
-              ? parsePacmanUpdates(updatesRes.stdout, updatesRes.exitCode)
-              : null;
-          const lastUpgradeAt =
-            pacmanLogText !== null ? parsePacmanLogLastUpgrade(pacmanLogText) : null;
-          const daysSinceUpgrade =
-            lastUpgradeAt !== null
-              ? Math.floor((capturedAt - lastUpgradeAt) / DAY_MS)
-              : null;
-          const isStaleUpgrade =
-            lastUpgradeAt !== null && capturedAt - lastUpgradeAt > STALE_UPGRADE_DAYS * DAY_MS;
-
-          const auditParsed =
-            archAuditRes?.status === "ok" ? parseArchAudit(archAuditRes.stdout) : null;
-
-          const sourceCoverage: Record<string, Coverage> = {
-            updates: updatesRes?.status === "ok" ? "complete" : "unavailable",
-            pacman_log:
-              pacmanLogText === null
-                ? "unavailable"
-                : lastUpgradeAt !== null
-                  ? "complete"
-                  : "partial",
-            arch_audit: archAuditRes?.status === "ok" ? "complete" : "unavailable",
-          };
-
-          const evId = addEvidence("criterion", "package_updates", {
-            criterion: "package_updates",
-            pendingCount: parsedUpdates?.totalCount ?? null,
-            kernelUpdateCount: parsedUpdates?.kernelCount ?? null,
-            daysSinceLastUpgrade: daysSinceUpgrade,
-            advisoryCount: auditParsed?.advisoryCount ?? null,
-            highAdvisoryCount: auditParsed?.highOrCriticalCount ?? null,
-          });
-
-          const issues: { slug: string; severity: Severity; text: string }[] = [];
-
-          if (auditParsed && auditParsed.advisoryCount > 0) {
-            issues.push({
-              slug: "arch_audit",
-              severity: auditParsed.highOrCriticalCount > 0 ? "critical" : "warning",
-              text: `arch-audit reported ${auditParsed.advisoryCount} upgradable security advisory(ies).`,
-            });
-          }
-          if (parsedUpdates !== null) {
-            if (parsedUpdates.kernelCount > 0) {
-              issues.push({
-                slug: "kernel_updates",
-                severity: "warning",
-                text: `${parsedUpdates.kernelCount} pending kernel update(s) (${parsedUpdates.totalCount} total pending packages).`,
-              });
-            } else if (parsedUpdates.totalCount > 0) {
-              issues.push({
-                slug: "pending_updates",
-                severity: "warning",
-                text: `${parsedUpdates.totalCount} pending package update(s) available.`,
-              });
-            }
-          }
-          if (isStaleUpgrade) {
-            issues.push({
-              slug: "stale_upgrades",
-              severity: "warning",
-              text: `Last recorded package upgrade was ${daysSinceUpgrade} days ago (threshold: ${STALE_UPGRADE_DAYS} days).`,
-            });
-          }
-
-          let status: PostureCheck["status"];
-          let summary: string;
-          let remediation: string | undefined;
-
-          if (issues.length > 0) {
-            status = issues.some((i) => i.severity === "critical") ? "fail" : "warn";
-            summary =
-              issues.map((i) => i.text).join(" ") +
-              (parsedUpdates === null ? " Pending package updates could not be checked." : "");
-            remediation = "Upgrade system packages and reboot if a kernel update is installed.";
-            for (const issue of issues) {
-              addFinding(id, issue.slug, issue.severity, issue.text, [evId]);
-            }
-          } else if (parsedUpdates === null) {
-            status = "unknown";
-            summary = "Pending package updates could not be checked.";
-          } else {
-            status = "pass";
-            const hasUpgradeHistory = lastUpgradeAt !== null;
-            const hasArchAudit = auditParsed !== null;
-            if (hasUpgradeHistory && hasArchAudit) {
-              summary = "Packages are up to date with recent upgrade history and no advisories.";
-            } else if (hasUpgradeHistory) {
-              summary =
-                "Packages are up to date with recent upgrade history (arch-audit unavailable).";
-            } else if (hasArchAudit) {
-              summary =
-                "No pending package updates or advisories detected (upgrade history unavailable).";
-            } else {
-              summary =
-                "No pending package updates detected (upgrade history and arch-audit unavailable).";
-            }
-          }
-
-          checks.push({
-            id,
-            category: meta.category,
-            title: meta.title,
-            status,
-            summary,
-            ...(remediation ? { remediation } : {}),
-            evidenceIds: [evId],
-            sourceCoverage,
-          });
-          break;
-        }
-
-        case "disk_and_boot": {
-          const blockRes = commandResults.get("block_devices");
-          const bootRes = commandResults.get("boot_status");
-
-          const blockParsed =
-            blockRes?.status === "ok" ? parseBlockDevices(blockRes.stdout) : null;
-          const bootParsed =
-            bootRes?.status === "ok" ? parseBootStatus(bootRes.stdout) : null;
-
-          const bootFieldsComplete =
-            bootParsed !== null &&
-            bootParsed.secureBoot !== "unknown" &&
-            bootParsed.tpm2 !== "unknown";
-
-          const sourceCoverage: Record<string, Coverage> = {
-            block_devices: blockParsed !== null ? "complete" : "unavailable",
-            boot_status:
-              bootParsed === null
-                ? "unavailable"
-                : bootFieldsComplete
-                  ? "complete"
-                  : "partial",
-          };
-
-          const evId = addEvidence("criterion", "disk_and_boot", {
-            criterion: "disk_and_boot",
-            rootEncrypted: blockParsed?.rootEncrypted ?? null,
-            unencryptedSecondaryCount: blockParsed?.unencryptedSecondaryCount ?? null,
-            secureBoot: bootParsed?.secureBoot ?? null,
-            tpm2: bootParsed?.tpm2 ?? null,
-          });
-
-          if (blockParsed === null && bootParsed === null) {
-            checks.push({
-              id,
-              category: meta.category,
-              title: meta.title,
-              status: "unknown",
-              summary: "Disk encryption and boot security status could not be inspected.",
-              evidenceIds: [evId],
-              sourceCoverage,
-            });
-            break;
-          }
-
-          const issues: { slug: string; severity: Severity; text: string }[] = [];
-
-          if (blockParsed?.rootEncrypted === false) {
-            issues.push({
-              slug: "unencrypted_root",
-              severity: "critical",
-              text: "Root filesystem is not encrypted with LUKS.",
-            });
-          }
-          if (blockParsed && blockParsed.unencryptedSecondaryCount > 0) {
-            issues.push({
-              slug: "unencrypted_secondary",
-              severity: "warning",
-              text: `${blockParsed.unencryptedSecondaryCount} unencrypted secondary mounted volume(s) detected.`,
-            });
-          }
-          if (bootParsed?.secureBoot === "disabled") {
-            issues.push({
-              slug: "secure_boot_disabled",
-              severity: "warning",
-              text: "UEFI Secure Boot is disabled.",
-            });
-          }
-          if (bootParsed?.tpm2 === "no") {
-            issues.push({
-              slug: "tpm2_missing",
-              severity: "warning",
-              text: "TPM2 support is not available.",
-            });
-          }
-          if (bootParsed !== null && !bootFieldsComplete) {
-            issues.push({
-              slug: "boot_fields_missing",
-              severity: "warning",
-              text: "Secure Boot or TPM2 fields were missing from bootctl status.",
-            });
-          }
-
-          let status: PostureCheck["status"];
-          let summary: string;
-          let remediation: string | undefined;
-
-          if (issues.length > 0) {
-            status = issues.some((i) => i.severity === "critical") ? "fail" : "warn";
-            summary = issues.map((i) => i.text).join(" ");
-            remediation =
-              "Ensure root and secondary data volumes use LUKS encryption and enable UEFI Secure Boot with TPM2.";
-            for (const issue of issues) {
-              addFinding(id, issue.slug, issue.severity, issue.text, [evId]);
-            }
-          } else if (blockParsed === null || bootParsed === null || blockParsed.rootEncrypted === null) {
-            status = "unknown";
-            summary = "Disk encryption or boot status coverage is incomplete.";
-          } else {
-            status = "pass";
-            summary = "Root and mounted data volumes are encrypted with Secure Boot and TPM2 enabled.";
-          }
-
-          checks.push({
-            id,
-            category: meta.category,
-            title: meta.title,
-            status,
-            summary,
-            ...(remediation ? { remediation } : {}),
-            evidenceIds: [evId],
-            sourceCoverage,
-          });
-          break;
-        }
-
-        case "kernel_sysctl": {
-          const sysctlRes = commandResults.get("sysctl");
-          const parsed = sysctlRes?.status === "ok" ? parseSysctl(sysctlRes.stdout) : null;
-
-          const coverage: Coverage =
-            parsed === null || parsed.observed.size === 0
-              ? "unavailable"
-              : parsed.missingKeys.length > 0
-                ? "partial"
-                : "complete";
-
-          const sourceCoverage: Record<string, Coverage> = { sysctl: coverage };
-
-          const facts: Record<string, string | number | boolean | null> = {
-            criterion: "kernel_sysctl",
-            observedCount: parsed?.observed.size ?? 0,
-            missingCount: parsed?.missingKeys.length ?? SYSCTL_POLICIES.length,
-            unsafeCount: parsed?.unsafeKeys.length ?? 0,
-          };
-          for (const policy of SYSCTL_POLICIES) {
-            facts[policy.key] = parsed?.observed.get(policy.key) ?? null;
-          }
-
-          const evId = addEvidence("criterion", "kernel_sysctl", facts);
-
-          let status: PostureCheck["status"];
-          let summary: string;
-          let remediation: string | undefined;
-
-          if (coverage === "unavailable") {
-            status = "unknown";
-            summary = "Kernel sysctl hardening parameters could not be read.";
-          } else if (parsed!.unsafeKeys.length > 0) {
-            status = parsed!.unsafeKeys.length >= 3 ? "fail" : "warn";
-            summary = `${parsed!.unsafeKeys.length} kernel sysctl parameter(s) have unsafe values: ${parsed!.unsafeKeys.join(", ")}.`;
-            remediation = "Persist hardened sysctl values under /etc/sysctl.d/99-hardening.conf.";
-            addFinding(
-              id,
-              "unsafe_sysctl",
-              status === "fail" ? "critical" : "warning",
-              summary,
-              [evId],
-            );
-          } else {
-            status = "pass";
-            summary =
-              coverage === "partial"
-                ? `All ${parsed!.observed.size} observed kernel sysctl parameters meet hardening defaults (${parsed!.missingKeys.length} unavailable).`
-                : "All kernel sysctl hardening parameters meet expected values.";
-          }
-
-          checks.push({
-            id,
-            category: meta.category,
-            title: meta.title,
-            status,
-            summary,
-            ...(remediation ? { remediation } : {}),
-            evidenceIds: [evId],
-            sourceCoverage,
-          });
-          break;
-        }
-
-        case "systemd_health": {
-          const sysFailedRes = commandResults.get("system_failed");
-          const userFailedRes = commandResults.get("user_failed");
-          const snapperRes = commandResults.get("snapper_health");
-          const limineRes = commandResults.get("limine_health");
-
-          const sourceCoverage: Record<string, Coverage> = {
-            system_failed: sysFailedRes?.status === "ok" ? "complete" : "unavailable",
-            user_failed: userFailedRes?.status === "ok" ? "complete" : "unavailable",
-            snapper_health: snapperRes?.status === "ok" ? "complete" : "unavailable",
-            limine_health: limineRes?.status === "ok" ? "complete" : "unavailable",
-          };
-
-          const allUnavailable =
-            sysFailedRes?.status !== "ok" &&
-            userFailedRes?.status !== "ok" &&
-            snapperRes?.status !== "ok" &&
-            limineRes?.status !== "ok";
-
-          const systemFailed =
-            sysFailedRes?.status === "ok" ? parseSystemdUnits(sysFailedRes.stdout) : [];
-          const userFailed =
-            userFailedRes?.status === "ok" ? parseSystemdUnits(userFailedRes.stdout) : [];
-          const snapperDegraded =
-            snapperRes?.status === "ok"
-              ? parseSystemdUnits(snapperRes.stdout).filter(
-                  (u) => u.active === "failed" || u.sub === "failed" || u.load === "error",
-                )
-              : [];
-          const limineDegraded =
-            limineRes?.status === "ok"
-              ? parseSystemdUnits(limineRes.stdout).filter(
-                  (u) => u.active === "failed" || u.sub === "failed" || u.load === "error",
-                )
-              : [];
-
-          const evId = addEvidence("criterion", "systemd_health", {
-            criterion: "systemd_health",
-            systemFailedCount: sysFailedRes?.status === "ok" ? systemFailed.length : null,
-            userFailedCount: userFailedRes?.status === "ok" ? userFailed.length : null,
-            snapperDegradedCount: snapperRes?.status === "ok" ? snapperDegraded.length : null,
-            limineDegradedCount: limineRes?.status === "ok" ? limineDegraded.length : null,
-          });
-
-          if (allUnavailable) {
-            checks.push({
-              id,
-              category: meta.category,
-              title: meta.title,
-              status: "unknown",
-              summary: "Systemd unit health could not be queried.",
-              evidenceIds: [evId],
-              sourceCoverage,
-            });
-            break;
-          }
-
-          const checkEvidenceIds = [evId];
-          const unitEvidenceIds: string[] = [];
-          let unitIndex = 0;
-
-          const recordUnitEvidence = (scope: string, units: readonly ParsedUnit[]) => {
-            for (const u of units) {
-              const unitEvId = addEvidence("unit", String(unitIndex++), {
-                scope,
-                unit: u.unit,
-                load: u.load,
-                active: u.active,
-                sub: u.sub,
-              });
-              unitEvidenceIds.push(unitEvId);
-              checkEvidenceIds.push(unitEvId);
-            }
-          };
-
-          recordUnitEvidence("system", systemFailed);
-          recordUnitEvidence("user", userFailed);
-          recordUnitEvidence("snapper", snapperDegraded);
-          recordUnitEvidence("limine", limineDegraded);
-
-          const totalIssues =
-            systemFailed.length +
-            userFailed.length +
-            snapperDegraded.length +
-            limineDegraded.length;
-
-          let status: PostureCheck["status"];
-          let summary: string;
-          let remediation: string | undefined;
-
-          if (totalIssues > 0) {
-            status = systemFailed.length > 0 ? "fail" : "warn";
-            const parts: string[] = [];
-            if (systemFailed.length > 0) parts.push(`${systemFailed.length} failed system unit(s)`);
-            if (userFailed.length > 0) parts.push(`${userFailed.length} failed user unit(s)`);
-            if (snapperDegraded.length > 0)
-              parts.push(`${snapperDegraded.length} degraded Snapper unit(s)`);
-            if (limineDegraded.length > 0)
-              parts.push(`${limineDegraded.length} degraded Limine unit(s)`);
-            summary = `Systemd reported ${parts.join(", ")}.`;
-            remediation = "Inspect failed units with `systemctl status` and resolve underlying errors.";
-            addFinding(
-              id,
-              "degraded_units",
-              status === "fail" ? "critical" : "warning",
-              summary,
-              [evId, ...unitEvidenceIds],
-            );
-          } else {
-            status = "pass";
-            summary = "No failed system, user, Snapper, or Limine units detected.";
-          }
-
-          checks.push({
-            id,
-            category: meta.category,
-            title: meta.title,
-            status,
-            summary,
-            ...(remediation ? { remediation } : {}),
-            evidenceIds: checkEvidenceIds,
-            sourceCoverage,
-          });
-          break;
-        }
-
-        case "process_and_timers": {
-          const procRes = commandResults.get("processes");
-          const timersRes = commandResults.get("user_timers");
-
-          const sourceCoverage: Record<string, Coverage> = {
-            processes: procRes?.status === "ok" ? "complete" : "unavailable",
-            user_timers: timersRes?.status === "ok" ? "complete" : "unavailable",
-            sockets: socketsAvailable ? "complete" : "unavailable",
-          };
-
-          const processMap =
-            procRes?.status === "ok" ? parseProcesses(procRes.stdout, capturedAt) : null;
-          const userTimers =
-            timersRes?.status === "ok" ? parseUserTimers(timersRes.stdout) : null;
-
-          const unexpectedListeners = socketsAvailable
-            ? listeners.filter((listener) => !expectedPortSet.has(listener.port))
-            : [];
-
-          const evId = addEvidence("criterion", "process_and_timers", {
-            criterion: "process_and_timers",
-            processCount: processMap?.size ?? null,
-            userTimerCount: userTimers?.length ?? null,
-            unexpectedListenerCount: socketsAvailable ? unexpectedListeners.length : null,
-          });
-
-          if (processMap === null && userTimers === null && !socketsAvailable) {
-            checks.push({
-              id,
-              category: meta.category,
-              title: meta.title,
-              status: "unknown",
-              summary: "Process, timer, and socket inventory could not be collected.",
-              evidenceIds: [evId],
-              sourceCoverage,
-            });
-            break;
-          }
-
-          const checkEvidenceIds = [evId];
-          const flaggedProcessEvIds: string[] = [];
-
-          for (let i = 0; i < unexpectedListeners.length; i++) {
-            const listener = unexpectedListeners[i]!;
-            const proc = listener.pid !== undefined ? processMap?.get(listener.pid) : undefined;
-            const parent = proc !== undefined ? processMap?.get(proc.ppid) : undefined;
-            const comm = proc?.comm ?? listener.process ?? null;
-
-            const procEvId = addEvidence("process", `unexpected:${listener.port}:${i}`, {
-              comm,
-              pid: proc?.pid ?? listener.pid ?? null,
-              uid: proc?.uid ?? null,
-              startedAt: proc?.startedAt ?? null,
-              parentComm: parent?.comm ?? null,
-              protocol: listener.protocol,
-              port: listener.port,
-            });
-            flaggedProcessEvIds.push(procEvId);
-            checkEvidenceIds.push(procEvId);
-          }
-
-          let status: PostureCheck["status"];
-          let summary: string;
-          let remediation: string | undefined;
-
-          if (unexpectedListeners.length > 0) {
-            status = "warn";
-            summary = `${unexpectedListeners.length} process(es) are listening on unexpected ports.`;
-            remediation =
-              "Verify the owning processes and either stop unauthorized listeners or enroll their ports.";
-            addFinding(id, "unexpected_socket_owners", "warning", summary, [
-              evId,
-              ...flaggedProcessEvIds,
-            ]);
-          } else if (processMap === null || !socketsAvailable) {
-            status = "unknown";
-            summary = "Process or socket inventory is unavailable.";
-          } else {
-            status = "pass";
-            summary = "All socket-owning processes listen only on expected ports.";
-          }
-
-          checks.push({
-            id,
-            category: meta.category,
-            title: meta.title,
-            status,
-            summary,
-            ...(remediation ? { remediation } : {}),
-            evidenceIds: checkEvidenceIds,
-            sourceCoverage,
-          });
-          break;
-        }
-      }
-    }
+      return CRITERION_EVALUATORS[id](ctx);
+    });
 
     return {
       snapshot: {

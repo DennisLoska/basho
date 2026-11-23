@@ -8,6 +8,10 @@ Domain language for Basho's host security monitoring, AI-assisted investigation,
 A timestamped evaluation of enabled host security checklist criteria together with typed evidence references and per-source collection coverage.
 _Avoid_: System health dump, audit blob
 
+**PostureCollector**:
+The deterministic read-only component that gathers host facts through allowlisted commands and config files to produce a `PostureSnapshot`, `ExposureEntry` inventory, and deterministic `SecurityFinding` records.
+_Avoid_: Host scanner, audit runner, collector daemon
+
 **SecurityEvent**:
 A normalized host observation bound to a source, category, severity, and timestamp, optionally aggregating repeated equivalent occurrences into a count.
 _Avoid_: Raw log line, breach
