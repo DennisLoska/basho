@@ -433,10 +433,17 @@ describe("evaluateFirewall", () => {
 
     expect(
       evaluateFirewall(
-        { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0" },
+        { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0", interfaceName: "eth0" },
         { active: true, v4: rules, defaultInput: "deny" },
       ),
     ).toBe("deny");
+
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0" },
+        { active: true, v4: rules, defaultInput: "deny" },
+      ),
+    ).toBe("unknown");
   });
 
   test("honors source-scoped rules that cover every source", () => {
@@ -1429,6 +1436,7 @@ describe("PostureCollector spec hardening regressions", () => {
             "tcp   LISTEN 0      128    [::1]:8081           [::]:*",
             "tcp   LISTEN 0      128    127.0.0.1:8081       0.0.0.0:*",
             "tcp   LISTEN 0      128    0.0.0.0:8082         0.0.0.0:*",
+            "tcp   LISTEN 0      128    127.0.0.1:8082       0.0.0.0:*",
             "tcp   LISTEN 0      128    192.168.1.50:8083    0.0.0.0:*",
             "tcp   LISTEN 0      128    127.0.0.1:8084       0.0.0.0:*",
             "tcp   LISTEN 0      128    [::1]:8084           [::]:*",
@@ -1472,8 +1480,10 @@ describe("PostureCollector spec hardening regressions", () => {
     expect(byAddrPort("::1", 8081).publication).toBe("serve");
     expect(byAddrPort("127.0.0.1", 8081).publication).toBe("none");
 
-    // Remote host 198.51.100.9 is rejected and never matches 0.0.0.0 wildcard
-    expect(byAddrPort("0.0.0.0", 8082).publication).toBe("none");
+    // Non-loopback IP 198.51.100.9 not proven non-host leaves 0.0.0.0 wildcard unknown,
+    // while an explicit non-matching address stays none
+    expect(byAddrPort("0.0.0.0", 8082).publication).toBe("unknown");
+    expect(byAddrPort("127.0.0.1", 8082).publication).toBe("none");
 
     // Explicit local IP matches matching listener IP
     expect(byAddrPort("192.168.1.50", 8083).publication).toBe("serve");
@@ -1686,5 +1696,290 @@ describe("PostureCollector spec hardening regressions", () => {
     }
     expect(unitEvidence[0]!.facts.unit).toBe("secret-service@prod.service");
     expect(unitEvidence[1]!.facts.unit).toBe("my-timer.service");
+  });
+});
+
+describe("PostureCollector spec re-review regressions (findings 1-6)", () => {
+  test("re-review finding 1: wildcard listeners without interfaceName are indeterminate on matching interface-scoped rules", () => {
+    const v4Rule = "-A ufw-user-input -i tailscale0 -p tcp --dport 22 -j ACCEPT";
+    const v6Rule = "-A ufw6-user-input -i tailscale0 -p tcp --dport 22 -j ACCEPT";
+
+    // Wildcard without interfaceName is indeterminate on matching interface-scoped rule
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0" },
+        { active: true, v4: v4Rule, defaultInput: "deny" },
+      ),
+    ).toBe("unknown");
+    expect(
+      evaluateFirewall(
+        { family: 6, protocol: "tcp", port: 22, address: "::" },
+        { active: true, ipv6Enabled: true, v6: v6Rule, defaultInput: "deny" },
+      ),
+    ).toBe("unknown");
+
+    // Wildcard WITH a specific interfaceName matches or mismatches normally
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0", interfaceName: "tailscale0" },
+        { active: true, v4: v4Rule, defaultInput: "deny" },
+      ),
+    ).toBe("allow");
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0", interfaceName: "eth0" },
+        { active: true, v4: v4Rule, defaultInput: "deny" },
+      ),
+    ).toBe("deny");
+    expect(
+      evaluateFirewall(
+        { family: 6, protocol: "tcp", port: 22, address: "::", interfaceName: "eth0" },
+        { active: true, ipv6Enabled: true, v6: v6Rule, defaultInput: "deny" },
+      ),
+    ).toBe("deny");
+
+    // Unrelated port or protocol does NOT trigger indeterminate
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 8080, address: "0.0.0.0" },
+        { active: true, v4: v4Rule, defaultInput: "deny" },
+      ),
+    ).toBe("deny");
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "udp", port: 22, address: "0.0.0.0" },
+        { active: true, v4: v4Rule, defaultInput: "deny" },
+      ),
+    ).toBe("deny");
+  });
+
+  test("re-review finding 2: unknown publication reports unknown reachability for loopback and Tailnet listeners while retaining firewall verdicts", async () => {
+    const result = await harness({
+      commands: {
+        sockets: okResult(
+          ss(
+            "tcp   LISTEN 0      128    127.0.0.1:6969                     0.0.0.0:*",
+            "tcp   LISTEN 0      128    [::1]:6970                         [::]:*",
+            "tcp   LISTEN 0      128    100.101.102.103:9443               0.0.0.0:*",
+            "tcp   LISTEN 0      128    [fd7a:115c:a1e0::1]%tailscale0:443 [::]:*",
+          ),
+        ),
+        tailscale_serve: UNAVAILABLE,
+        tailscale_funnel: UNAVAILABLE,
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -p tcp --dport 6969 -j ACCEPT",
+        "ufw-v6": "-A ufw6-user-input -i tailscale0 -p tcp --dport 443 -j ACCEPT",
+      },
+    }).collector.collect("scan-pub-unknown-loopback-tailnet", settings());
+
+    const loV4 = entryByPort(result, 6969);
+    expect(loV4.publication).toBe("unknown");
+    expect(loV4.reachability).toBe("unknown");
+    expect(loV4.firewallV4).toBe("allow");
+    expect(loV4.firewallV6).toBe("na");
+
+    const loV6 = entryByPort(result, 6970);
+    expect(loV6.publication).toBe("unknown");
+    expect(loV6.reachability).toBe("unknown");
+    expect(loV6.firewallV4).toBe("na");
+    expect(loV6.firewallV6).toBe("deny");
+
+    const tsV4 = entryByPort(result, 9443);
+    expect(tsV4.publication).toBe("unknown");
+    expect(tsV4.reachability).toBe("unknown");
+    expect(tsV4.firewallV4).toBe("deny");
+    expect(tsV4.firewallV6).toBe("na");
+
+    const tsV6 = entryByPort(result, 443);
+    expect(tsV6.publication).toBe("unknown");
+    expect(tsV6.reachability).toBe("unknown");
+    expect(tsV6.firewallV4).toBe("na");
+    expect(tsV6.firewallV6).toBe("allow");
+  });
+
+  test("re-review finding 3: resolves explicit 0.0.0.0 and [::] Tailscale targets to loopback/wildcard only, not unrelated LAN or Tailnet IPs", async () => {
+    const result = await harness({
+      commands: {
+        sockets: okResult(
+          ss(
+            "tcp   LISTEN 0      128    127.0.0.1:8090            0.0.0.0:*",
+            "tcp   LISTEN 0      128    0.0.0.0:8090              0.0.0.0:*",
+            "tcp   LISTEN 0      128    192.168.1.50:8090         0.0.0.0:*",
+            "tcp   LISTEN 0      128    100.101.102.103:8090      0.0.0.0:*",
+            "tcp   LISTEN 0      128    [::1]:8090                [::]:*",
+            "tcp   LISTEN 0      128    [::1]:8091                [::]:*",
+            "tcp   LISTEN 0      128    [::]:8091                 [::]:*",
+            "tcp   LISTEN 0      128    [fd7a:115c:a1e0::1]:8091  [::]:*",
+            "tcp   LISTEN 0      128    127.0.0.1:8091            0.0.0.0:*",
+            "tcp   LISTEN 0      128    0.0.0.0:8091              0.0.0.0:*",
+          ),
+        ),
+        tailscale_serve: okResult(
+          JSON.stringify({
+            Web: {
+              "host.ts.net:443": {
+                Handlers: {
+                  "/v4zero": { Proxy: "http://0.0.0.0:8090" },
+                  "/v6zero": { Proxy: "http://[::]:8091" },
+                },
+              },
+            },
+          }),
+        ),
+        tailscale_funnel: okResult("{}"),
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -j RETURN",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ts-zero-targets", settings());
+
+    const byAddrPort = (addr: string, port: number) =>
+      result.exposure.find((e) => e.listener.address === addr && e.listener.port === port)!;
+
+    // 0.0.0.0 -> 127.0.0.1 (matches IPv4 loopback and wildcard, not LAN/tailnet or IPv6)
+    expect(byAddrPort("127.0.0.1", 8090).publication).toBe("serve");
+    expect(byAddrPort("0.0.0.0", 8090).publication).toBe("serve");
+    expect(byAddrPort("192.168.1.50", 8090).publication).toBe("none");
+    expect(byAddrPort("100.101.102.103", 8090).publication).toBe("none");
+    expect(byAddrPort("::1", 8090).publication).toBe("none");
+
+    // [::] -> ::1 (matches IPv6 loopback and wildcard, not tailnet IPv6 or IPv4)
+    expect(byAddrPort("::1", 8091).publication).toBe("serve");
+    expect(byAddrPort("::", 8091).publication).toBe("serve");
+    expect(byAddrPort("fd7a:115c:a1e0::1", 8091).publication).toBe("none");
+    expect(byAddrPort("127.0.0.1", 8091).publication).toBe("none");
+    expect(byAddrPort("0.0.0.0", 8091).publication).toBe("none");
+  });
+
+  test("re-review finding 4: wildcard listeners preserve unknown publication for non-loopback non-proven-local IPv4 and IPv6 targets", async () => {
+    const result = await harness({
+      commands: {
+        sockets: okResult(
+          ss(
+            "tcp   LISTEN 0      128    0.0.0.0:8092        0.0.0.0:*",
+            "tcp   LISTEN 0      128    127.0.0.1:8092      0.0.0.0:*",
+            "tcp   LISTEN 0      128    [::]:8093           [::]:*",
+            "tcp   LISTEN 0      128    [::1]:8093          [::]:*",
+            "tcp   LISTEN 0      128    192.168.1.60:9000   0.0.0.0:*",
+            "tcp   LISTEN 0      128    0.0.0.0:8094        0.0.0.0:*",
+          ),
+        ),
+        tailscale_serve: okResult(
+          JSON.stringify({
+            Web: {
+              "host.ts.net:443": {
+                Handlers: {
+                  "/v4unproven": { Proxy: "http://198.51.100.9:8092" },
+                  "/v6unproven": { Proxy: "http://[2001:db8::9]:8093" },
+                  "/v4local": { Proxy: "http://192.168.1.60:8094" },
+                },
+              },
+            },
+          }),
+        ),
+        tailscale_funnel: okResult("{}"),
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -j RETURN",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ts-wildcard-unproven", settings());
+
+    const byAddrPort = (addr: string, port: number) =>
+      result.exposure.find((e) => e.listener.address === addr && e.listener.port === port)!;
+
+    expect(byAddrPort("0.0.0.0", 8092).publication).toBe("unknown");
+    expect(byAddrPort("0.0.0.0", 8092).reachability).toBe("unknown");
+    expect(byAddrPort("127.0.0.1", 8092).publication).toBe("none");
+
+    expect(byAddrPort("::", 8093).publication).toBe("unknown");
+    expect(byAddrPort("::", 8093).reachability).toBe("unknown");
+    expect(byAddrPort("::1", 8093).publication).toBe("none");
+
+    // Proven-local IP (observed on another listener) still matches wildcard
+    expect(byAddrPort("0.0.0.0", 8094).publication).toBe("serve");
+  });
+
+  test("re-review finding 5: indeterminate UFW allow rules mark audit coverage partial and never claim no unused allow rules", async () => {
+    const indeterminateMatch = await harness({
+      files: {
+        "ufw-v4": [
+          "-A ufw-user-input -p tcp --dport 6969 -j ACCEPT",
+          "-A ufw-user-input -p tcp --dport 9999 -m conntrack --ctstate NEW -j ACCEPT",
+        ].join("\n"),
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ufw-indeterminate-match", settings());
+
+    const checkMatch = checkById(indeterminateMatch, "firewall_ufw");
+    expect(checkMatch.sourceCoverage.rule_audit).toBe("partial");
+    expect(checkMatch.status).toBe("unknown");
+    expect(checkMatch.summary.toLowerCase()).not.toContain("no unused");
+
+    const negatedPort = await harness({
+      files: {
+        "ufw-v4": [
+          "-A ufw-user-input -p tcp --dport 6969 -j ACCEPT",
+          "-A ufw-user-input -p tcp ! --dport 80 -j ACCEPT",
+        ].join("\n"),
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ufw-negated-allow", settings());
+
+    const checkNegated = checkById(negatedPort, "firewall_ufw");
+    expect(checkNegated.sourceCoverage.rule_audit).toBe("partial");
+    expect(checkNegated.status).toBe("unknown");
+    expect(checkNegated.summary.toLowerCase()).not.toContain("no unused");
+
+    const rateLimitJump = await harness({
+      files: {
+        "ufw-v4": [
+          "-A ufw-user-input -p tcp --dport 6969 -j ACCEPT",
+          "-A ufw-user-input -p tcp --dport 22 -j ufw-user-limit",
+        ].join("\n"),
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-ufw-limit-jump", settings());
+
+    const checkLimit = checkById(rateLimitJump, "firewall_ufw");
+    expect(checkLimit.sourceCoverage.rule_audit).toBe("partial");
+    expect(checkLimit.status).toBe("unknown");
+    expect(checkLimit.summary.toLowerCase()).not.toContain("no unused");
+  });
+
+  test("re-review finding 6: SSH Include glob matching zero drop-in files marks coverage partial", async () => {
+    const emptyGlob = await harness({
+      files: {
+        "sshd-main": [
+          "Include /etc/ssh/sshd_config.d/*.conf",
+          "PasswordAuthentication no",
+          "PermitRootLogin no",
+          "KbdInteractiveAuthentication no",
+        ].join("\n"),
+      },
+      dropIns: [],
+    }).collector.collect("scan-ssh-empty-glob", settings());
+
+    const checkEmpty = checkById(emptyGlob, "ssh_hardening");
+    expect(checkEmpty.sourceCoverage.sshd_dropins).toBe("partial");
+    expect(checkEmpty.status).toBe("unknown");
+
+    const unmatchedPrefixGlob = await harness({
+      files: {
+        "sshd-main": [
+          "Include /etc/ssh/sshd_config.d/10-*.conf",
+          "PasswordAuthentication no",
+          "PermitRootLogin no",
+          "KbdInteractiveAuthentication no",
+        ].join("\n"),
+      },
+      dropIns: [{ name: "99-other.conf", text: "Port 22" }],
+    }).collector.collect("scan-ssh-unmatched-glob", settings());
+
+    const checkUnmatched = checkById(unmatchedPrefixGlob, "ssh_hardening");
+    expect(checkUnmatched.sourceCoverage.sshd_dropins).toBe("partial");
+    expect(checkUnmatched.status).toBe("unknown");
   });
 });

@@ -823,9 +823,20 @@ export function evaluateFirewall(
       continue;
     }
 
-    // Interface-scoped rules apply only when listener matches that interface.
-    if (rule.inInterface !== undefined && !interfaceMatches(rule.inInterface, listener.interfaceName)) {
-      continue;
+    // Interface-scoped rules:
+    // - If the listener has an explicit interfaceName, match/mismatch normally.
+    // - If a wildcard listener has no interfaceName, an interface-scoped rule is indeterminate
+    //   rather than skipped to default policy.
+    if (rule.inInterface !== undefined) {
+      if (listener.interfaceName !== undefined) {
+        if (!interfaceMatches(rule.inInterface, listener.interfaceName)) {
+          continue;
+        }
+      } else if (isWildcardAddress(listener.address)) {
+        return "unknown";
+      } else {
+        continue;
+      }
     }
 
     // Destination-scoped rules
@@ -1006,14 +1017,46 @@ function countUnusedAllowRules(
   chainName: string,
   family: 4 | 6,
   listeners: readonly Listener[],
-): { totalRules: number; unusedCount: number } {
+): { totalRules: number; unusedCount: number; indeterminateCount: number } {
   const rules = parseUfwChainRules(rulesText, chainName);
   let unusedCount = 0;
+  let indeterminateCount = 0;
 
   for (const rule of rules) {
-    if (rule.jump !== "ACCEPT" || !rule.dports || rule.dports.length === 0 || rule.indeterminate) {
+    if (rule.protocol === "other") {
       continue;
     }
+    if (
+      rule.jump === "DROP" ||
+      rule.jump === "REJECT" ||
+      rule.jump === "RETURN" ||
+      rule.jump === "LOG" ||
+      rule.jump === "ufw-user-logging-input"
+    ) {
+      continue;
+    }
+
+    if (rule.jump !== "ACCEPT") {
+      indeterminateCount++;
+      continue;
+    }
+
+    if (rule.indeterminate || !rule.dports || rule.dports.length === 0) {
+      indeterminateCount++;
+      continue;
+    }
+
+    if (rule.destination !== undefined && !isAllSourcesCidr(rule.destination, family)) {
+      const validCidr =
+        family === 4
+          ? ipv4InCidr("0.0.0.0", rule.destination)
+          : ipv6InCidr("::", rule.destination);
+      if (validCidr === null) {
+        indeterminateCount++;
+        continue;
+      }
+    }
+
     const hasMatchingListener = listeners.some((listener) =>
       listenerMatchesAllowRule(listener, rule, family),
     );
@@ -1022,7 +1065,7 @@ function countUnusedAllowRules(
     }
   }
 
-  return { totalRules: rules.length, unusedCount };
+  return { totalRules: rules.length, unusedCount, indeterminateCount };
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,79 +1132,88 @@ function parseTailscaleBackendTarget(target: string): TailscaleBackendTarget | n
   return null;
 }
 
+type TailscaleTargetMatch = "match" | "unknown" | "no_match";
+
+const IPV4_LOOPBACK_ADDR = 0x7f000001; // 127.0.0.1
+
 function tailscaleTargetMatchesListener(
   target: TailscaleBackendTarget,
   listener: Listener,
   knownLocalV4: ReadonlySet<number>,
   knownLocalV6: ReadonlySet<bigint>,
-): boolean {
-  if (target.port !== listener.port) return false;
+): TailscaleTargetMatch {
+  if (target.port !== listener.port) return "no_match";
 
   if (target.family === "any" || target.host === null) {
-    return true;
+    return "match";
   }
 
   if (target.family === "localhost") {
-    return isLoopbackAddress(listener.address, listener.family) || isWildcardAddress(listener.address);
+    return isLoopbackAddress(listener.address, listener.family) || isWildcardAddress(listener.address)
+      ? "match"
+      : "no_match";
   }
 
   if (target.family === 4) {
-    const targetNum = parseIpv4ToUint32(target.host);
-    if (targetNum === null) return false;
+    const rawTargetNum = parseIpv4ToUint32(target.host);
+    if (rawTargetNum === null) return "no_match";
 
-    if (isLoopbackAddress(target.host, 4)) {
+    // Explicit 0.0.0.0 connects to 127.0.0.1 on Linux, not unrelated LAN/tailnet IPs.
+    const targetNum = rawTargetNum === 0 ? IPV4_LOOPBACK_ADDR : rawTargetNum;
+    if (rawTargetNum === 0 || isLoopbackAddress(target.host, 4)) {
       if (listener.family === 4) {
-        return (
-          parseIpv4ToUint32(listener.address) === targetNum ||
+        return parseIpv4ToUint32(listener.address) === targetNum ||
           isWildcardAddress(listener.address)
-        );
+          ? "match"
+          : "no_match";
       }
-      return listener.family === "unspecified" && isWildcardAddress(listener.address);
+      return listener.family === "unspecified" && isWildcardAddress(listener.address)
+        ? "match"
+        : "no_match";
     }
 
-    if (targetNum === 0) {
-      return listener.family === 4 || listener.family === "unspecified";
-    }
-
-    // Explicit non-loopback IPv4: match exact listener IP, or wildcard only when observed locally.
+    // Explicit non-loopback IPv4: match exact listener IP; wildcard matches if proven local,
+    // otherwise preserve unknown because host interface IPs are not enumerated.
     if (listener.family === 4 && parseIpv4ToUint32(listener.address) === targetNum) {
-      return true;
+      return "match";
     }
     if (
       (listener.family === 4 || listener.family === "unspecified") &&
       isWildcardAddress(listener.address)
     ) {
-      return knownLocalV4.has(targetNum);
+      return knownLocalV4.has(targetNum) ? "match" : "unknown";
     }
-    return false;
+    return "no_match";
   }
 
   // target.family === 6
-  const targetVal = ipv6ToBigInt(target.host);
-  if (targetVal === null) return false;
+  const rawTargetVal = ipv6ToBigInt(target.host);
+  if (rawTargetVal === null) return "no_match";
 
-  if (targetVal === 1n) {
+  // Explicit [::] connects to [::1] on Linux, not unrelated IPv6/tailnet IPs.
+  if (rawTargetVal === 0n || rawTargetVal === 1n) {
     if (listener.family === 6) {
-      return isPureIpv6Loopback(listener.address) || isWildcardAddress(listener.address);
+      return isPureIpv6Loopback(listener.address) || isWildcardAddress(listener.address)
+        ? "match"
+        : "no_match";
     }
-    return listener.family === "unspecified" && isWildcardAddress(listener.address);
+    return listener.family === "unspecified" && isWildcardAddress(listener.address)
+      ? "match"
+      : "no_match";
   }
 
-  if (targetVal === 0n) {
-    return listener.family === 6 || listener.family === "unspecified";
-  }
-
-  // Explicit non-loopback IPv6: match exact listener IP, or wildcard only when observed locally.
-  if (listener.family === 6 && ipv6ToBigInt(listener.address) === targetVal) {
-    return true;
+  // Explicit non-loopback IPv6: match exact listener IP; wildcard matches if proven local,
+  // otherwise preserve unknown because host interface IPs are not enumerated.
+  if (listener.family === 6 && ipv6ToBigInt(listener.address) === rawTargetVal) {
+    return "match";
   }
   if (
     (listener.family === 6 || listener.family === "unspecified") &&
     isWildcardAddress(listener.address)
   ) {
-    return knownLocalV6.has(targetVal);
+    return knownLocalV6.has(rawTargetVal) ? "match" : "unknown";
   }
-  return false;
+  return "no_match";
 }
 
 function collectTargetsFromTailscaleJson(
@@ -1314,12 +1366,29 @@ export function classifyListeners(options: ClassifyListenersOptions): ExposureEn
           ? "na"
           : "unknown";
 
-    const hasFunnelTarget = publications.funnelTargets.some((target) =>
-      tailscaleTargetMatchesListener(target, listener, knownLocalV4, knownLocalV6),
-    );
-    const hasServeTarget = publications.serveTargets.some((target) =>
-      tailscaleTargetMatchesListener(target, listener, knownLocalV4, knownLocalV6),
-    );
+    let funnelMatch: TailscaleTargetMatch = "no_match";
+    for (const target of publications.funnelTargets) {
+      const m = tailscaleTargetMatchesListener(target, listener, knownLocalV4, knownLocalV6);
+      if (m === "match") {
+        funnelMatch = "match";
+        break;
+      }
+      if (m === "unknown") {
+        funnelMatch = "unknown";
+      }
+    }
+
+    let serveMatch: TailscaleTargetMatch = "no_match";
+    for (const target of publications.serveTargets) {
+      const m = tailscaleTargetMatchesListener(target, listener, knownLocalV4, knownLocalV6);
+      if (m === "match") {
+        serveMatch = "match";
+        break;
+      }
+      if (m === "unknown") {
+        serveMatch = "unknown";
+      }
+    }
 
     let publication: ExposureEntry["publication"];
     if (listener.protocol !== "tcp") {
@@ -1327,17 +1396,16 @@ export function classifyListeners(options: ClassifyListenersOptions): ExposureEn
         publications.serveCoverage === "complete" && publications.funnelCoverage === "complete"
           ? "none"
           : "unknown";
-    } else if (hasFunnelTarget) {
+    } else if (funnelMatch === "match") {
       publication = "funnel";
-    } else if (hasServeTarget) {
-      publication = publications.funnelCoverage === "complete" ? "serve" : "unknown";
-    } else if (
-      publications.serveCoverage === "complete" &&
-      publications.funnelCoverage === "complete"
-    ) {
-      publication = "none";
-    } else {
+    } else if (funnelMatch === "unknown" || publications.funnelCoverage !== "complete") {
       publication = "unknown";
+    } else if (serveMatch === "match") {
+      publication = "serve";
+    } else if (serveMatch === "unknown" || publications.serveCoverage !== "complete") {
+      publication = "unknown";
+    } else {
+      publication = "none";
     }
 
     const loopback = isLoopbackAddress(listener.address, listener.family);
@@ -1375,9 +1443,14 @@ export function classifyListeners(options: ClassifyListenersOptions): ExposureEn
     if (publication === "funnel") {
       reachability = "exposed_v4_v6";
     } else if (loopback) {
-      reachability = publication === "serve" ? "tailnet" : "local_only";
+      reachability =
+        publication === "serve"
+          ? "tailnet"
+          : publication === "unknown"
+            ? "unknown"
+            : "local_only";
     } else if (tailnet) {
-      reachability = "tailnet";
+      reachability = publication === "unknown" ? "unknown" : "tailnet";
     } else if (listener.family === "unspecified") {
       reachability = "unknown";
     } else {
@@ -1559,9 +1632,7 @@ function parseSshdConfig(
             processLines(dropIn.text, false);
           }
           const isGlob = hasGlobMeta(filePattern);
-          if (!filePattern.endsWith(".conf") && (isGlob || matched.length === 0)) {
-            hasUnhandledInclude = true;
-          } else if (!isGlob && matched.length === 0) {
+          if (matched.length === 0 || (isGlob && !filePattern.endsWith(".conf"))) {
             hasUnhandledInclude = true;
           }
         }
@@ -2281,10 +2352,14 @@ export class PostureCollector {
               ? countUnusedAllowRules(ufwV6Text!, "ufw6-user-input", 6, listeners)
               : null;
 
+          const indeterminateAllowRuleCount =
+            (v4Stats?.indeterminateCount ?? 0) + (v6Stats?.indeterminateCount ?? 0);
+
           const unusedRulesCoverageComplete =
             socketsAvailable &&
             v4RulesComplete &&
-            (v6Enabled === false || (v6Enabled === true && v6RulesComplete));
+            (v6Enabled === false || (v6Enabled === true && v6RulesComplete)) &&
+            indeterminateAllowRuleCount === 0;
 
           const sourceCoverage: Record<string, Coverage> = {
             ufw_status:
@@ -2292,8 +2367,16 @@ export class PostureCollector {
                 ? "complete"
                 : "unavailable",
             ufw_default: ufwDefaultCoverage,
-            ufw_v4: v4RulesComplete ? "complete" : "unavailable",
-            ufw_v6: v6RulesComplete ? "complete" : "unavailable",
+            ufw_v4: !v4RulesComplete
+              ? "unavailable"
+              : (v4Stats?.indeterminateCount ?? 0) > 0
+                ? "partial"
+                : "complete",
+            ufw_v6: !v6RulesComplete
+              ? "unavailable"
+              : (v6Stats?.indeterminateCount ?? 0) > 0
+                ? "partial"
+                : "complete",
             sockets: socketsAvailable ? "complete" : "unavailable",
             rule_audit: unusedRulesCoverageComplete
               ? "complete"
@@ -2312,6 +2395,7 @@ export class PostureCollector {
             v4RuleCount: v4Stats?.totalRules ?? null,
             v6RuleCount: v6Stats?.totalRules ?? null,
             unusedAllowRuleCount: v4Stats || v6Stats ? unusedAllowRuleCount : null,
+            indeterminateAllowRuleCount: v4Stats || v6Stats ? indeterminateAllowRuleCount : null,
           });
 
           let status: PostureCheck["status"];
