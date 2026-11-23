@@ -104,6 +104,10 @@ _Avoid_: Arbitrary tool call, shell command, raw query
 The bounded AI investigation orchestrator that runs read-only evidence-tool turns under strict time, call, token, and backoff limits, validates final JSON verdicts, findings, and `ProposalDraft` records against issued scan evidence, and degrades cleanly when unconfigured or offline.
 _Avoid_: Autonomous agent, AI engine, chatbot
 
+**AiProviderClient**:
+The transport boundary that sends bounded chat-completion turns to a configured OpenAI-compatible provider under strict timeout, origin, redirect, and header controls, mapping provider failures without leaking secrets or raw upstream bodies.
+_Avoid_: Raw HTTP client, OpenAI SDK wrapper, LLM fetcher
+
 **EvidenceBroker**:
 The per-scan trust-boundary adapter that exposes closed-schema read-only `EvidenceTool` definitions, validates arguments locally, strips sensitive host fields, caps tool payloads, and tracks issued `Evidence` IDs eligible for citation.
 _Avoid_: Tool runner, log proxy, evidence dump

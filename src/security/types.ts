@@ -120,7 +120,7 @@ export type EvidenceTool = (typeof evidenceTools)[number];
 
 export interface InvestigationTrail {
   steps: {
-    tool: EvidenceTool | "verdict";
+    tool: EvidenceTool | "verdict" | "unknown";
     reason: string;
     outcome: "ok" | "rejected" | "unavailable";
     evidenceIds: string[];

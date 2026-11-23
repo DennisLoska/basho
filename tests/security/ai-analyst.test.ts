@@ -184,12 +184,14 @@ function scriptedClient(
 
 function makeBroker(
   options: {
+    scanId?: string;
     evidence?: Evidence[];
     recentEvents?: (category: Category, windowMinutes: number, limit: number) => SecurityEvent[];
     unitStatus?: (name: string, scope: "system" | "user") => Promise<Facts | null>;
   } = {},
 ): EvidenceBroker {
   return new EvidenceBroker({
+    ...(options.scanId !== undefined ? { scanId: options.scanId } : {}),
     evidence: options.evidence ?? [],
     recentEvents: options.recentEvents ?? (() => []),
     ...(options.unitStatus ? { unitStatus: options.unitStatus } : {}),
@@ -769,20 +771,108 @@ describe("EvidenceBroker tool dispatch", () => {
       makeBroker({ evidence: postureEvidence() }),
     );
 
-    expect(rejectedSteps(result).length).toBeGreaterThanOrEqual(2);
+    expect(rejectedSteps(result)).toHaveLength(3);
     expect(new Set(rejectedSteps(result).map((step) => step.tool))).toEqual(
-      new Set(["read_posture_detail", "read_unit_status"]),
+      new Set(["unknown", "read_posture_detail", "read_unit_status"]),
     );
 
     const nextMessages = JSON.stringify(requests[1]!.messages);
     expect(nextMessages).not.toContain("rm -rf /");
     expect(nextMessages).not.toContain("/etc/shadow");
+    expect(nextMessages).not.toContain("run_shell");
+    expect(JSON.stringify(result.trail)).not.toContain("run_shell");
 
     const assistant = requests[1]!.messages.find((message) => message.role === "assistant") as
       | { tool_calls?: { function: { arguments: string } }[] }
       | undefined;
     for (const entry of assistant?.tool_calls ?? []) {
       expect(entry.function.arguments).toBe("{}");
+    }
+  });
+
+  test("records unknown tool calls in InvestigationTrail without echoing untrusted tool names", async () => {
+    const requests: AiTurnRequest[] = [];
+    const client = scriptedClient(
+      [
+        () => ({
+          calls: [call("c1", "exec_shell", { cmd: "cat /etc/shadow" })],
+        }),
+        () => finalTurn(),
+      ],
+      requests,
+    );
+
+    const result = await new AiAnalyst({ client, clock: clockAt(NOW) }).investigate(
+      "scan-1",
+      makeBroker({ evidence: postureEvidence() }),
+    );
+
+    expect(result.trail.steps).toContainEqual({
+      tool: "unknown",
+      reason: "Rejected unknown tool call",
+      outcome: "rejected",
+      evidenceIds: [],
+    });
+    expect(JSON.stringify(result.trail)).not.toContain("exec_shell");
+    expect(JSON.stringify(requests[1]!.messages)).not.toContain("exec_shell");
+    expect(JSON.stringify(requests[1]!.messages)).not.toContain("/etc/shadow");
+  });
+
+  test("strips camelCase sensitive criterion keys while preserving safe SSH posture keys", async () => {
+    const requests: AiTurnRequest[] = [];
+    const client = scriptedClient(
+      [
+        () => ({
+          calls: [call("c1", "read_posture_detail", { criterionId: "ssh_hardening" })],
+        }),
+        () => finalTurn(),
+      ],
+      requests,
+    );
+
+    await new AiAnalyst({ client, clock: clockAt(NOW) }).investigate(
+      "scan-1",
+      makeBroker({
+        evidence: [
+          {
+            id: "ev-ssh",
+            kind: "criterion",
+            facts: {
+              criterionId: "ssh_hardening",
+              passwordAuthentication: "no",
+              passwordAuth: "no",
+              kbdInteractiveAuthentication: "no",
+              permitRootLogin: "no",
+              pubkeyAuthentication: "yes",
+              authToken: "secret-auth-token",
+              sshPrivateKey: "secret-ssh-private-key",
+              rootPassword: "secret-root-password",
+              cmdlineArgs: "--token=secret-cmdline",
+              apiKey: "secret-api-key",
+              secretValue: "secret-val",
+            },
+          },
+        ],
+      }),
+    );
+
+    const initialPayload = JSON.stringify(requests[0]!.messages);
+    const detailPayload = toolResult(requests[1]!, "c1", 0);
+
+    for (const surface of [initialPayload, detailPayload]) {
+      expect(surface).toContain("passwordAuthentication");
+      expect(surface).toContain("passwordAuth");
+      expect(surface).toContain("kbdInteractiveAuthentication");
+      expect(surface).toContain("permitRootLogin");
+      expect(surface).toContain("pubkeyAuthentication");
+
+      expect(surface).not.toContain("authToken");
+      expect(surface).not.toContain("sshPrivateKey");
+      expect(surface).not.toContain("rootPassword");
+      expect(surface).not.toContain("cmdlineArgs");
+      expect(surface).not.toContain("apiKey");
+      expect(surface).not.toContain("secretValue");
+      expect(surface).not.toContain("secret-");
     }
   });
 
@@ -1158,20 +1248,202 @@ describe("AiAnalyst investigation", () => {
     );
 
     const toolRequests = toolsOnRequest(requests);
-    expect(toolRequests.length).toBeGreaterThanOrEqual(2);
-    expect(toolRequests.length).toBeLessThanOrEqual(4);
-
-    const totalToolResults = toolMessages(toolRequests.at(-1)!).length;
-    expect(totalToolResults).toBeGreaterThan(0);
-    expect(totalToolResults).toBeLessThanOrEqual(6);
+    expect(toolRequests).toHaveLength(3);
 
     const finalRequest = requests.at(-1)!;
     expect(finalRequest.tools).toEqual([]);
-    expect(requests.length).toBeLessThanOrEqual(6);
+    expect(requests).toHaveLength(4);
+    expect(toolMessages(finalRequest)).toHaveLength(6);
 
     const toolSteps = result.trail.steps.filter((step) => step.tool !== "verdict");
-    expect(toolSteps.length).toBeLessThanOrEqual(6);
+    expect(toolSteps).toHaveLength(6);
     expect(result.status).toBe("ready");
+  });
+
+  test("caps tool dispatches at 6 when a single turn requests 8 tool calls", async () => {
+    const requests: AiTurnRequest[] = [];
+    let dispatchedCount = 0;
+    const client = scriptedClient(
+      [
+        () => ({
+          calls: Array.from({ length: 8 }, (_, index) =>
+            call(`c${index + 1}`, "read_recent_events", {
+              category: "auth",
+              windowMinutes: 60,
+              limit: 1,
+            }),
+          ),
+        }),
+        () => finalTurn(),
+      ],
+      requests,
+    );
+
+    const result = await new AiAnalyst({ client, clock: clockAt(NOW) }).investigate(
+      "scan-1",
+      makeBroker({
+        recentEvents: () => {
+          dispatchedCount += 1;
+          return [eventFixture({ id: `event-${dispatchedCount}` })];
+        },
+      }),
+    );
+
+    expect(dispatchedCount).toBe(6);
+    expect(toolsOnRequest(requests)).toHaveLength(1);
+    expect(requests).toHaveLength(2);
+    expect(requests[1]!.tools).toEqual([]);
+    expect(toolMessages(requests[1]!)).toHaveLength(6);
+    expect(result.trail.steps.filter((step) => step.tool !== "verdict")).toHaveLength(6);
+    expect(result.status).toBe("ready");
+  });
+
+  test("cuts off tool access early when estimated input tokens exceed 12,000 and trims the final request", async () => {
+    const requests: AiTurnRequest[] = [];
+    const client = scriptedClient(
+      [
+        () => ({
+          calls: [
+            call("c1", "read_recent_events", { category: "auth", windowMinutes: 60, limit: 15 }),
+            call("c2", "read_recent_events", { category: "auth", windowMinutes: 60, limit: 15 }),
+            call("c3", "read_recent_events", { category: "auth", windowMinutes: 60, limit: 15 }),
+            call("c4", "read_recent_events", { category: "auth", windowMinutes: 60, limit: 15 }),
+          ],
+        }),
+        () => finalTurn(),
+      ],
+      requests,
+    );
+
+    const largeInitialEvidence: Evidence[] = Array.from({ length: 65 }, (_, index) => ({
+      id: `ev-pad-${index + 1}`,
+      kind: "criterion",
+      facts: {
+        criterionId: "ssh_hardening",
+        detail: "d".repeat(250),
+      },
+    }));
+
+    const largeEvents = Array.from({ length: 15 }, (_, index) =>
+      eventFixture({
+        id: `big-ev-${index + 1}`,
+        summary: "s".repeat(240),
+        rule: "r".repeat(60),
+      }),
+    );
+
+    const result = await new AiAnalyst({ client, clock: clockAt(NOW) }).investigate(
+      "scan-1",
+      makeBroker({
+        evidence: largeInitialEvidence,
+        recentEvents: () => largeEvents,
+      }),
+    );
+
+    expect(toolsOnRequest(requests)).toHaveLength(1);
+    expect(requests).toHaveLength(2);
+
+    const finalRequest = requests[1]!;
+    expect(finalRequest.tools).toEqual([]);
+    const finalEstimatedTokens = Math.ceil(
+      Buffer.byteLength(JSON.stringify(finalRequest.messages), "utf8") / 3,
+    );
+    expect(finalEstimatedTokens).toBeLessThanOrEqual(12_000);
+    expect(toolMessages(finalRequest).some((m) => m.content === '{"truncated":true}')).toBe(true);
+    expect(result.status).toBe("ready");
+  });
+
+  test("rejects a cross-scan evidence broker before calling the provider", async () => {
+    let providerCalls = 0;
+    const client: AiProviderClient = {
+      async complete() {
+        providerCalls += 1;
+        return finalTurn();
+      },
+    };
+    const broker = makeBroker({ scanId: "scan-1", evidence: postureEvidence() });
+    expect(broker.scanId).toBe("scan-1");
+
+    const result = await new AiAnalyst({ client, clock: clockAt(NOW) }).investigate(
+      "scan-2",
+      broker,
+    );
+
+    expect(providerCalls).toBe(0);
+    expect(result).toEqual({
+      status: "offline",
+      findings: [],
+      proposals: [],
+      trail: {
+        steps: [
+          {
+            tool: "verdict",
+            reason: "Rejected cross-scan evidence broker",
+            outcome: "rejected",
+            evidenceIds: [],
+          },
+        ],
+      },
+      reason: "invalid_response",
+    });
+  });
+
+  test("rejects findings and proposals citing evidence IDs from another scan", async () => {
+    const scan1Broker = makeBroker({
+      scanId: "scan-1",
+      evidence: [
+        {
+          id: "scan-1-ev-1",
+          kind: "criterion",
+          facts: { criterionId: "ssh_hardening", status: "warn" },
+        },
+      ],
+    });
+    const scan2Broker = makeBroker({
+      scanId: "scan-2",
+      evidence: [
+        {
+          id: "scan-2-ev-1",
+          kind: "criterion",
+          facts: { criterionId: "ssh_hardening", status: "pass" },
+        },
+      ],
+    });
+
+    const client = scriptedClient([
+      () =>
+        finalTurn({
+          verdict: { kind: "warn", confidence: 0.9, summary: "Cross-scan citation attempt" },
+          findings: [
+            {
+              severity: "critical",
+              summary: "Stale finding citing scan-1 evidence",
+              evidenceIds: ["scan-1-ev-1"],
+            },
+            {
+              severity: "info",
+              summary: "Valid finding citing scan-2 evidence",
+              evidenceIds: ["scan-2-ev-1"],
+            },
+          ],
+          proposals: [
+            { target: { kind: "deny_peer_ip", ip: PEER }, evidenceIds: ["scan-1-ev-1"] },
+          ],
+        }),
+    ]);
+
+    const result = await new AiAnalyst({ client, clock: clockAt(NOW) }).investigate(
+      "scan-2",
+      scan2Broker,
+    );
+
+    expect(scan1Broker.hasEvidenceId("scan-1-ev-1")).toBe(true);
+    expect(scan2Broker.hasEvidenceId("scan-1-ev-1")).toBe(false);
+    expect(result.status).toBe("ready");
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]!.evidenceIds).toEqual(["scan-2-ev-1"]);
+    expect(result.proposals).toEqual([]);
+    expect(rejectedSteps(result)).toHaveLength(2);
   });
 });
 
@@ -1320,40 +1592,77 @@ describe("AiAnalyst provider backoff and degradation", () => {
     expect(requests.length).toBeGreaterThan(baseline);
   });
 
-  test(
-    "the 45 second investigation deadline aborts a hanging provider call as a timeout",
-    async () => {
-      let sawAbort = false;
-      const client: AiProviderClient = {
-        complete({ signal }) {
-          return new Promise<never>((_resolve, reject) => {
-            const fail = () => {
-              sawAbort = true;
-              const error = new Error("The operation was aborted");
-              error.name = "AbortError";
-              reject(error);
-            };
-            if (signal.aborted) fail();
-            else signal.addEventListener("abort", fail, { once: true });
-          });
+  test("the investigation deadline defaults to 45 seconds and aborts a hanging provider call as a timeout", async () => {
+    let sawAbort = false;
+    const client: AiProviderClient = {
+      complete({ signal }) {
+        return new Promise<never>((_resolve, reject) => {
+          const fail = () => {
+            sawAbort = true;
+            const error = new Error("The operation was aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          if (signal.aborted) fail();
+          else signal.addEventListener("abort", fail, { once: true });
+        });
+      },
+    };
+
+    const defaultAnalyst = new AiAnalyst({ client, clock: { now: () => Date.now() } });
+    expect(defaultAnalyst.deadlineMs).toBe(45 * SECOND);
+
+    const started = Date.now();
+    const result = await new AiAnalyst({
+      client,
+      clock: { now: () => Date.now() },
+      deadlineMs: 80,
+    }).investigate("scan-1", makeBroker());
+    const elapsed = Date.now() - started;
+
+    expect(sawAbort).toBe(true);
+    expect(elapsed).toBeGreaterThanOrEqual(80);
+    expect(elapsed).toBeLessThan(1_000);
+    expect(result.status).toBe("offline");
+    expect(result.reason).toBe("timeout");
+    expect(result.findings).toEqual([]);
+    expect(result.proposals).toEqual([]);
+  });
+
+  test("aborts a hanging broker.dispatch cleanly when the investigation deadline fires", async () => {
+    const client = scriptedClient([
+      () => ({
+        calls: [call("c1", "read_unit_status", { unitName: "sshd.service", scope: "system" })],
+      }),
+      () => finalTurn(),
+    ]);
+
+    const broker = makeBroker({
+      evidence: [
+        {
+          id: "unit-sshd",
+          kind: "unit",
+          facts: { unitName: "sshd.service", scope: "system" },
         },
-      };
+      ],
+      unitStatus: () => new Promise<Facts | null>(() => {}),
+    });
 
-      const started = Date.now();
-      const result = await new AiAnalyst({
-        client,
-        clock: { now: () => Date.now() },
-      }).investigate("scan-1", makeBroker());
+    const started = Date.now();
+    const result = await new AiAnalyst({
+      client,
+      clock: { now: () => Date.now() },
+      deadlineMs: 80,
+    }).investigate("scan-1", broker);
+    const elapsed = Date.now() - started;
 
-      expect(sawAbort).toBe(true);
-      expect(Date.now() - started).toBeGreaterThanOrEqual(45 * SECOND);
-      expect(result.status).toBe("offline");
-      expect(result.reason).toBe("timeout");
-      expect(result.findings).toEqual([]);
-      expect(result.proposals).toEqual([]);
-    },
-    70_000,
-  );
+    expect(elapsed).toBeGreaterThanOrEqual(80);
+    expect(elapsed).toBeLessThan(1_000);
+    expect(result.status).toBe("offline");
+    expect(result.reason).toBe("timeout");
+    expect(result.findings).toEqual([]);
+    expect(result.proposals).toEqual([]);
+  });
 
   test("sets redirect: error on outbound requests and rejects cross-origin 3xx redirects", async () => {
     const { fetcher, requests } = recordingFetch(

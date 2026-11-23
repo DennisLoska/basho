@@ -18,7 +18,6 @@ import type {
   Coverage,
   CriterionId,
   Evidence,
-  EvidenceTool,
   ExposureEntry,
   InvestigationTrail,
   Listener,
@@ -341,7 +340,7 @@ interface FindingRow {
 }
 
 interface InvestigationStepRow {
-  tool: EvidenceTool | "verdict";
+  tool: InvestigationTrail["steps"][number]["tool"];
   reason: string;
   outcome: InvestigationTrail["steps"][number]["outcome"];
   evidence_ids_json: string;

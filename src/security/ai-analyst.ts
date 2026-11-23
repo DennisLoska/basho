@@ -47,7 +47,6 @@ const MAX_EVIDENCE_IDS_PER_ITEM = 20;
 
 const SYSTEMD_UNIT_SCHEMA_PATTERN = "^[A-Za-z0-9_@.:-]{1,128}$";
 const SAFE_CALL_ID_PATTERN = /^[A-Za-z0-9._:-]{1,64}$/;
-const SAFE_TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const SAFE_WORKLOAD_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 
 const CATEGORIES: readonly Category[] = [
@@ -109,8 +108,16 @@ const EVENT_FACT_KEYS = [
   "summary",
 ] as const;
 
+const SAFE_POSTURE_KEYS = new Set<string>([
+  "passwordauthentication",
+  "passwordauth",
+  "kbdinteractiveauthentication",
+  "permitrootlogin",
+  "pubkeyauthentication",
+]);
+
 const SENSITIVE_KEY_PATTERN =
-  /(?:^|_|-)(?:argv|cmdline|commandline|environ|environment|openfiles|secret|token|password|passwd|apikey|privatekey|cookie|auth|credential)(?:$|_|-)/i;
+  /(?:argv|cmdline|command[_-]?line|environ(?:ment)?|open[_-]?files|secret|token|password|passwd|api[_-]?key|private[_-]?key|cookie|auth|credential)/i;
 
 const SYSTEM_PROMPT = [
   "You are Basho's read-only host security analyst.",
@@ -188,6 +195,7 @@ export class AiProviderError extends Error {
 }
 
 export interface EvidenceBrokerOptions {
+  scanId?: string;
   evidence: Evidence[];
   recentEvents: (
     category: Category,
@@ -203,6 +211,7 @@ export interface EvidenceBrokerOptions {
 export interface AiAnalystOptions {
   client?: AiProviderClient;
   clock?: Clock;
+  deadlineMs?: number;
 }
 
 interface ToolDispatchResult {
@@ -285,12 +294,19 @@ function pickFacts(
   return out;
 }
 
+function isSensitiveFactKey(key: string): boolean {
+  if (SAFE_POSTURE_KEYS.has(key.toLowerCase())) {
+    return false;
+  }
+  return SENSITIVE_KEY_PATTERN.test(key);
+}
+
 function sanitizeCriterionFacts(
   facts: Facts,
 ): Record<string, string | number | boolean | null> {
   const out: Record<string, string | number | boolean | null> = {};
   for (const [key, val] of Object.entries(facts)) {
-    if (SENSITIVE_KEY_PATTERN.test(key)) continue;
+    if (isSensitiveFactKey(key)) continue;
     if (!isValidScalar(val)) continue;
     out[key] = typeof val === "string" ? sanitizeStringScalar(val, 256) : val;
   }
@@ -694,6 +710,7 @@ function buildClosedToolSchemas(): ChatCompletionTool[] {
 const CLOSED_TOOL_SCHEMAS = buildClosedToolSchemas();
 
 export class EvidenceBroker {
+  readonly scanId?: string;
   private readonly evidenceById = new Map<string, Evidence>();
   private readonly criterionEvidence = new Map<CriterionId, Evidence[]>();
   private readonly listenerEvidence = new Map<string, Evidence>();
@@ -717,6 +734,9 @@ export class EvidenceBroker {
   }
 
   constructor(options: EvidenceBrokerOptions) {
+    if (options.scanId !== undefined) {
+      this.scanId = options.scanId;
+    }
     this.recentEventsFn = options.recentEvents;
     this.unitStatusFn = options.unitStatus;
 
@@ -1384,7 +1404,35 @@ function validateProposalDraft(
   return { target, evidenceIds: validIds };
 }
 
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(new AiProviderError("timeout", "AI provider request timed out"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(new AiProviderError("timeout", "AI provider request timed out"));
+    };
+    const cleanup = () => {
+      signal.removeEventListener("abort", onAbort);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (err) => {
+        cleanup();
+        reject(err);
+      },
+    );
+  });
+}
+
 export class AiAnalyst {
+  readonly deadlineMs: number;
   private readonly client?: AiProviderClient;
   private readonly clock: Clock;
   private backoffUntil = 0;
@@ -1394,6 +1442,12 @@ export class AiAnalyst {
   constructor(options: AiAnalystOptions = {}) {
     this.client = options.client;
     this.clock = options.clock ?? { now: () => Date.now() };
+    this.deadlineMs =
+      typeof options.deadlineMs === "number" &&
+      Number.isFinite(options.deadlineMs) &&
+      options.deadlineMs > 0
+        ? options.deadlineMs
+        : INVESTIGATION_DEADLINE_MS;
   }
 
   private recordProviderFailure(error: AiProviderError): void {
@@ -1439,6 +1493,25 @@ export class AiAnalyst {
       };
     }
 
+    if (broker.scanId !== undefined && broker.scanId !== scanId) {
+      return {
+        status: "offline",
+        findings: [],
+        proposals: [],
+        trail: {
+          steps: [
+            {
+              tool: "verdict",
+              reason: "Rejected cross-scan evidence broker",
+              outcome: "rejected",
+              evidenceIds: [],
+            },
+          ],
+        },
+        reason: "invalid_response",
+      };
+    }
+
     const now = this.clock.now();
     if (now < this.backoffUntil) {
       return {
@@ -1457,7 +1530,7 @@ export class AiAnalyst {
 
     const scheduleDeadline = (delayMs: number) => {
       deadlineTimer = setTimeout(() => {
-        const remaining = INVESTIGATION_DEADLINE_MS - (Date.now() - wallStarted);
+        const remaining = this.deadlineMs - (Date.now() - wallStarted);
         if (remaining > 0) {
           scheduleDeadline(remaining);
           return;
@@ -1466,7 +1539,7 @@ export class AiAnalyst {
         controller.abort();
       }, delayMs);
     };
-    scheduleDeadline(INVESTIGATION_DEADLINE_MS);
+    scheduleDeadline(this.deadlineMs);
 
     const trail: InvestigationTrail = { steps: [] };
     const tools = broker.getToolDefinitions();
@@ -1524,19 +1597,31 @@ export class AiAnalyst {
         const toolResults: ChatCompletionMessageParam[] = [];
 
         for (const entry of batch) {
+          if (deadlineExpired || controller.signal.aborted) {
+            throw new AiProviderError("timeout", "AI provider request timed out");
+          }
           toolCallsUsed += 1;
           const callId = allocateCallId(entry.id);
-          const safeName = SAFE_TOOL_NAME_PATTERN.test(entry.name)
-            ? entry.name
-            : "unknown_tool";
 
-          const dispatched = await broker.dispatch(entry.name, entry.arguments);
+          const dispatched = await raceWithAbort(
+            broker.dispatch(entry.name, entry.arguments),
+            controller.signal,
+          );
+          const safeName =
+            dispatched.knownTool && dispatched.tool ? dispatched.tool : "unknown_tool";
           if (dispatched.knownTool && dispatched.tool) {
             trail.steps.push({
               tool: dispatched.tool,
               reason: dispatched.reason,
               outcome: dispatched.outcome,
               evidenceIds: dispatched.evidenceIds,
+            });
+          } else {
+            trail.steps.push({
+              tool: "unknown",
+              reason: "Rejected unknown tool call",
+              outcome: "rejected",
+              evidenceIds: [],
             });
           }
 
