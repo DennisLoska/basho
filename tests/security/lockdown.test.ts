@@ -242,10 +242,10 @@ describe("DeadMansSwitch", () => {
       ),
     ).toBe(false);
 
-    // Mismatched process start time (PID reuse).
+    // Mismatched process start time (PID reuse beyond clock/rounding tolerance).
     expect(
       guard.allows(
-        { ...WORKLOAD_TARGET, startedAt: ENROLLED_STARTED_AT + 1 } as ContainmentTarget,
+        { ...WORKLOAD_TARGET, startedAt: ENROLLED_STARTED_AT + 5_000 } as ContainmentTarget,
         context,
       ),
     ).toBe(false);
@@ -828,7 +828,7 @@ describe("LockdownEngine.approve", () => {
     await harness.engine.consider(scanFixture(), [WORKLOAD_DRAFT], [], harness.settings);
     const proposal = onlyProposal(harness.store);
 
-    identity.startedAt = ENROLLED_STARTED_AT + 5;
+    identity.startedAt = ENROLLED_STARTED_AT + 5_000;
 
     expect(await harness.engine.approve(proposal.id, proposal.revision, harness.settings)).toBe(
       false,
@@ -1629,8 +1629,8 @@ describe("DeadMansSwitch user-unit scope and production adapters", () => {
       updatedAt: NOW,
     };
 
-    // Start-time drift right before apply
-    identity.startedAt = ENROLLED_STARTED_AT + 42;
+    // Start-time drift right before apply (beyond clock/rounding tolerance)
+    identity.startedAt = ENROLLED_STARTED_AT + 5_000;
     await expect(adapter.apply(workloadAction)).rejects.toThrow(/drift|identity|match/i);
 
     // User-unit ownership drift right before apply
@@ -1735,14 +1735,14 @@ describe("DeadMansSwitch user-unit scope and production adapters", () => {
       ),
     ).toBe(true);
 
-    // Exact === check must still reject drifted start times.
+    // Drifted start times beyond the 2000ms tolerance must still be rejected.
     expect(
       guard.allows(
         {
           kind: "pause_workload",
           workloadId: ENROLLED_ID,
           pid: ENROLLED_PID,
-          startedAt: eventStartedAtMs + 1,
+          startedAt: eventStartedAtMs + 2_001,
         },
         {
           workloads: [ENROLLED_WORKLOAD],
@@ -1903,8 +1903,8 @@ describe("DeadMansSwitch user-unit scope and production adapters", () => {
     const appliedB = await adapter.apply(actionB);
     const activeB: LockdownAction = { ...actionB, state: "active", rollbackHandle: appliedB.handle };
 
-    // actionA shares the same unit, but its timer is not active -> must not cross-contaminate.
-    expect(await adapter.inspect(actionA)).toEqual({ state: "absent" });
+    // actionA shares the same unit, but its timer is not active -> must not report active or absent while frozen.
+    expect(await adapter.inspect(actionA)).toEqual({ state: "unknown" });
     expect(await adapter.inspect(activeB)).toEqual({
       state: "active",
       handle: appliedB.handle,
@@ -1921,6 +1921,285 @@ describe("DeadMansSwitch user-unit scope and production adapters", () => {
       calls.some((argv) => argv.includes("thaw") && argv.includes(ENROLLED_UNIT)),
     ).toBe(true);
     expect(freezerState).toBe("running");
+    expect(await adapter.inspect(activeB)).toEqual({ state: "absent" });
+  });
+
+  test("DeadMansSwitch and user workload apply tolerate bounded /proc vs etimes jitter and reject >2000ms PID reuse", async () => {
+    const procRoot = makeTempDir("proc-jitter");
+    const pidDir = join(procRoot, String(ENROLLED_PID));
+    mkdirSync(pidDir, { recursive: true });
+
+    const btimeSec = 1_700_000_000;
+    const clkTck = 100;
+    // Process started 123.70s after boot (fractional ticks).
+    const startTicks = 12_370;
+
+    // Sample at a non-second-aligned wall clock (500.456s after btime),
+    // matching how events.ts/collector.ts compute nowMs - etimes * 1000.
+    const sampleNowMs = (btimeSec + 500) * 1_000 + 456;
+    const etimesSec = Math.floor(500.456 - startTicks / clkTck); // 376
+    const eventStartedAtMs = sampleNowMs - etimesSec * 1_000; // (btime + 124) * 1000 + 456
+
+    writeFileSync(
+      join(procRoot, "stat"),
+      `cpu  100 0 50 1000 0 0 0 0 0 0\nbtime ${btimeSec}\nprocesses 4242\n`,
+      "utf8",
+    );
+    const afterCommFields = [
+      "S", "1", "4242", "4242", "0", "-1", "4194304", "100", "0", "12", "0",
+      "10", "5", "0", "0", "20", "0", "4", "0", String(startTicks), "1048576", "256",
+    ];
+    writeFileSync(
+      join(pidDir, "stat"),
+      `${ENROLLED_PID} (ollama) ${afterCommFields.join(" ")}\n`,
+      "utf8",
+    );
+    writeFileSync(
+      join(pidDir, "status"),
+      `Name:\tollama\nUid:\t${CURRENT_UID}\t${CURRENT_UID}\t${CURRENT_UID}\t${CURRENT_UID}\n`,
+      "utf8",
+    );
+    writeFileSync(join(pidDir, "comm"), "ollama\n", "utf8");
+
+    const resolver = createProcProcessResolver({
+      procRoot,
+      clkTck,
+      exec: async () => ({
+        exitCode: 0,
+        stdout: `user@${CURRENT_UID}.service ${ENROLLED_UNIT}\n`,
+        stderr: "",
+      }),
+    });
+
+    const identity = await resolver(ENROLLED_PID);
+    expect(identity).not.toBeNull();
+    expect(Math.abs(identity!.startedAt - eventStartedAtMs)).toBeGreaterThan(0);
+    expect(Math.abs(identity!.startedAt - eventStartedAtMs)).toBeLessThanOrEqual(2_000);
+
+    const guard = new DeadMansSwitch();
+    const jitterTarget: ContainmentTarget = {
+      kind: "pause_workload",
+      workloadId: ENROLLED_ID,
+      pid: ENROLLED_PID,
+      startedAt: eventStartedAtMs,
+    };
+    const context = {
+      workloads: [ENROLLED_WORKLOAD],
+      currentProcess: identity,
+      currentUid: CURRENT_UID,
+    };
+
+    // Matching process with non-second-aligned etimes jitter is accepted.
+    expect(guard.allows(jitterTarget, context)).toBe(true);
+    // Exact ±2000ms boundary is accepted.
+    expect(
+      guard.allows(
+        { ...jitterTarget, startedAt: identity!.startedAt + 2_000 },
+        context,
+      ),
+    ).toBe(true);
+    expect(
+      guard.allows(
+        { ...jitterTarget, startedAt: identity!.startedAt - 2_000 },
+        context,
+      ),
+    ).toBe(true);
+
+    // Genuine PID reuse (> 2000ms difference) is rejected.
+    expect(
+      guard.allows(
+        { ...jitterTarget, startedAt: identity!.startedAt + 2_001 },
+        context,
+      ),
+    ).toBe(false);
+    expect(
+      guard.allows(
+        { ...jitterTarget, startedAt: identity!.startedAt - 2_001 },
+        context,
+      ),
+    ).toBe(false);
+
+    // User workload adapter apply() also accepts the jittered target and rejects >2000ms drift.
+    const calls: string[][] = [];
+    const adapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => [ENROLLED_WORKLOAD],
+      clock: createClock().clock,
+      resolveProcess: resolver,
+      currentUid: CURRENT_UID,
+      exec: async (argv) => {
+        calls.push([...argv]);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    const jitterAction: LockdownAction = {
+      id: "act-jitter-ok",
+      proposalId: "prop-jitter-ok",
+      idempotencyKey: "prop-jitter-ok:1",
+      target: jitterTarget,
+      state: "pending",
+      createdAt: NOW,
+      expiresAt: NOW + 120 * SECOND,
+      updatedAt: NOW,
+    };
+    const applied = await adapter.apply(jitterAction);
+    expect(applied.handle).toContain(ENROLLED_UNIT);
+
+    const driftedAction: LockdownAction = {
+      ...jitterAction,
+      id: "act-jitter-drifted",
+      idempotencyKey: "prop-jitter-drifted:1",
+      target: {
+        ...jitterTarget,
+        startedAt: identity!.startedAt + 5_000,
+      },
+    };
+    await expect(adapter.apply(driftedAction)).rejects.toThrow(/drift|identity|match/i);
+  });
+
+  test("FreezerState=frozen with inactive thaw timer never transitions pending to failed and still thaws via unlock or reconcile expiry", async () => {
+    const createScenario = (failFreezeAfterFreezing: boolean) => {
+      const clock = createClock();
+      const store = new SecurityStore(":memory:");
+      const activeTimers = new Set<string>();
+      let freezerState = "running";
+      const calls: string[][] = [];
+
+      const adapter = createUserWorkloadLockdownAdapter({
+        getWorkloads: () => [ENROLLED_WORKLOAD],
+        clock: clock.clock,
+        resolveProcess: async (pid) => defaultProcess(pid),
+        currentUid: CURRENT_UID,
+        exec: async (argv) => {
+          calls.push([...argv]);
+          if (argv[0] === "/usr/bin/systemd-run" && argv.includes("--version")) {
+            return { exitCode: 0, stdout: "systemd 256\n", stderr: "" };
+          }
+          if (argv[0] === "/usr/bin/systemd-run") {
+            const unitArg = argv.find((a) => a.startsWith("--unit="));
+            if (unitArg) activeTimers.add(`${unitArg.slice("--unit=".length)}.timer`);
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          if (argv.includes("freeze")) {
+            freezerState = "frozen";
+            if (failFreezeAfterFreezing) {
+              return { exitCode: 124, stdout: "", stderr: "timed out" };
+            }
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          if (argv.includes("thaw")) {
+            freezerState = "running";
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          if (argv.includes("stop")) {
+            const timer = argv[argv.length - 1]!;
+            activeTimers.delete(timer);
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          if (argv.includes("is-active")) {
+            const timer = argv[argv.length - 1]!;
+            return activeTimers.has(timer)
+              ? { exitCode: 0, stdout: "active\n", stderr: "" }
+              : { exitCode: 3, stdout: "inactive\n", stderr: "" };
+          }
+          if (argv.includes("FreezerState")) {
+            return { exitCode: 0, stdout: `${freezerState}\n`, stderr: "" };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      });
+
+      const settings = makeSettings({
+        workloads: [ENROLLED_WORKLOAD],
+        lockdown: { proposalMinutes: 30, leaseSeconds: 60, helperEnabled: true },
+      });
+      const engine = new LockdownEngine({
+        store,
+        clock: clock.clock,
+        guard: new DeadMansSwitch(),
+        adapter,
+        resolveProcess: async (pid) => defaultProcess(pid),
+        currentUid: CURRENT_UID,
+      });
+
+      return {
+        clock,
+        store,
+        adapter,
+        engine,
+        settings,
+        activeTimers,
+        calls,
+        getFreezerState: () => freezerState,
+      };
+    };
+
+    // Case 1: pending action + FreezerState=frozen + inactive timer -> stays pending (not failed) and unlock() thaws it.
+    const pendingUnlock = createScenario(true);
+    await pendingUnlock.engine.consider(
+      scanFixture(),
+      [WORKLOAD_DRAFT],
+      [],
+      pendingUnlock.settings,
+    );
+    const prop1 = onlyProposal(pendingUnlock.store);
+    expect(
+      await pendingUnlock.engine.approve(prop1.id, prop1.revision, pendingUnlock.settings),
+    ).toBe(false);
+    expect(pendingUnlock.getFreezerState()).toBe("frozen");
+    // Simulate thaw timer having fired/vanished while unit remains frozen.
+    pendingUnlock.activeTimers.clear();
+
+    const pendingAction1 = onlyAction(pendingUnlock.store);
+    expect(pendingAction1.state).toBe("pending");
+    expect(await pendingUnlock.adapter.inspect(pendingAction1)).toEqual({ state: "unknown" });
+
+    await pendingUnlock.engine.reconcile();
+    expect(onlyAction(pendingUnlock.store).state).toBe("pending");
+
+    expect(await pendingUnlock.engine.unlock(pendingAction1.id)).toBe(true);
+    expect(onlyAction(pendingUnlock.store).state).toBe("rolled_back");
+    expect(pendingUnlock.getFreezerState()).toBe("running");
+
+    // Case 2: pending action + FreezerState=frozen + inactive timer -> reconcile() thaws on lease expiry.
+    const pendingExpire = createScenario(true);
+    await pendingExpire.engine.consider(
+      scanFixture(),
+      [WORKLOAD_DRAFT],
+      [],
+      pendingExpire.settings,
+    );
+    const prop2 = onlyProposal(pendingExpire.store);
+    await pendingExpire.engine.approve(prop2.id, prop2.revision, pendingExpire.settings);
+    pendingExpire.activeTimers.clear();
+    pendingExpire.clock.advance(61 * SECOND);
+
+    await pendingExpire.engine.reconcile();
+    expect(onlyAction(pendingExpire.store).state).toBe("rolled_back");
+    expect(pendingExpire.getFreezerState()).toBe("running");
+
+    // Case 3: active action + FreezerState=frozen + inactive timer -> reconcile() still thaws on lease expiry.
+    const activeExpire = createScenario(false);
+    await activeExpire.engine.consider(
+      scanFixture(),
+      [WORKLOAD_DRAFT],
+      [],
+      activeExpire.settings,
+    );
+    const prop3 = onlyProposal(activeExpire.store);
+    expect(
+      await activeExpire.engine.approve(prop3.id, prop3.revision, activeExpire.settings),
+    ).toBe(true);
+    expect(onlyAction(activeExpire.store).state).toBe("active");
+    activeExpire.activeTimers.clear();
+    expect(await activeExpire.adapter.inspect(onlyAction(activeExpire.store))).toEqual({
+      state: "unknown",
+    });
+
+    activeExpire.clock.advance(61 * SECOND);
+    await activeExpire.engine.reconcile();
+    expect(onlyAction(activeExpire.store).state).toBe("rolled_back");
+    expect(activeExpire.getFreezerState()).toBe("running");
   });
 
   test("decideContainment keeps isolate_lan_ingress approval-only even with scoped corroboration", () => {
@@ -2041,5 +2320,61 @@ esac
     expect(remaining).not.toContain("basho-op-shift");
     expect(remaining).toContain("22/tcp ALLOW IN Anywhere");
     expect(remaining).toContain("443/tcp ALLOW IN Anywhere");
+  });
+
+  test("helper enforces C locale in root mode and for ufw status parsing under non-English caller locales", () => {
+    const source = readFileSync(helperSourcePath, "utf8");
+    const rootBranchMatch = /if \[ "\$REAL_UID" -eq 0 \]; then([\s\S]*?)\nelse\n/.exec(source);
+    expect(rootBranchMatch).not.toBeNull();
+    const rootBranch = rootBranchMatch![1]!;
+    expect(rootBranch).toContain("LC_ALL=C");
+    expect(rootBranch).toContain("LANG=C");
+    expect(rootBranch).toContain("LANGUAGE=");
+
+    const fixture = installHelperFixture();
+    const localeUfw = `#!/usr/bin/env bash
+set -u
+rules="\${BASHO_FAKE_UFW_RULES:?}"
+log="\${BASHO_FAKE_LOG:?}"
+printf 'ufw %s\\n' "$*" >>"$log"
+cmd="\${1:-}"
+case "$cmd" in
+  status)
+    if [ "\${LC_ALL:-}" = "C" ] && [ "\${LANG:-}" = "C" ] && [ -z "\${LANGUAGE:-}" ]; then
+      printf 'Status: active\\n'
+    else
+      printf 'Status: Aktiv\\n'
+    fi
+    if [ -f "$rules" ]; then
+      n=0
+      while IFS= read -r line; do
+        n=$((n + 1))
+        printf '[%2d] %s\\n' "$n" "$line"
+      done <"$rules"
+    fi
+    exit 0
+    ;;
+  prepend)
+    printf 'Anywhere DENY IN %s # %s\\n' "$4" "$8" >>"$rules"
+    exit 0
+    ;;
+esac
+`;
+    const ufwPath = join(fixture.bin, "ufw");
+    writeFileSync(ufwPath, localeUfw, "utf8");
+    chmodSync(ufwPath, 0o755);
+
+    const nonEnglishLocale = {
+      LC_ALL: "de_DE.UTF-8",
+      LANG: "de_DE.UTF-8",
+      LANGUAGE: "de_DE:de",
+    };
+
+    const status = runHelper(fixture, ["status"], nonEnglishLocale);
+    expect(status.code).toBe(0);
+    expect(status.stdout).toContain("status=ready");
+
+    const deny = runHelper(fixture, ["deny-ip", PEER, "600", "op-locale"], nonEnglishLocale);
+    expect(deny.code).toBe(0);
   });
 });

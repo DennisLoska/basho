@@ -2,6 +2,7 @@
 set -euo pipefail
 
 umask 077
+export LC_ALL=C LANG=C LANGUAGE=
 
 # CRITICAL SECURITY INVARIANT:
 # When running as real root (UID 0, e.g. via sudo), NEVER read or honor any
@@ -13,7 +14,7 @@ SCRIPT_SELF="$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf
 
 if [ "$REAL_UID" -eq 0 ]; then
   PATH="/usr/sbin:/usr/bin:/sbin:/bin"
-  export PATH
+  export PATH LC_ALL=C LANG=C LANGUAGE=
   EFFECTIVE_UID="0"
   UFW_BIN="/usr/bin/ufw"
   SYSTEMCTL_BIN="/usr/bin/systemctl"

@@ -22,6 +22,7 @@ const DEFAULT_HELPER_PATH = "/usr/local/libexec/basho-lockdown-helper";
 const DEFAULT_ADAPTER_TIMEOUT_MS = 10_000;
 const MIN_LEASE_SECONDS = 30;
 const MAX_LEASE_SECONDS = 1_800;
+const PROCESS_START_TIME_TOLERANCE_MS = 2_000;
 const SAFE_OP_ID_PATTERN = /^[A-Za-z0-9._:-]{1,64}$/;
 const STRICT_IPV4_PATTERN =
   /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/;
@@ -510,7 +511,8 @@ export class DeadMansSwitch {
           proc.pid !== target.pid ||
           !Number.isSafeInteger(proc.startedAt) ||
           proc.startedAt <= 0 ||
-          proc.startedAt !== target.startedAt
+          Math.abs(proc.startedAt - target.startedAt) >
+            PROCESS_START_TIME_TOLERANCE_MS
         ) {
           return false;
         }
@@ -976,7 +978,11 @@ export class LockdownEngine {
     if (action.state === "rolled_back") {
       return true;
     }
-    if (action.state !== "active" && action.state !== "rolling_back") {
+    if (
+      action.state !== "pending" &&
+      action.state !== "active" &&
+      action.state !== "rolling_back"
+    ) {
       return false;
     }
     if (this.inFlightActions.has(action.id)) {
@@ -985,10 +991,10 @@ export class LockdownEngine {
 
     this.inFlightActions.add(action.id);
     try {
-      if (action.state === "active") {
+      if (action.state === "pending" || action.state === "active") {
         const transitioned = this.store.transitionAction(
           action.id,
-          "active",
+          action.state,
           "rolling_back",
           this.clock.now(),
         );
@@ -1097,6 +1103,16 @@ export class LockdownEngine {
             "failed",
             this.clock.now(),
           );
+        } else if (action.expiresAt <= this.clock.now()) {
+          const moved = this.store.transitionAction(
+            action.id,
+            "pending",
+            "rolling_back",
+            this.clock.now(),
+          );
+          if (moved) {
+            await this.attemptRollback({ ...action, state: "rolling_back" });
+          }
         }
         continue;
       }
@@ -1535,7 +1551,7 @@ export function createUserWorkloadLockdownAdapter(
         }
       }
 
-      if (freezerState === "running" || timerState === "inactive") {
+      if (freezerState === "running") {
         return { state: "absent" };
       }
       if (timerState === "active" && freezerState === "frozen") {
@@ -1688,9 +1704,10 @@ export function createProcProcessResolver(
         return null;
       }
 
-      // Convert boot time + starttime ticks to Unix epoch milliseconds to match
-      // events.ts and collector.ts (now - etimes * 1000).
-      const startedAt = Math.floor(btimeSeconds + startTicks / clkTck) * 1_000;
+      // Convert boot time + starttime ticks to Unix epoch milliseconds, preserving
+      // sub-second tick precision so comparisons with events.ts/collector.ts
+      // (now - etimes * 1000) stay within PROCESS_START_TIME_TOLERANCE_MS.
+      const startedAt = Math.round((btimeSeconds + startTicks / clkTck) * 1_000);
       if (!Number.isSafeInteger(startedAt) || startedAt <= 0) {
         return null;
       }
