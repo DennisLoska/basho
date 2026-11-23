@@ -35,11 +35,23 @@ import type {
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
+const MAX_BURST_SPAN_MS = 24 * HOUR_MS;
+const MAX_EVENT_COUNT = 1_000_000_000;
 const DEFAULT_DB_PATH = "data/basho-security.db";
 const BUSY_TIMEOUT_MS = 5_000;
 const MAX_RETAINED_SCANS = 50;
 const EVENT_RETENTION_DAYS = 14;
 const ACTION_RETENTION_DAYS = 90;
+
+const VALID_EVENT_SOURCES = new Set<string>(["journal", "socket"]);
+const VALID_EVENT_CATEGORIES = new Set<string>([
+  "auth",
+  "firewall",
+  "network",
+  "units",
+  "packages",
+]);
+const VALID_EVENT_SEVERITIES = new Set<string>(["info", "warning", "critical", "breach"]);
 
 const SEVERITY_RANK: Record<Severity, number> = {
   info: 0,
@@ -47,6 +59,69 @@ const SEVERITY_RANK: Record<Severity, number> = {
   critical: 2,
   breach: 3,
 };
+
+function validateNonEmptyString(value: unknown, field: string): void {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new TypeError(`SecurityEvent ${field} must be a non-empty string`);
+  }
+}
+
+function validateSecurityEvent(event: SecurityEvent): void {
+  if (!event || typeof event !== "object") {
+    throw new TypeError("SecurityEvent must be an object");
+  }
+  validateNonEmptyString(event.id, "id");
+  validateNonEmptyString(event.rule, "rule");
+  validateNonEmptyString(event.target, "target");
+  validateNonEmptyString(event.summary, "summary");
+
+  if (typeof event.source !== "string" || !VALID_EVENT_SOURCES.has(event.source)) {
+    throw new RangeError(`SecurityEvent source is invalid: ${String(event.source)}`);
+  }
+  if (typeof event.category !== "string" || !VALID_EVENT_CATEGORIES.has(event.category)) {
+    throw new RangeError(`SecurityEvent category is invalid: ${String(event.category)}`);
+  }
+  if (typeof event.severity !== "string" || !VALID_EVENT_SEVERITIES.has(event.severity)) {
+    throw new RangeError(`SecurityEvent severity is invalid: ${String(event.severity)}`);
+  }
+  if (typeof event.isNoise !== "boolean") {
+    throw new TypeError(`SecurityEvent isNoise must be a boolean: ${String(event.isNoise)}`);
+  }
+  if (!Number.isSafeInteger(event.firstAt) || !Number.isSafeInteger(event.lastAt)) {
+    throw new RangeError(
+      `SecurityEvent timestamps must be finite integers: firstAt=${event.firstAt}, lastAt=${event.lastAt}`,
+    );
+  }
+  if (event.firstAt > event.lastAt) {
+    throw new RangeError(
+      `SecurityEvent firstAt (${event.firstAt}) must not exceed lastAt (${event.lastAt})`,
+    );
+  }
+  if (!Number.isSafeInteger(event.count) || event.count < 1 || event.count > MAX_EVENT_COUNT) {
+    throw new RangeError(
+      `SecurityEvent count must be a safe integer between 1 and ${MAX_EVENT_COUNT}: ${event.count}`,
+    );
+  }
+}
+
+function safeAddCount(left: number | bigint, right: number | bigint, label: string): number {
+  if (
+    typeof left !== "number" ||
+    typeof right !== "number" ||
+    !Number.isSafeInteger(left) ||
+    !Number.isSafeInteger(right) ||
+    left < 0 ||
+    right < 0 ||
+    right > Number.MAX_SAFE_INTEGER - left
+  ) {
+    throw new RangeError(`${label} exceeds MAX_SAFE_INTEGER`);
+  }
+  const total = left + right;
+  if (!Number.isSafeInteger(total) || total > Number.MAX_SAFE_INTEGER) {
+    throw new RangeError(`${label} exceeds MAX_SAFE_INTEGER`);
+  }
+  return total;
+}
 
 export interface EventBatch {
   events: SecurityEvent[];
@@ -894,6 +969,15 @@ export class SecurityStore implements SecurityStoreContract {
         ) VALUES ('aggregate', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
 
+      const sumHourlyObservations = this.db.query(
+        `SELECT COALESCE(SUM(count), 0) AS total
+         FROM security_events
+         WHERE row_kind = 'observation'
+           AND hour_bucket = ?
+           AND is_noise = ?
+           AND observation_id != ?`,
+      );
+
       if (!Number.isFinite(batch.burstWindowMs)) {
         throw new RangeError(
           `EventBatch burstWindowMs must be finite: ${batch.burstWindowMs}`,
@@ -902,21 +986,7 @@ export class SecurityStore implements SecurityStoreContract {
       const burstWindowMs = Math.max(0, batch.burstWindowMs);
 
       for (const event of batch.events) {
-        if (!Number.isInteger(event.count) || event.count < 1) {
-          throw new RangeError(
-            `SecurityEvent count must be a finite positive integer: ${event.count}`,
-          );
-        }
-        if (!Number.isFinite(event.firstAt) || !Number.isFinite(event.lastAt)) {
-          throw new RangeError(
-            `SecurityEvent timestamps must be finite: firstAt=${event.firstAt}, lastAt=${event.lastAt}`,
-          );
-        }
-        if (event.firstAt > event.lastAt) {
-          throw new RangeError(
-            `SecurityEvent firstAt (${event.firstAt}) must not exceed lastAt (${event.lastAt})`,
-          );
-        }
+        validateSecurityEvent(event);
 
         const isNoiseInt = event.isNoise ? 1 : 0;
         const eventCount = event.count;
@@ -943,6 +1013,15 @@ export class SecurityStore implements SecurityStoreContract {
           continue;
         }
 
+        const hourlyRow = sumHourlyObservations.get(hourBucket, isNoiseInt, event.id) as {
+          total: number | bigint;
+        } | null;
+        safeAddCount(
+          hourlyRow ? hourlyRow.total : 0,
+          eventCount,
+          `SecurityEvent hourly total for hour ${hourBucket}`,
+        );
+
         const collectedByRowId = new Map<number, SecurityEventRow>();
         let mergedFirst = event.firstAt;
         let mergedLast = event.lastAt;
@@ -965,14 +1044,15 @@ export class SecurityStore implements SecurityStoreContract {
             if (collectedByRowId.has(agg.row_id)) {
               continue;
             }
+            const nextFirst = agg.first_at < mergedFirst ? agg.first_at : mergedFirst;
+            const nextLast = agg.last_at > mergedLast ? agg.last_at : mergedLast;
+            if (nextLast - nextFirst > MAX_BURST_SPAN_MS) {
+              continue;
+            }
             collectedByRowId.set(agg.row_id, agg);
             added = true;
-            if (agg.first_at < mergedFirst) {
-              mergedFirst = agg.first_at;
-            }
-            if (agg.last_at > mergedLast) {
-              mergedLast = agg.last_at;
-            }
+            mergedFirst = nextFirst;
+            mergedLast = nextLast;
           }
 
           if (!added || (mergedFirst === prevFirst && mergedLast === prevLast)) {
@@ -991,7 +1071,11 @@ export class SecurityStore implements SecurityStoreContract {
           let latestPayloadJson = payloadJson;
 
           for (const agg of matchingAggs) {
-            nextCount += agg.count;
+            nextCount = safeAddCount(
+              nextCount,
+              agg.count,
+              `SecurityEvent aggregate count for ${event.rule}/${event.target}`,
+            );
             if (SEVERITY_RANK[agg.severity] > SEVERITY_RANK[nextSeverity]) {
               nextSeverity = agg.severity;
             }

@@ -12,6 +12,10 @@ _Avoid_: System health dump, audit blob
 A normalized host observation bound to a source, category, severity, and timestamp, optionally aggregating repeated equivalent occurrences into a count.
 _Avoid_: Raw log line, breach
 
+**EventBatch**:
+An atomic set of `SecurityEvent` observations committed together with a burst aggregation window and an optional compare-and-set source cursor transition.
+_Avoid_: Raw log chunk, unvalidated event list, cursor update
+
 **SecurityFinding**:
 An evidence-backed security assessment produced either by a deterministic rule or by the AI analyst referencing verified snapshot or event evidence IDs.
 _Avoid_: Event, alert, log entry

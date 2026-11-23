@@ -1990,8 +1990,11 @@ test("two-connection write-transaction contention on claimProposal is atomic and
           for await (const _line of console) {
             break;
           }
+          const startedAt = Date.now();
+          console.log("CLAIMING");
           const action = store.claimProposal(${JSON.stringify(proposalId)}, 1, 500);
-          console.log(JSON.stringify({ action }));
+          const finishedAt = Date.now();
+          console.log(JSON.stringify({ action, startedAt, finishedAt }));
         } finally {
           store.close();
         }
@@ -2006,38 +2009,68 @@ test("two-connection write-transaction contention on claimProposal is atomic and
       const reader = child.stdout.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      while (!buffer.includes("READY\n")) {
-        const chunk = await reader.read();
-        if (chunk.done) {
-          const stderrText = await new Response(child.stderr).text();
-          throw new Error(`Child exited before READY: ${stderrText}`);
+      const waitForMarker = async (marker: string) => {
+        while (!buffer.includes(marker)) {
+          const chunk = await reader.read();
+          if (chunk.done) {
+            const stderrText = await new Response(child.stderr).text();
+            throw new Error(`Child exited before ${marker.trim()}: ${stderrText}`);
+          }
+          buffer += decoder.decode(chunk.value, { stream: true });
         }
-        buffer += decoder.decode(chunk.value, { stream: true });
-      }
+        const markerEnd = buffer.indexOf(marker) + marker.length;
+        buffer = buffer.slice(markerEnd);
+      };
+
+      await waitForMarker("READY\n");
 
       const locker = new Database(dbPath);
+      let lockReleasedAt = 0;
+      let pendingRead: ReturnType<typeof reader.read>;
       try {
         locker.run("BEGIN IMMEDIATE");
         child.stdin.write("GO\n");
         child.stdin.end();
-        // Give the child process time to enter BEGIN IMMEDIATE and block on SQLite busy_timeout.
-        await Bun.sleep(150);
+        // Wait for the child to confirm it is about to enter claimProposal while we hold the lock.
+        await waitForMarker("CLAIMING\n");
+        expect(buffer).toBe("");
+
+        // Hold BEGIN IMMEDIATE for ~40ms and prove the child remains blocked until lock release.
+        pendingRead = reader.read();
+        const holdOutcome = await Promise.race([
+          pendingRead.then(() => "unblocked-early" as const),
+          Bun.sleep(45).then(() => "still-blocked" as const),
+        ]);
+        expect(holdOutcome).toBe("still-blocked");
+
         const outcome = whileLocked(locker);
+        lockReleasedAt = Date.now();
         locker.run(outcome === "commit" ? "COMMIT" : "ROLLBACK");
       } finally {
         locker.close();
       }
 
-      let rest = buffer.slice(buffer.indexOf("READY\n") + "READY\n".length);
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        rest += decoder.decode(chunk.value, { stream: true });
+      let rest = buffer;
+      const firstAfterRelease = await pendingRead;
+      if (!firstAfterRelease.done) {
+        rest += decoder.decode(firstAfterRelease.value, { stream: true });
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          rest += decoder.decode(chunk.value, { stream: true });
+        }
       }
       const exitCode = await child.exited;
       const stderrText = await new Response(child.stderr).text();
       expect(exitCode, `child stderr: ${stderrText}`).toBe(0);
-      return JSON.parse(rest.trim()) as { action: { id: string } | null };
+      const parsed = JSON.parse(rest.trim()) as {
+        action: { id: string } | null;
+        startedAt: number;
+        finishedAt: number;
+      };
+      expect(parsed.finishedAt).toBeGreaterThanOrEqual(lockReleasedAt);
+      expect(parsed.finishedAt - parsed.startedAt).toBeGreaterThanOrEqual(35);
+      return parsed;
     };
 
     // Parent holds write lock, claims proposal and commits -> child waits on busy_timeout, unblocks, sees claimed, returns null.
@@ -2074,6 +2107,302 @@ test("two-connection write-transaction contention on claimProposal is atomic and
     ).toEqual([rollbackRace.action!.id]);
   } finally {
     storeZeroTimeout.close();
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("commitEventBatch validates every SecurityEvent field and rolls back batch and cursor on invalid input", () => {
+  const store = memoryStore();
+  try {
+    expect(
+      store.commitEventBatch({
+        events: [eventFixture("val-baseline", 1_000)],
+        cursor: { source: "journal", expected: null, next: "val-c1" },
+        burstWindowMs: 1_000,
+      }),
+    ).toBe(true);
+
+    const invalidCases: { name: string; event: SecurityEvent }[] = [
+      {
+        name: "invalid severity",
+        event: eventFixture("bad-sev", 2_000, { severity: "fatal" as Severity }),
+      },
+      {
+        name: "missing summary",
+        event: eventFixture("bad-summary-empty", 2_000, { summary: "" }),
+      },
+      {
+        name: "whitespace summary",
+        event: eventFixture("bad-summary-ws", 2_000, { summary: "   " }),
+      },
+      {
+        name: "empty id",
+        event: eventFixture("", 2_000),
+      },
+      {
+        name: "empty rule",
+        event: eventFixture("bad-rule", 2_000, { rule: "" }),
+      },
+      {
+        name: "empty target",
+        event: eventFixture("bad-target", 2_000, { target: "  " }),
+      },
+      {
+        name: "invalid source",
+        event: eventFixture("bad-source", 2_000, {
+          source: "syslog" as SecurityEvent["source"],
+        }),
+      },
+      {
+        name: "invalid category",
+        event: eventFixture("bad-category", 2_000, {
+          category: "kernel" as SecurityEvent["category"],
+        }),
+      },
+      {
+        name: "non-boolean isNoise",
+        event: eventFixture("bad-noise", 2_000, {
+          isNoise: 1 as unknown as boolean,
+        }),
+      },
+      {
+        name: "fractional firstAt",
+        event: eventFixture("bad-first-float", 2_000, {
+          firstAt: 1_999.5,
+          lastAt: 2_000,
+        }),
+      },
+      {
+        name: "fractional lastAt",
+        event: eventFixture("bad-last-float", 2_000, {
+          firstAt: 2_000,
+          lastAt: 2_000.5,
+        }),
+      },
+    ];
+
+    for (const testCase of invalidCases) {
+      expect(
+        () =>
+          store.commitEventBatch({
+            events: [
+              eventFixture(`rolled-back-${testCase.name}`, 1_500, { rule: "should_rollback" }),
+              testCase.event,
+            ],
+            cursor: { source: "journal", expected: "val-c1", next: "val-c2" },
+            burstWindowMs: 1_000,
+          }),
+        testCase.name,
+      ).toThrow();
+
+      expect(store.getCursor("journal"), testCase.name).toBe("val-c1");
+      expect(
+        store.recentEvents(0, 10).map((event) => event.id),
+        testCase.name,
+      ).toEqual(["val-baseline"]);
+    }
+  } finally {
+    store.close();
+  }
+});
+
+test("commitEventBatch rejects unsafe counts and guards aggregate and hourly totals against integer overflow", () => {
+  const store = memoryStore();
+  try {
+    const baseHour = Date.UTC(2026, 4, 1, 10, 0, 0);
+
+    expect(
+      store.commitEventBatch({
+        events: [eventFixture("cnt-init", baseHour + 1_000, { count: 1_000_000_000 })],
+        cursor: { source: "journal", expected: null, next: "cnt-c1" },
+        burstWindowMs: 5_000,
+      }),
+    ).toBe(true);
+    expect(store.recentEvents(0, 10)[0]!.count).toBe(1_000_000_000);
+
+    // Above 1_000_000_000 cap and unsafe integer counts must be rejected without advancing cursor.
+    for (const badCount of [1_000_000_001, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() =>
+        store.commitEventBatch({
+          events: [
+            eventFixture(`cnt-rolled-${badCount}`, baseHour + 1_200, { rule: "other_rule" }),
+            eventFixture(`cnt-bad-${badCount}`, baseHour + 1_500, { count: badCount }),
+          ],
+          cursor: { source: "journal", expected: "cnt-c1", next: "cnt-c2" },
+          burstWindowMs: 5_000,
+        }),
+      ).toThrow(RangeError);
+      expect(store.getCursor("journal")).toBe("cnt-c1");
+      expect(store.recentEvents(0, 10)).toHaveLength(1);
+    }
+
+    // Aggregate total overflow guard: push existing aggregate near MAX_SAFE_INTEGER and try to merge.
+    const internalDb = (store as unknown as { db: Database }).db;
+    internalDb
+      .query("UPDATE security_events SET count = ? WHERE row_kind = 'aggregate' AND event_id = 'cnt-init'")
+      .run(Number.MAX_SAFE_INTEGER - 5);
+
+    expect(() =>
+      store.commitEventBatch({
+        events: [eventFixture("cnt-agg-overflow", baseHour + 2_000, { count: 10 })],
+        cursor: { source: "journal", expected: "cnt-c1", next: "cnt-c2" },
+        burstWindowMs: 5_000,
+      }),
+    ).toThrow(RangeError);
+    expect(store.getCursor("journal")).toBe("cnt-c1");
+    expect(store.recentEvents(0, 10)[0]!.count).toBe(Number.MAX_SAFE_INTEGER - 5);
+
+    // Hourly total overflow guard: seed an observation near MAX_SAFE_INTEGER in another hour
+    // and insert a separate-rule event in that same hour so only the hourly sum overflows.
+    const nextHour = baseHour + HOUR_MS;
+    expect(
+      store.commitEventBatch({
+        events: [eventFixture("hourly-seed", nextHour + 1_000, { rule: "rule_hourly_a", count: 1 })],
+        cursor: { source: "journal", expected: "cnt-c1", next: "cnt-c2" },
+        burstWindowMs: 5_000,
+      }),
+    ).toBe(true);
+
+    internalDb
+      .query("UPDATE security_events SET count = ? WHERE row_kind = 'observation' AND observation_id = 'hourly-seed'")
+      .run(Number.MAX_SAFE_INTEGER - 5);
+
+    expect(() =>
+      store.commitEventBatch({
+        events: [
+          eventFixture("hourly-overflow", nextHour + 2_000, { rule: "rule_hourly_b", count: 10 }),
+        ],
+        cursor: { source: "journal", expected: "cnt-c2", next: "cnt-c3" },
+        burstWindowMs: 5_000,
+      }),
+    ).toThrow(RangeError);
+    expect(store.getCursor("journal")).toBe("cnt-c2");
+    expect(store.recentEvents(0, 10).map((event) => event.rule)).not.toContain("rule_hourly_b");
+  } finally {
+    store.close();
+  }
+});
+
+test("commitEventBatch caps aggregate burst span at 24h so continuously active bursts and dedupe observations prune cleanly", () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-burst-cap-"));
+  const dbPath = join(root, "burst-cap.db");
+  const store = new SecurityStore(dbPath);
+  try {
+    const start = 100 * DAY_MS;
+    const burstWindowMs = 2 * HOUR_MS;
+
+    // 37 hourly events (hours 0..36), each 1h apart (well inside 2h burstWindowMs).
+    // Hours 0..24 span exactly 24h -> single aggregate; hour 25 starts a new aggregate (hours 25..36).
+    const events: SecurityEvent[] = [];
+    for (let h = 0; h <= 36; h += 1) {
+      events.push(
+        eventFixture(`cont-${h}`, start + h * HOUR_MS, {
+          rule: "ssh_burst",
+          target: "198.51.100.88",
+        }),
+      );
+    }
+    store.commitEventBatch({ events, burstWindowMs });
+
+    const aggregates = store
+      .recentEvents(0, 20)
+      .sort((left, right) => left.firstAt - right.firstAt);
+    expect(aggregates).toHaveLength(2);
+    expect(aggregates[0]).toMatchObject({
+      firstAt: start,
+      lastAt: start + 24 * HOUR_MS,
+      count: 25,
+    });
+    expect(aggregates[1]).toMatchObject({
+      firstAt: start + 25 * HOUR_MS,
+      lastAt: start + 36 * HOUR_MS,
+      count: 12,
+    });
+
+    // Prune at cutoff = start + 26h:
+    // - Aggregate 1 (lastAt = start + 24h < cutoff) and all 25 of its observation rows must be reclaimed.
+    // - Aggregate 2 (firstAt = start + 25h, lastAt = start + 36h) spans cutoff and survives with dedupe intact.
+    const cutoff = start + 26 * HOUR_MS;
+    store.prune(cutoff + 14 * DAY_MS);
+
+    const afterPrune = store.recentEvents(0, 20);
+    expect(afterPrune).toHaveLength(1);
+    expect(afterPrune[0]).toMatchObject({
+      firstAt: start + 25 * HOUR_MS,
+      lastAt: start + 36 * HOUR_MS,
+      count: 12,
+    });
+
+    const inspectDb = new Database(dbPath, { readonly: true });
+    try {
+      const obsCount = (
+        inspectDb
+          .query("SELECT COUNT(*) AS n FROM security_events WHERE row_kind = 'observation'")
+          .get() as { n: number }
+      ).n;
+      expect(obsCount).toBe(12);
+    } finally {
+      inspectDb.close();
+    }
+
+    // Replaying the pre-cutoff observation from the surviving second burst must NOT double-count.
+    store.commitEventBatch({
+      events: [events[25]!],
+      burstWindowMs,
+    });
+    expect(store.recentEvents(0, 20)[0]!.count).toBe(12);
+
+    // Transitive burst merge must also respect the 24h maximum span cap.
+    const transTarget = "203.0.113.88";
+    const tBase = start + 10 * DAY_MS;
+    store.commitEventBatch({
+      events: [
+        eventFixture("tr-a", tBase, {
+          target: transTarget,
+          firstAt: tBase,
+          lastAt: tBase + 10 * HOUR_MS,
+          count: 2,
+        }),
+        eventFixture("tr-b", tBase + 11 * HOUR_MS, {
+          target: transTarget,
+          firstAt: tBase + 11 * HOUR_MS,
+          lastAt: tBase + 20 * HOUR_MS,
+          count: 2,
+        }),
+        eventFixture("tr-c", tBase + 21 * HOUR_MS, {
+          target: transTarget,
+          firstAt: tBase + 21 * HOUR_MS,
+          lastAt: tBase + 26 * HOUR_MS,
+          count: 2,
+        }),
+      ],
+      burstWindowMs: 1_000,
+    });
+
+    // Trigger near A with burstWindowMs = 2h: bridges A [0, 10h] + B [11h, 20h] (span 20h <= 24h),
+    // but must NOT transitively merge C [21h, 26h] (span 26h > 24h).
+    store.commitEventBatch({
+      events: [eventFixture("tr-bridge", tBase + 9 * HOUR_MS, { target: transTarget })],
+      burstWindowMs: 2 * HOUR_MS,
+    });
+
+    const transAggs = store
+      .recentEvents(0, 20)
+      .filter((event) => event.target === transTarget)
+      .sort((left, right) => left.firstAt - right.firstAt);
+    expect(transAggs).toHaveLength(2);
+    expect(transAggs[0]).toMatchObject({
+      firstAt: tBase,
+      lastAt: tBase + 20 * HOUR_MS,
+      count: 5,
+    });
+    expect(transAggs[1]).toMatchObject({
+      firstAt: tBase + 21 * HOUR_MS,
+      lastAt: tBase + 26 * HOUR_MS,
+      count: 2,
+    });
+  } finally {
     store.close();
     rmSync(root, { recursive: true, force: true });
   }
