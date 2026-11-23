@@ -1422,3 +1422,75 @@ test("journal after-cursor classifies expired or missing cursor stderr as cursor
     whichSpy.mockRestore();
   }
 });
+
+test("journal returns complete JSON lines prefix on 256 KiB byte cap and overflows only when 0 lines fit", async () => {
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockImplementation((cmd) =>
+    cmd === "journalctl" ? "/usr/bin/journalctl" : null,
+  );
+
+  try {
+    // Both cursor-based and initial (--lines=N) journal reads return the complete prefix when >= 1 line fits.
+    for (const after of ["s=abc123;i=1", undefined]) {
+      let spawned: ReturnType<typeof Bun.spawn> | undefined;
+      const script = [
+        `printf '{"__CURSOR":"s=p;i=1","MESSAGE":"one"}\\n{"__CURSOR":"s=p;i=2","MESSAGE":"two"}\\n'`,
+        `printf '{"__CURSOR":"s=p;i=3","MESSAGE":"'`,
+        `head -c 280000 /dev/zero | tr '\\0' 'x'`,
+        `printf '"}\\n'`,
+        `sleep 5`,
+      ].join("; ");
+      const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) => {
+        spawned = realSpawn(
+          ["/bin/sh", "-c", script],
+          options as Parameters<typeof Bun.spawn>[1],
+        );
+        return spawned;
+      }) as typeof Bun.spawn);
+
+      try {
+        const result = await createCommandRunner({ timeoutMs: 2_000 }).run({
+          kind: "journal",
+          after,
+          limit: 50,
+        });
+        expect(result).toEqual({
+          status: "ok",
+          stdout: '{"__CURSOR":"s=p;i=1","MESSAGE":"one"}\n{"__CURSOR":"s=p;i=2","MESSAGE":"two"}',
+          exitCode: 0,
+        });
+        expect(spawned).toBeDefined();
+        const deadline = performance.now() + 500;
+        while (isProcessAlive(spawned!.pid) && performance.now() < deadline) {
+          await Bun.sleep(10);
+        }
+        expect(isProcessAlive(spawned!.pid)).toBe(false);
+      } finally {
+        spawnSpy.mockRestore();
+      }
+    }
+
+    // When 0 complete lines fit under 256 KiB, journal returns overflow.
+    const spawnOverflowSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+      realSpawn(
+        [
+          "/bin/sh",
+          "-c",
+          `head -c 280000 /dev/zero | tr '\\0' 'x'; printf '\\n'`,
+        ],
+        options as Parameters<typeof Bun.spawn>[1],
+      )) as typeof Bun.spawn);
+    try {
+      const overflowed = await createCommandRunner({ timeoutMs: 2_000 }).run({
+        kind: "journal",
+        after: "s=abc123;i=1",
+        limit: 50,
+      });
+      expect(overflowed).toEqual({ status: "overflow" });
+    } finally {
+      spawnOverflowSpy.mockRestore();
+    }
+  } finally {
+    whichSpy.mockRestore();
+  }
+});

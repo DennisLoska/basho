@@ -236,8 +236,28 @@ async function readBoundedJsonLines(
         // Never emit a trailing unterminated/truncated line; only complete newline-delimited records.
         return { text: lines.join("\n"), reachedLimit, complete: !canceled };
       }
+      const prevBytes = bytes;
       bytes += value.byteLength;
       if (bytes > maxBytes) {
+        const remaining = maxBytes - prevBytes;
+        if (remaining > 0) {
+          pending += decoder.decode(value.subarray(0, remaining), { stream: true });
+          let newlineIdx = pending.indexOf("\n");
+          while (newlineIdx !== -1 && lines.length < maxLines) {
+            const line = pending.slice(0, newlineIdx);
+            pending = pending.slice(newlineIdx + 1);
+            if (line.length > 0) {
+              lines.push(line);
+            }
+            newlineIdx = pending.indexOf("\n");
+          }
+        }
+        if (lines.length > 0) {
+          reachedLimit = true;
+          onLimitReached();
+          cancel();
+          return { text: lines.join("\n"), reachedLimit, complete: true };
+        }
         cancel();
         throw new Error("output limit");
       }
@@ -381,7 +401,7 @@ function buildRecipe(request: CommandRequest): BuiltRecipe {
       };
     case "processes":
       return {
-        argv: ["ps", "-eo", "pid=,ppid=,uid=,etimes=,comm="],
+        argv: ["ps", "-eo", "pid=,ppid=,uid=,etimes=,unit=,comm="],
         benignExitCodes: [0],
         includeUserRuntimeEnv: false,
       };
@@ -450,6 +470,7 @@ function buildRecipe(request: CommandRequest): BuiltRecipe {
         ],
         benignExitCodes: [0],
         includeUserRuntimeEnv: false,
+        streamLineLimit: request.limit,
       };
     }
     case "unit": {

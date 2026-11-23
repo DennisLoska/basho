@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { EventMonitor, parseJournalRecord } from "../../src/security/events";
+import { createCommandRunner } from "../../src/security/runner";
 import { SecurityStore } from "../../src/security/store";
 import type {
   Clock,
@@ -221,6 +222,7 @@ describe("parseJournalRecord", () => {
     const oom = parsedEvent(
       jline({
         __CURSOR: "s=oom;i=1",
+        _TRANSPORT: "kernel",
         SYSLOG_IDENTIFIER: "kernel",
         MESSAGE:
           "Out of memory: Killed process 4242 (node) total-vm:1048576kB, anon-rss:524288kB, file-rss:0kB, shmem-rss:0kB",
@@ -574,6 +576,7 @@ describe("EventMonitor.pollJournal", () => {
     const lines = [
       jline({
         __CURSOR: "s=oom;i=1",
+        _TRANSPORT: "kernel",
         SYSLOG_IDENTIFIER: "kernel",
         MESSAGE:
           "Out of memory: Killed process 4242 (node) listening on 0.0.0.0:8188 behind ufw allow from 203.0.113.9",
@@ -1182,6 +1185,429 @@ describe("EventMonitor edge cases", () => {
       } finally {
         store.close();
       }
+    }
+  });
+
+  test("rejects spoofed logger -t sshd and logger -t kernel records while advancing cursor with zero alerts", async () => {
+    const store = memoryStore();
+    const spoofedLines = [
+      // logger -t sshd from unprivileged user
+      ...Array.from({ length: 6 }, (_, index) =>
+        jline({
+          __CURSOR: `s=spoof-ssh;i=${index}`,
+          _TRANSPORT: "syslog",
+          _UID: "1000",
+          _COMM: "logger",
+          SYSLOG_IDENTIFIER: "sshd",
+          MESSAGE: sshFailureMessage(PEER),
+        }),
+      ),
+      // logger -t kernel spoofing UFW BLOCK and OOM kill
+      jline({
+        __CURSOR: "s=spoof-kernel;i=1",
+        _TRANSPORT: "syslog",
+        _UID: "1000",
+        _COMM: "logger",
+        SYSLOG_IDENTIFIER: "kernel",
+        MESSAGE:
+          "[UFW BLOCK] IN=eth0 OUT= MAC=aa:bb:cc:dd:ee:ff SRC=198.51.100.42 DST=192.0.2.10 LEN=60 PROTO=TCP SPT=51234 DPT=8188 SYN",
+      }),
+      jline({
+        __CURSOR: "s=spoof-kernel;i=2",
+        _TRANSPORT: "syslog",
+        _UID: "1000",
+        _COMM: "logger",
+        SYSLOG_IDENTIFIER: "kernel",
+        MESSAGE: "Out of memory: Killed process 4242 (node)",
+      }),
+      // kernel identifier with missing _TRANSPORT must also be rejected
+      JSON.stringify({
+        __CURSOR: "s=spoof-kernel;i=3",
+        __REALTIME_TIMESTAMP: String(NOW * 1000),
+        SYSLOG_IDENTIFIER: "kernel",
+        MESSAGE: "Out of memory: Killed process 4242 (node)",
+      }),
+      // spoofed sudo, polkitd, systemd, pacman via logger / non-root UID
+      jline({
+        __CURSOR: "s=spoof-sudo;i=1",
+        _TRANSPORT: "syslog",
+        _UID: "1000",
+        _COMM: "logger",
+        SYSLOG_IDENTIFIER: "sudo",
+        MESSAGE: "dennis : TTY=pts/0 ; PWD=/home/dennis ; USER=root ; COMMAND=/usr/bin/id",
+      }),
+      jline({
+        __CURSOR: "s=spoof-polkit;i=1",
+        _TRANSPORT: "syslog",
+        _UID: "1000",
+        _COMM: "logger",
+        SYSLOG_IDENTIFIER: "polkitd",
+        MESSAGE: "Operator successfully authenticated to gain authorization",
+      }),
+      jline({
+        __CURSOR: "s=spoof-systemd;i=1",
+        _TRANSPORT: "journal",
+        _UID: "1000",
+        _COMM: "systemd",
+        _SYSTEMD_USER_UNIT: "evil.service",
+        SYSLOG_IDENTIFIER: "systemd",
+        MESSAGE: "backup.service: Failed with result 'exit-code'.",
+      }),
+      jline({
+        __CURSOR: "s=spoof-pacman;i=1",
+        _TRANSPORT: "syslog",
+        _UID: "1000",
+        _COMM: "pacman",
+        SYSLOG_IDENTIFIER: "pacman",
+        MESSAGE: "[ALPM] installed backdoor (1.0-1)",
+      }),
+    ];
+
+    // Unit-level check on parseJournalRecord: cursor returned, no event.
+    for (const line of spoofedLines) {
+      const parsed = parseJournalRecord(line);
+      expect(parsed).not.toBeNull();
+      expect(parsed!.event).toBeUndefined();
+    }
+
+    // Legitimate records with full trusted metadata are still accepted.
+    expect(
+      parseJournalRecord(
+        jline({
+          __CURSOR: "s=legit-ssh;i=1",
+          _TRANSPORT: "syslog",
+          _UID: "0",
+          _COMM: "sshd-session",
+          _SYSTEMD_UNIT: "sshd.service",
+          SYSLOG_IDENTIFIER: "sshd-session",
+          MESSAGE: sshFailureMessage(PEER),
+        }),
+      )?.event?.rule,
+    ).toBe("ssh_auth_failure");
+
+    const runner = runnerStub(() => journalPage(spoofedLines));
+    const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW) });
+
+    try {
+      const result = await monitor.pollJournal();
+      expect(result.alerts).toEqual([]);
+      expect(result.corroboration).toEqual([]);
+      expect(result.coverage).toBe("complete");
+      expect(store.getCursor("journal")).toBe("s=spoof-pacman;i=1");
+      expect(store.recentEvents(0, 50)).toEqual([]);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("deduplicates real 3-line OpenSSH failure sequences per (ip, srcPort) within a batch", async () => {
+    const makeAttempt = (attemptIndex: number, port: number, atMs: number): string[] => [
+      jline({
+        __CURSOR: `s=openssh;a=${attemptIndex};l=1`,
+        __REALTIME_TIMESTAMP: String(atMs * 1000),
+        SYSLOG_IDENTIFIER: "sshd-session",
+        MESSAGE: `Invalid user admin from ${PEER} port ${port}`,
+      }),
+      jline({
+        __CURSOR: `s=openssh;a=${attemptIndex};l=2`,
+        __REALTIME_TIMESTAMP: String((atMs + 10) * 1000),
+        SYSLOG_IDENTIFIER: "sshd-session",
+        MESSAGE: `Failed password for invalid user admin from ${PEER} port ${port} ssh2`,
+      }),
+      jline({
+        __CURSOR: `s=openssh;a=${attemptIndex};l=3`,
+        __REALTIME_TIMESTAMP: String((atMs + 20) * 1000),
+        SYSLOG_IDENTIFIER: "sshd-session",
+        MESSAGE: `Connection closed by authenticating user admin ${PEER} port ${port} [preauth]`,
+      }),
+    ];
+
+    // 2 real attempts = 6 log lines -> must count as 2 and NOT trigger a 5-failure burst.
+    const storeTwo = memoryStore();
+    const twoAttempts = [
+      ...makeAttempt(1, 51001, NOW - 20 * SECOND_MS),
+      ...makeAttempt(2, 51002, NOW - 10 * SECOND_MS),
+    ];
+    try {
+      const monitor = new EventMonitor({
+        store: storeTwo,
+        runner: runnerStub(() => journalPage(twoAttempts)),
+        clock: clockAt(NOW),
+      });
+      const result = await monitor.pollJournal();
+      expect(result.corroboration.some((entry) => entry.rule === "ssh_burst")).toBe(false);
+      expect(result.alerts).toEqual([]);
+      expect(authEventTotal(storeTwo, PEER)).toBe(2);
+    } finally {
+      storeTwo.close();
+    }
+
+    // 5 real attempts = 15 log lines -> must count as 5 and DO trigger a 5-failure burst.
+    const storeFive = memoryStore();
+    const fiveAttempts = Array.from({ length: 5 }, (_, idx) =>
+      makeAttempt(idx + 1, 52000 + idx, NOW - (5 - idx) * 10 * SECOND_MS),
+    ).flat();
+    try {
+      const monitor = new EventMonitor({
+        store: storeFive,
+        runner: runnerStub(() => journalPage(fiveAttempts)),
+        clock: clockAt(NOW),
+      });
+      const result = await monitor.pollJournal();
+      const burst = result.corroboration.find((entry) => entry.rule === "ssh_burst");
+      expect(burst).toBeDefined();
+      expect(burst!.target).toEqual({ kind: "deny_peer_ip", ip: PEER });
+      expect(burst!.eventIds).toHaveLength(5);
+      expect(authEventTotal(storeFive, PEER)).toBe(5);
+    } finally {
+      storeFive.close();
+    }
+  });
+
+  test("commits complete journal prefix and advances cursor when a journal page exceeds 256 KiB", async () => {
+    const store = memoryStore();
+    const realSpawn = Bun.spawn.bind(Bun);
+    const whichSpy = spyOn(Bun, "which").mockImplementation((cmd) =>
+      cmd === "journalctl" ? "/usr/bin/journalctl" : null,
+    );
+
+    // Emit 3 complete valid JSON records (~1 KiB total) followed by a >270 KiB fourth record.
+    const line1 = jline({
+      __CURSOR: "s=over;i=1",
+      MESSAGE: sshFailureMessage(PEER),
+    });
+    const line2 = jline({
+      __CURSOR: "s=over;i=2",
+      MESSAGE: sshFailureMessage(PEER),
+    });
+    const line3 = jline({
+      __CURSOR: "s=over;i=3",
+      MESSAGE: sshFailureMessage(PEER),
+    });
+    const script = [
+      `printf '%s\\n%s\\n%s\\n' '${line1}' '${line2}' '${line3}'`,
+      `printf '{"__CURSOR":"s=over;i=4","__REALTIME_TIMESTAMP":"${NOW * 1000}","MESSAGE":"'`,
+      `head -c 280000 /dev/zero | tr '\\0' 'A'`,
+      `printf '"}\\n'`,
+    ].join("; ");
+
+    const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+      realSpawn(
+        ["/bin/sh", "-c", script],
+        options as Parameters<typeof Bun.spawn>[1],
+      )) as typeof Bun.spawn);
+
+    try {
+      const runner = createCommandRunner({ timeoutMs: 2_000 });
+      const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW) });
+      const result = await monitor.pollJournal();
+
+      expect(result.coverage).toBe("complete");
+      expect(store.getCursor("journal")).toBe("s=over;i=3");
+      expect(authEventTotal(store, PEER)).toBe(3);
+    } finally {
+      spawnSpy.mockRestore();
+      whichSpy.mockRestore();
+      store.close();
+    }
+  });
+
+  test("uses restart-safe socket observation IDs so EventMonitor restarts do not collide in SQLite", async () => {
+    const store = memoryStore();
+    let now = NOW;
+    const clock: Clock = { now: () => now };
+
+    const makeRunner = () => {
+      let poll = 0;
+      return runnerStub(() => {
+        poll += 1;
+        return poll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WILDCARD);
+      });
+    };
+
+    try {
+      const monitor1 = new EventMonitor({ store, runner: makeRunner(), clock });
+      await monitor1.pollSockets(async (listeners) => benignEntries(listeners));
+      const firstOpen = await monitor1.pollSockets(async (listeners) =>
+        unexpectedEntries(listeners),
+      );
+      expect(firstOpen.corroboration).toHaveLength(1);
+      expect(networkEventTotal(store)).toBe(1);
+
+      // Restart EventMonitor on the same SQLite store at a later timestamp.
+      now += 15 * SECOND_MS;
+      const monitor2 = new EventMonitor({ store, runner: makeRunner(), clock });
+      await monitor2.pollSockets(async (listeners) => benignEntries(listeners));
+      const secondOpen = await monitor2.pollSockets(async (listeners) =>
+        unexpectedEntries(listeners),
+      );
+      expect(secondOpen.corroboration).toHaveLength(1);
+      expect(secondOpen.corroboration[0]?.eventIds[0]).not.toBe(
+        firstOpen.corroboration[0]?.eventIds[0],
+      );
+      expect(networkEventTotal(store)).toBe(2);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("verifies systemd unit from 6-column ps output and rejects matching comm in wrong unit", async () => {
+    const workloads: EnrolledWorkload[] = [
+      { id: "comfy", unit: "comfy.service", name: "comfy", ports: [8188] },
+    ];
+
+    // Matching unit in 6-column ps output -> emits pause_workload target.
+    {
+      const store = memoryStore();
+      let socketPoll = 0;
+      const runner = runnerStub((request) => {
+        if (request.kind === "processes") {
+          return ok("  4242     1  1000   120 comfy.service                   comfy\n");
+        }
+        socketPoll += 1;
+        return socketPoll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WORKLOAD);
+      });
+      const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW), workloads });
+      try {
+        await monitor.pollSockets(async (listeners) => benignEntries(listeners));
+        const result = await monitor.pollSockets(async (listeners) =>
+          unexpectedEntries(listeners),
+        );
+        const corroborated = result.corroboration.find(
+          (entry) => entry.rule === "unexpected_workload",
+        );
+        expect(corroborated).toBeDefined();
+        expect(corroborated!.target).toEqual({
+          kind: "pause_workload",
+          workloadId: "comfy",
+          pid: 4242,
+          startedAt: NOW - 120 * 1000,
+        });
+      } finally {
+        store.close();
+      }
+    }
+
+    // Wrong systemd unit or non-unit ("-") with matching comm -> falls back to unexpected_listener.
+    const wrongUnits = [
+      "  4242     1  1000   120 session-2.scope                 comfy\n",
+      "  4242     1  1000   120 user@1000.service               comfy\n",
+      "  4242     1  1000   120 -                               comfy\n",
+    ];
+    for (const psLine of wrongUnits) {
+      const store = memoryStore();
+      let socketPoll = 0;
+      const runner = runnerStub((request) => {
+        if (request.kind === "processes") {
+          return ok(psLine);
+        }
+        socketPoll += 1;
+        return socketPoll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WORKLOAD);
+      });
+      const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW), workloads });
+      try {
+        await monitor.pollSockets(async (listeners) => benignEntries(listeners));
+        const result = await monitor.pollSockets(async (listeners) =>
+          unexpectedEntries(listeners),
+        );
+        expect(result.alerts.length).toBeGreaterThan(0);
+        expect(result.corroboration).toHaveLength(1);
+        expect(result.corroboration[0]?.rule).toBe("unexpected_listener");
+        expect(result.corroboration[0]?.target).toBeUndefined();
+      } finally {
+        store.close();
+      }
+    }
+  });
+
+  test("advances cursor past records with invalid or missing __REALTIME_TIMESTAMP without stalling", async () => {
+    const invalidTsRecord = JSON.stringify({
+      __CURSOR: "s=bad-ts;i=1",
+      __REALTIME_TIMESTAMP: "not-a-timestamp",
+      _TRANSPORT: "syslog",
+      SYSLOG_IDENTIFIER: "sshd",
+      MESSAGE: sshFailureMessage(PEER),
+    });
+    const missingTsRecord = JSON.stringify({
+      __CURSOR: "s=bad-ts;i=2",
+      _TRANSPORT: "syslog",
+      SYSLOG_IDENTIFIER: "sshd",
+      MESSAGE: sshFailureMessage(PEER),
+    });
+    const validFollowingRecord = jline({
+      __CURSOR: "s=bad-ts;i=3",
+      MESSAGE: sshFailureMessage(PEER),
+    });
+
+    expect(parseJournalRecord(invalidTsRecord)).toEqual({ cursor: "s=bad-ts;i=1" });
+    expect(parseJournalRecord(missingTsRecord)).toEqual({ cursor: "s=bad-ts;i=2" });
+
+    const store = memoryStore();
+    const monitor = new EventMonitor({
+      store,
+      runner: runnerStub(() =>
+        journalPage([invalidTsRecord, missingTsRecord, validFollowingRecord]),
+      ),
+      clock: clockAt(NOW),
+    });
+
+    try {
+      const result = await monitor.pollJournal();
+      expect(result.coverage).toBe("complete");
+      expect(store.getCursor("journal")).toBe("s=bad-ts;i=3");
+      expect(authEventTotal(store, PEER)).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("commits journal_cursor_gap and clears expired cursor on empty recovery page without looping", async () => {
+    const store = memoryStore();
+    const requests: CommandRequest[] = [];
+    let stage = 0;
+    const runner = runnerStub((request) => {
+      stage += 1;
+      if (stage === 1) {
+        return journalPage([
+          jline({
+            __CURSOR: "s=expired-empty;i=1",
+            SYSLOG_IDENTIFIER: "cron",
+            MESSAGE: "(root) CMD (true)",
+          }),
+        ]);
+      }
+      if (stage === 2) {
+        expect(request).toEqual({ kind: "journal", after: "s=expired-empty;i=1", limit: 200 });
+        return { status: "cursor_expired" };
+      }
+      if (stage === 3) {
+        expect(request).toEqual({ kind: "journal", after: undefined, limit: 200 });
+        return ok("");
+      }
+      return ok("");
+    }, requests);
+
+    const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW) });
+
+    try {
+      await monitor.pollJournal();
+      expect(store.getCursor("journal")).toBe("s=expired-empty;i=1");
+
+      const recovered = await monitor.pollJournal();
+      expect(recovered.coverage).toBe("partial");
+      expect(store.getCursor("journal")).toBeNull();
+
+      const gapEvent = store
+        .recentEvents(0, 50)
+        .find((event) => event.rule === "journal_cursor_gap");
+      expect(gapEvent).toBeDefined();
+      expect(gapEvent!.severity).toBe("warning");
+
+      // Next poll starts fresh with after: undefined instead of looping on the expired cursor.
+      await monitor.pollJournal();
+      expect(requests[3]).toEqual({ kind: "journal", after: undefined, limit: 200 });
+    } finally {
+      store.close();
     }
   });
 });

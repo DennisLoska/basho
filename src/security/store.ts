@@ -130,7 +130,7 @@ function safeAddCount(left: number | bigint, right: number | bigint, label: stri
 
 export interface EventBatch {
   events: SecurityEvent[];
-  cursor?: { source: string; expected: string | null; next: string };
+  cursor?: { source: string; expected: string | null; next: string | null };
   burstWindowMs: number;
 }
 
@@ -1152,15 +1152,21 @@ export class SecurityStore implements SecurityStoreContract {
       }
 
       if (batch.cursor) {
-        this.db
-          .query(
-            `INSERT INTO source_cursors (source, cursor, updated_at)
-             VALUES (?, ?, ?)
-             ON CONFLICT(source) DO UPDATE SET
-               cursor = excluded.cursor,
-               updated_at = excluded.updated_at`,
-          )
-          .run(batch.cursor.source, batch.cursor.next, Date.now());
+        if (batch.cursor.next === null) {
+          this.db
+            .query("DELETE FROM source_cursors WHERE source = ?")
+            .run(batch.cursor.source);
+        } else {
+          this.db
+            .query(
+              `INSERT INTO source_cursors (source, cursor, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(source) DO UPDATE SET
+                 cursor = excluded.cursor,
+                 updated_at = excluded.updated_at`,
+            )
+            .run(batch.cursor.source, batch.cursor.next, Date.now());
+        }
       }
 
       return true;

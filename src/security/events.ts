@@ -291,6 +291,37 @@ function deterministicJournalGapId(previousCursor: string, nextCursor: string): 
   return `journal:cursor_gap:${digest}`;
 }
 
+function deterministicSocketEventId(
+  nowMs: number,
+  transition: "opened" | "closed",
+  key: string,
+): string {
+  const digest = createHash("sha256")
+    .update(`${nowMs}\0${transition}\0${key}`)
+    .digest("hex")
+    .slice(0, 24);
+  return `socket:${nowMs}:${transition}:${digest}`;
+}
+
+interface SshPeer {
+  ip: string;
+  port?: number;
+}
+
+interface SshDedupeMeta {
+  subtype: "failed_auth" | "companion";
+  peerKey?: string;
+}
+
+interface ClassifiedJournalEvent {
+  event: SecurityEvent;
+  sshMeta?: SshDedupeMeta;
+}
+
+interface InternalParsedJournalRecord extends ParsedJournalRecord {
+  sshMeta?: SshDedupeMeta;
+}
+
 function parseRealtimeTimestampMs(raw: unknown): number | null {
   if (typeof raw === "string") {
     if (!/^\d{1,20}$/.test(raw)) return null;
@@ -304,32 +335,43 @@ function parseRealtimeTimestampMs(raw: unknown): number | null {
   return null;
 }
 
-function extractSshPeerIp(message: string, isAuthenticatingClose: boolean): string | null {
-  const patterns = isAuthenticatingClose
-    ? [
-        /\s([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]{1,32})?)\s+port\s+\d+\b/g,
-        /\bfrom\s+([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]{1,32})?)(?:\s|$)/g,
-      ]
-    : [
-        /\bfrom\s+([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]{1,32})?)\s+port\s+\d+\b/g,
-        /\bfrom\s+([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]{1,32})?)(?:\s|$)/g,
-      ];
+function extractSshPeer(message: string, isAuthenticatingClose: boolean): SshPeer | null {
+  const patternsWithPort = isAuthenticatingClose
+    ? [/\s([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]{1,32})?)\s+port\s+(\d+)\b/g]
+    : [/\bfrom\s+([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]{1,32})?)\s+port\s+(\d+)\b/g];
 
-  for (const pattern of patterns) {
-    let lastCandidate: string | null = null;
+  for (const pattern of patternsWithPort) {
+    let lastCandidate: SshPeer | null = null;
     for (const match of message.matchAll(pattern)) {
       const candidate = match[1];
+      const portRaw = match[2];
       if (!candidate) continue;
       const canonical = canonicalizeIp(candidate);
       if (canonical !== null) {
-        lastCandidate = canonical;
+        const parsedPort = portRaw ? Number(portRaw) : NaN;
+        const port =
+          Number.isInteger(parsedPort) && parsedPort >= 0 && parsedPort <= 65535
+            ? parsedPort
+            : undefined;
+        lastCandidate = port !== undefined ? { ip: canonical, port } : { ip: canonical };
       }
     }
     if (lastCandidate !== null) {
       return lastCandidate;
     }
   }
-  return null;
+
+  const fallbackPattern = /\bfrom\s+([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]{1,32})?)(?:\s|$)/g;
+  let lastIp: string | null = null;
+  for (const match of message.matchAll(fallbackPattern)) {
+    const candidate = match[1];
+    if (!candidate) continue;
+    const canonical = canonicalizeIp(candidate);
+    if (canonical !== null) {
+      lastIp = canonical;
+    }
+  }
+  return lastIp !== null ? { ip: lastIp } : null;
 }
 
 function parseUfwBlockEvent(
@@ -423,76 +465,129 @@ function extractFailedUnitName(
   return "unknown.service";
 }
 
+function verifyTrustedUidRoot(record: Record<string, unknown>): boolean {
+  if (record._UID === undefined) return true;
+  return record._UID === "0";
+}
+
+function verifyTrustedComm(
+  record: Record<string, unknown>,
+  allowedComms: readonly string[],
+): boolean {
+  if (record._COMM === undefined) return true;
+  if (typeof record._COMM !== "string") return false;
+  if (record._COMM === "logger") return false;
+  return allowedComms.includes(record._COMM);
+}
+
+function hasSystemdUserUnit(record: Record<string, unknown>): boolean {
+  return record._SYSTEMD_USER_UNIT !== undefined;
+}
+
+const SSHD_SYSTEMD_UNIT_PATTERN = /^(?:sshd|ssh)(?:@[^/]+)?\.service$/;
+
 function classifyJournalMessage(
   record: Record<string, unknown>,
   cursor: string,
   timestampMs: number,
   message: string,
-): SecurityEvent | undefined {
+): ClassifiedJournalEvent | undefined {
   const identifier =
     typeof record.SYSLOG_IDENTIFIER === "string" ? record.SYSLOG_IDENTIFIER : "";
   const transport = typeof record._TRANSPORT === "string" ? record._TRANSPORT : "";
   const id = deterministicJournalEventId(cursor);
 
-  // 1. SSH authentication failures
-  if (identifier === "sshd" || identifier === "sshd-session") {
-    const isAuthClose = message.includes("Connection closed by authenticating user");
-    const isAuthFailure =
-      isAuthClose ||
-      message.includes("Failed password") ||
-      message.includes("Invalid user") ||
-      message.includes("Failed publickey");
-    if (isAuthFailure) {
-      const peerIp = extractSshPeerIp(message, isAuthClose);
-      if (peerIp !== null) {
-        return {
-          id,
-          source: "journal",
-          category: "auth",
-          severity: "warning",
-          rule: "ssh_auth_failure",
-          target: peerIp,
-          firstAt: timestampMs,
-          lastAt: timestampMs,
-          count: 1,
-          isNoise: false,
-          summary: `SSH authentication failure from ${peerIp}`,
-        };
-      }
+  // 1. Kernel events: UFW blocks and OOM kills (require unforgeable _TRANSPORT === "kernel")
+  if (transport === "kernel") {
+    if (
+      !verifyTrustedUidRoot(record) ||
+      record._COMM !== undefined ||
+      hasSystemdUserUnit(record)
+    ) {
+      return undefined;
     }
-    return undefined;
-  }
-
-  // 2. Kernel events: UFW blocks and OOM kills
-  if (identifier === "kernel" || transport === "kernel") {
     if (message.includes("[UFW BLOCK]")) {
-      return parseUfwBlockEvent(id, timestampMs, message) ?? undefined;
+      const event = parseUfwBlockEvent(id, timestampMs, message);
+      return event ? { event } : undefined;
     }
     if (/\bOut of memory\b/i.test(message) || /\bKilled process\b/.test(message)) {
       const procMatch = /Killed process \d+ \(([^)]+)\)/.exec(message);
       const rawProc = procMatch?.[1]?.trim() ?? "";
       const safeProc = SAFE_PROC_NAME_PATTERN.test(rawProc) ? rawProc : null;
       return {
-        id,
-        source: "journal",
-        category: "units",
-        severity: "critical",
-        rule: "oom_kill",
-        target: safeProc ?? "kernel",
-        firstAt: timestampMs,
-        lastAt: timestampMs,
-        count: 1,
-        isNoise: false,
-        summary: safeProc
-          ? `Kernel OOM killer terminated process ${safeProc}`
-          : "Kernel OOM killer terminated a process",
+        event: {
+          id,
+          source: "journal",
+          category: "units",
+          severity: "critical",
+          rule: "oom_kill",
+          target: safeProc ?? "kernel",
+          firstAt: timestampMs,
+          lastAt: timestampMs,
+          count: 1,
+          isNoise: false,
+          summary: safeProc
+            ? `Kernel OOM killer terminated process ${safeProc}`
+            : "Kernel OOM killer terminated a process",
+        },
       };
+    }
+    return undefined;
+  }
+
+  // 2. SSH authentication failures
+  if (identifier === "sshd" || identifier === "sshd-session") {
+    if (
+      !verifyTrustedUidRoot(record) ||
+      !verifyTrustedComm(record, ["sshd", "sshd-session"]) ||
+      hasSystemdUserUnit(record)
+    ) {
+      return undefined;
+    }
+    if (
+      record._SYSTEMD_UNIT !== undefined &&
+      (typeof record._SYSTEMD_UNIT !== "string" ||
+        !SSHD_SYSTEMD_UNIT_PATTERN.test(record._SYSTEMD_UNIT))
+    ) {
+      return undefined;
+    }
+
+    const isFailedAuth =
+      message.includes("Failed password") || message.includes("Failed publickey");
+    const isAuthClose = message.includes("Connection closed by authenticating user");
+    const isCompanion = !isFailedAuth && (isAuthClose || message.includes("Invalid user"));
+    if (isFailedAuth || isCompanion) {
+      const peer = extractSshPeer(message, isAuthClose);
+      if (peer !== null) {
+        return {
+          event: {
+            id,
+            source: "journal",
+            category: "auth",
+            severity: "warning",
+            rule: "ssh_auth_failure",
+            target: peer.ip,
+            firstAt: timestampMs,
+            lastAt: timestampMs,
+            count: 1,
+            isNoise: false,
+            summary: `SSH authentication failure from ${peer.ip}`,
+          },
+          sshMeta: {
+            subtype: isFailedAuth ? "failed_auth" : "companion",
+            ...(peer.port !== undefined ? { peerKey: `${peer.ip}:${peer.port}` } : {}),
+          },
+        };
+      }
     }
     return undefined;
   }
 
   // 3. Privilege escalations: sudo & polkitd
   if (identifier === "sudo") {
+    if (!verifyTrustedComm(record, ["sudo"])) {
+      return undefined;
+    }
     const isCommand = /\bCOMMAND=/.test(message);
     const isAuthError =
       /authentication failure|incorrect password|user NOT in sudoers/i.test(message);
@@ -505,61 +600,95 @@ function classifyJournalMessage(
         ? rawTargetUser
         : "root";
       return {
-        id,
-        source: "journal",
-        category: "auth",
-        severity: "warning",
-        rule: "sudo_escalation",
-        target: `sudo:${targetUser}`,
-        firstAt: timestampMs,
-        lastAt: timestampMs,
-        count: 1,
-        isNoise: false,
-        summary: isAuthError
-          ? `Sudo authentication failure targeting ${targetUser}`
-          : `Sudo privilege escalation targeting ${targetUser}`,
+        event: {
+          id,
+          source: "journal",
+          category: "auth",
+          severity: "warning",
+          rule: "sudo_escalation",
+          target: `sudo:${targetUser}`,
+          firstAt: timestampMs,
+          lastAt: timestampMs,
+          count: 1,
+          isNoise: false,
+          summary: isAuthError
+            ? `Sudo authentication failure targeting ${targetUser}`
+            : `Sudo privilege escalation targeting ${targetUser}`,
+        },
       };
     }
     return undefined;
   }
 
   if (identifier === "polkitd") {
+    if (
+      !verifyTrustedUidRoot(record) ||
+      !verifyTrustedComm(record, ["polkitd"]) ||
+      hasSystemdUserUnit(record)
+    ) {
+      return undefined;
+    }
+    if (
+      record._SYSTEMD_UNIT !== undefined &&
+      record._SYSTEMD_UNIT !== "polkit.service" &&
+      record._SYSTEMD_UNIT !== "polkitd.service"
+    ) {
+      return undefined;
+    }
     if (/\b(?:authenticated|authorization)\b/i.test(message)) {
       return {
-        id,
-        source: "journal",
-        category: "auth",
-        severity: "warning",
-        rule: "polkit_escalation",
-        target: "polkitd",
-        firstAt: timestampMs,
-        lastAt: timestampMs,
-        count: 1,
-        isNoise: false,
-        summary: "Polkit privilege authorization event recorded",
+        event: {
+          id,
+          source: "journal",
+          category: "auth",
+          severity: "warning",
+          rule: "polkit_escalation",
+          target: "polkitd",
+          firstAt: timestampMs,
+          lastAt: timestampMs,
+          count: 1,
+          isNoise: false,
+          summary: "Polkit privilege authorization event recorded",
+        },
       };
     }
     return undefined;
   }
 
-  // 4. Failed systemd units
+  // 4. Failed systemd units (system manager only)
   if (identifier === "systemd") {
+    if (
+      !verifyTrustedUidRoot(record) ||
+      !verifyTrustedComm(record, ["systemd"]) ||
+      hasSystemdUserUnit(record)
+    ) {
+      return undefined;
+    }
+    if (
+      record._SYSTEMD_UNIT !== undefined &&
+      (typeof record._SYSTEMD_UNIT !== "string" ||
+        !isValidSystemdUnitName(record._SYSTEMD_UNIT))
+    ) {
+      return undefined;
+    }
     if (
       /\bFailed with result\b|\bFailed to start\b|\bEntered failed state\b/i.test(message)
     ) {
       const unitName = extractFailedUnitName(record, message);
       return {
-        id,
-        source: "journal",
-        category: "units",
-        severity: "warning",
-        rule: "unit_failed",
-        target: unitName,
-        firstAt: timestampMs,
-        lastAt: timestampMs,
-        count: 1,
-        isNoise: false,
-        summary: `Systemd unit ${unitName} entered failed state`,
+        event: {
+          id,
+          source: "journal",
+          category: "units",
+          severity: "warning",
+          rule: "unit_failed",
+          target: unitName,
+          firstAt: timestampMs,
+          lastAt: timestampMs,
+          count: 1,
+          isNoise: false,
+          summary: `Systemd unit ${unitName} entered failed state`,
+        },
       };
     }
     return undefined;
@@ -567,22 +696,27 @@ function classifyJournalMessage(
 
   // 5. Pacman package changes
   if (identifier === "pacman" || identifier === "alpm") {
+    if (!verifyTrustedUidRoot(record) || !verifyTrustedComm(record, ["pacman"])) {
+      return undefined;
+    }
     const match = PACMAN_ACTION_PATTERN.exec(message);
     if (match) {
       const action = match[1]!;
       const pkg = match[2]!;
       return {
-        id,
-        source: "journal",
-        category: "packages",
-        severity: "info",
-        rule: `pacman_${action}`,
-        target: pkg,
-        firstAt: timestampMs,
-        lastAt: timestampMs,
-        count: 1,
-        isNoise: false,
-        summary: `Package ${pkg} ${action}`,
+        event: {
+          id,
+          source: "journal",
+          category: "packages",
+          severity: "info",
+          rule: `pacman_${action}`,
+          target: pkg,
+          firstAt: timestampMs,
+          lastAt: timestampMs,
+          count: 1,
+          isNoise: false,
+          summary: `Package ${pkg} ${action}`,
+        },
       };
     }
     return undefined;
@@ -591,7 +725,7 @@ function classifyJournalMessage(
   return undefined;
 }
 
-export function parseJournalRecord(line: string): ParsedJournalRecord | null {
+function parseJournalRecordInternal(line: string): InternalParsedJournalRecord | null {
   if (typeof line !== "string" || line.length === 0) return null;
 
   let parsed: unknown;
@@ -613,17 +747,25 @@ export function parseJournalRecord(line: string): ParsedJournalRecord | null {
 
   const rawTs = record.__REALTIME_TIMESTAMP;
   const timestampMs = rawTs === undefined ? null : parseRealtimeTimestampMs(rawTs);
-  if (rawTs !== undefined && timestampMs === null) {
-    return null;
-  }
 
   const message = typeof record.MESSAGE === "string" ? record.MESSAGE : "";
   if (!message || timestampMs === null) {
     return { cursor };
   }
 
-  const event = classifyJournalMessage(record, cursor, timestampMs, message);
-  return event ? { cursor, event } : { cursor };
+  const classified = classifyJournalMessage(record, cursor, timestampMs, message);
+  if (!classified) {
+    return { cursor };
+  }
+  return classified.sshMeta
+    ? { cursor, event: classified.event, sshMeta: classified.sshMeta }
+    : { cursor, event: classified.event };
+}
+
+export function parseJournalRecord(line: string): ParsedJournalRecord | null {
+  const parsed = parseJournalRecordInternal(line);
+  if (parsed === null) return null;
+  return parsed.event ? { cursor: parsed.cursor, event: parsed.event } : { cursor: parsed.cursor };
 }
 
 // ---------------------------------------------------------------------------
@@ -696,6 +838,7 @@ interface ParsedProcessRow {
   pid: number;
   startedAt: number;
   comm: string;
+  unit?: string;
 }
 
 function parseProcessRows(stdout: string, nowMs: number): Map<number, ParsedProcessRow> {
@@ -707,7 +850,18 @@ function parseProcessRows(stdout: string, nowMs: number): Map<number, ParsedProc
     if (!match) continue;
     const pid = Number(match[1]);
     const etimes = Number(match[2]);
-    const comm = match[3]!.trim();
+    const rest = match[3]!.trim();
+    let unit: string | undefined;
+    let comm = rest;
+    const firstSpace = rest.search(/\s/);
+    if (firstSpace !== -1) {
+      const firstTok = rest.slice(0, firstSpace);
+      const tail = rest.slice(firstSpace).trim();
+      if (tail.length > 0 && (firstTok === "-" || isValidSystemdUnitName(firstTok))) {
+        unit = firstTok;
+        comm = tail;
+      }
+    }
     if (
       !Number.isSafeInteger(pid) ||
       pid <= 0 ||
@@ -721,7 +875,7 @@ function parseProcessRows(stdout: string, nowMs: number): Map<number, ParsedProc
     if (!Number.isSafeInteger(startedAt)) {
       continue;
     }
-    map.set(pid, { pid, startedAt, comm });
+    map.set(pid, unit !== undefined ? { pid, startedAt, comm, unit } : { pid, startedAt, comm });
   }
   return map;
 }
@@ -738,7 +892,6 @@ export class EventMonitor {
 
   private hasSocketBaseline = false;
   private socketBaseline = new Map<string, Listener[]>();
-  private socketPollSeq = 0;
 
   constructor(deps: EventMonitorDeps) {
     this.store = deps.store;
@@ -779,7 +932,7 @@ export class EventMonitor {
       };
     }
 
-    const events: SecurityEvent[] = [];
+    const parsedItems: ClassifiedJournalEvent[] = [];
     let lastCursor: string | null = null;
     let malformed = false;
 
@@ -788,7 +941,7 @@ export class EventMonitor {
         const line = rawLine.trim();
         if (line.length === 0) continue;
 
-        const parsed = parseJournalRecord(line);
+        const parsed = parseJournalRecordInternal(line);
         if (parsed === null) {
           malformed = true;
           break;
@@ -796,13 +949,34 @@ export class EventMonitor {
 
         lastCursor = parsed.cursor;
         if (parsed.event) {
-          events.push(parsed.event);
+          parsedItems.push(
+            parsed.sshMeta ? { event: parsed.event, sshMeta: parsed.sshMeta } : { event: parsed.event },
+          );
         }
       }
     }
 
+    const failedAuthPeerKeys = new Set<string>();
+    for (const item of parsedItems) {
+      if (item.sshMeta?.subtype === "failed_auth" && item.sshMeta.peerKey !== undefined) {
+        failedAuthPeerKeys.add(item.sshMeta.peerKey);
+      }
+    }
+
+    const events: SecurityEvent[] = [];
+    for (const item of parsedItems) {
+      if (
+        item.sshMeta?.subtype === "companion" &&
+        item.sshMeta.peerKey !== undefined &&
+        failedAuthPeerKeys.has(item.sshMeta.peerKey)
+      ) {
+        continue;
+      }
+      events.push(item.event);
+    }
+
     const coverage: Coverage = malformed || cursorRecovered ? "partial" : "complete";
-    if (lastCursor === null) {
+    if (lastCursor === null && !cursorRecovered) {
       return { alerts: [], corroboration: [], coverage };
     }
 
@@ -810,7 +984,7 @@ export class EventMonitor {
     const batchEvents: SecurityEvent[] = cursorRecovered
       ? [
           {
-            id: deterministicJournalGapId(previous!, lastCursor),
+            id: deterministicJournalGapId(previous!, lastCursor ?? ""),
             source: "journal",
             category: "units",
             severity: "warning",
@@ -942,8 +1116,6 @@ export class EventMonitor {
     }
 
     const now = this.clock.now();
-    this.socketPollSeq += 1;
-    const pollSeq = this.socketPollSeq;
 
     const exposureByListenerId = new Map<string, ExposureEntry>();
     const exposureByKey = new Map<string, ExposureEntry[]>();
@@ -997,7 +1169,7 @@ export class EventMonitor {
           isWildcardAddress(entry.listener.address),
       );
 
-      const eventId = `socket:${pollSeq}:opened:${key}`;
+      const eventId = deterministicSocketEventId(now, "opened", key);
       const target = `${primary.protocol}:${primary.address}:${primary.port}`;
       events.push({
         id: eventId,
@@ -1023,7 +1195,8 @@ export class EventMonitor {
           const candidate = table?.get(matchedListener.pid);
           if (
             candidate &&
-            candidate.comm.toLowerCase() === matchedListener.process.trim().toLowerCase()
+            candidate.comm.toLowerCase() === matchedListener.process.trim().toLowerCase() &&
+            (candidate.unit === undefined || candidate.unit === workload.unit.trim())
           ) {
             verifiedProcess = candidate;
           }
@@ -1080,7 +1253,7 @@ export class EventMonitor {
       if (currentNonLoopback.has(key)) continue;
 
       const primary = closedListeners[0]!;
-      const eventId = `socket:${pollSeq}:closed:${key}`;
+      const eventId = deterministicSocketEventId(now, "closed", key);
       const target = `${primary.protocol}:${primary.address}:${primary.port}`;
       events.push({
         id: eventId,

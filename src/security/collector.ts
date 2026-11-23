@@ -1,6 +1,7 @@
 import { constants as fsConstants } from "node:fs";
 import { open, readdir } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { isValidSystemdUnitName } from "./runner";
 import {
   criterionIds,
   type Category,
@@ -2240,7 +2241,17 @@ function parseProcesses(stdout: string, nowMs: number): Map<number, ParsedProces
     const ppid = Number(match[2]);
     const uid = Number(match[3]);
     const etimes = Number(match[4]);
-    const comm = sanitizeProcessComm(match[5]!);
+    const rest = match[5]!.trim();
+    let commRaw = rest;
+    const firstSpace = rest.search(/\s/);
+    if (firstSpace !== -1) {
+      const firstTok = rest.slice(0, firstSpace);
+      const tail = rest.slice(firstSpace).trim();
+      if (tail.length > 0 && (firstTok === "-" || isValidSystemdUnitName(firstTok))) {
+        commRaw = tail;
+      }
+    }
+    const comm = sanitizeProcessComm(commRaw);
     if (!Number.isInteger(pid) || pid <= 0 || comm.length === 0) continue;
     map.set(pid, {
       pid,
