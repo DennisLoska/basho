@@ -3,11 +3,11 @@ import {
   chmodSync,
   closeSync,
   constants,
-  existsSync,
   fchmodSync,
+  lstatSync,
   mkdirSync,
   openSync,
-  statSync,
+  type Stats,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type {
@@ -101,13 +101,24 @@ export interface SecurityStoreContract {
   close(): void;
 }
 
+function lstatIfExists(path: string): Stats | null {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
 function ensurePrivateDatabasePath(dbPath: string): void {
   const resolvedDbPath = resolve(dbPath);
   const parentDir = dirname(resolvedDbPath);
   const dirsToCreate: string[] = [];
   let cursor = parentDir;
 
-  while (!existsSync(cursor)) {
+  while (lstatIfExists(cursor) === null) {
     dirsToCreate.push(cursor);
     const next = dirname(cursor);
     if (next === cursor) break;
@@ -126,7 +137,10 @@ function ensurePrivateDatabasePath(dbPath: string): void {
     }
   }
 
-  const dirStat = statSync(parentDir);
+  const dirStat = lstatSync(parentDir);
+  if (dirStat.isSymbolicLink()) {
+    throw new Error(`SecurityStore state directory must not be a symbolic link: ${parentDir}`);
+  }
   if (!dirStat.isDirectory()) {
     throw new Error(`SecurityStore state path is not a directory: ${parentDir}`);
   }
@@ -137,24 +151,34 @@ function ensurePrivateDatabasePath(dbPath: string): void {
     );
   }
 
-  try {
-    const fd = openSync(
-      resolvedDbPath,
-      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-      0o600,
-    );
+  const existingDbStat = lstatIfExists(resolvedDbPath);
+  if (existingDbStat?.isSymbolicLink()) {
+    throw new Error(`SecurityStore database path must not be a symbolic link: ${resolvedDbPath}`);
+  }
+
+  if (existingDbStat === null) {
     try {
-      fchmodSync(fd, 0o600);
-    } finally {
-      closeSync(fd);
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-      throw error;
+      const fd = openSync(
+        resolvedDbPath,
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+        0o600,
+      );
+      try {
+        fchmodSync(fd, 0o600);
+      } finally {
+        closeSync(fd);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
     }
   }
 
-  const fileStat = statSync(resolvedDbPath);
+  const fileStat = lstatSync(resolvedDbPath);
+  if (fileStat.isSymbolicLink()) {
+    throw new Error(`SecurityStore database path must not be a symbolic link: ${resolvedDbPath}`);
+  }
   if (!fileStat.isFile()) {
     throw new Error(`SecurityStore database path is not a regular file: ${resolvedDbPath}`);
   }
@@ -163,6 +187,26 @@ function ensurePrivateDatabasePath(dbPath: string): void {
     throw new Error(
       `SecurityStore requires a private database file (0600): ${resolvedDbPath} has mode ${modeOctal}`,
     );
+  }
+
+  for (const suffix of ["-wal", "-shm"] as const) {
+    const sidecarPath = `${resolvedDbPath}${suffix}`;
+    const sidecarStat = lstatIfExists(sidecarPath);
+    if (sidecarStat === null) {
+      continue;
+    }
+    if (sidecarStat.isSymbolicLink()) {
+      throw new Error(`SecurityStore sidecar path must not be a symbolic link: ${sidecarPath}`);
+    }
+    if (!sidecarStat.isFile()) {
+      throw new Error(`SecurityStore sidecar path is not a regular file: ${sidecarPath}`);
+    }
+    if ((sidecarStat.mode & 0o077) !== 0) {
+      const modeOctal = (sidecarStat.mode & 0o7777).toString(8).padStart(4, "0");
+      throw new Error(
+        `SecurityStore requires a private sidecar file (0600): ${sidecarPath} has mode ${modeOctal}`,
+      );
+    }
   }
 }
 
@@ -877,32 +921,54 @@ export class SecurityStore implements SecurityStoreContract {
           continue;
         }
 
-        const matchingAggs = findAggregates.all(
-          event.source,
-          event.category,
-          event.rule,
-          event.target,
-          isNoiseInt,
-          event.firstAt - burstWindowMs,
-          event.lastAt + burstWindowMs,
-        ) as SecurityEventRow[];
+        const collectedByRowId = new Map<number, SecurityEventRow>();
+        let mergedFirst = event.firstAt;
+        let mergedLast = event.lastAt;
 
-        if (matchingAggs.length > 0) {
+        while (true) {
+          const prevFirst = mergedFirst;
+          const prevLast = mergedLast;
+          const candidates = findAggregates.all(
+            event.source,
+            event.category,
+            event.rule,
+            event.target,
+            isNoiseInt,
+            mergedFirst - burstWindowMs,
+            mergedLast + burstWindowMs,
+          ) as SecurityEventRow[];
+
+          let added = false;
+          for (const agg of candidates) {
+            if (collectedByRowId.has(agg.row_id)) {
+              continue;
+            }
+            collectedByRowId.set(agg.row_id, agg);
+            added = true;
+            if (agg.first_at < mergedFirst) {
+              mergedFirst = agg.first_at;
+            }
+            if (agg.last_at > mergedLast) {
+              mergedLast = agg.last_at;
+            }
+          }
+
+          if (!added || (mergedFirst === prevFirst && mergedLast === prevLast)) {
+            break;
+          }
+        }
+
+        if (collectedByRowId.size > 0) {
+          const matchingAggs = [...collectedByRowId.values()].sort(
+            (left, right) => left.first_at - right.first_at || left.row_id - right.row_id,
+          );
           const keeper = matchingAggs[0]!;
-          let nextFirstAt = event.firstAt;
-          let nextLastAt = event.lastAt;
           let nextCount = eventCount;
           let nextSeverity: Severity = event.severity;
           let latestAt = -Infinity;
           let latestPayloadJson = payloadJson;
 
           for (const agg of matchingAggs) {
-            if (agg.first_at < nextFirstAt) {
-              nextFirstAt = agg.first_at;
-            }
-            if (agg.last_at > nextLastAt) {
-              nextLastAt = agg.last_at;
-            }
             nextCount += agg.count;
             if (SEVERITY_RANK[agg.severity] > SEVERITY_RANK[nextSeverity]) {
               nextSeverity = agg.severity;
@@ -917,12 +983,12 @@ export class SecurityStore implements SecurityStoreContract {
             latestPayloadJson = payloadJson;
           }
 
-          const nextHourBucket = Math.floor(nextLastAt / HOUR_MS) * HOUR_MS;
+          const nextHourBucket = Math.floor(mergedLast / HOUR_MS) * HOUR_MS;
 
           updateAggregate.run(
             nextSeverity,
-            nextFirstAt,
-            nextLastAt,
+            mergedFirst,
+            mergedLast,
             nextHourBucket,
             nextCount,
             latestPayloadJson,

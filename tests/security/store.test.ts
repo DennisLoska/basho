@@ -1,6 +1,14 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SecurityStore } from "../../src/security/store";
@@ -1559,5 +1567,157 @@ test("prune cascades scan children while keeping actions independent of scan ret
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("file-backed store rejects symlinked database, state directory, and WAL/SHM sidecars before opening SQLite", () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-symlink-"));
+  const outsideDir = mkdtempSync(join(tmpdir(), "basho-symlink-outside-"));
+  try {
+    // 1. Database path is a symlink to a private file outside the state directory.
+    const outsideTarget = join(outsideDir, "outside.db");
+    writeFileSync(outsideTarget, "", { mode: 0o600 });
+    chmodSync(outsideTarget, 0o600);
+    const dbLink = join(root, "state.db");
+    symlinkSync(outsideTarget, dbLink);
+
+    expect(() => new SecurityStore(dbLink)).toThrow(/symbolic link/i);
+    // SQLite must not have been opened against the symlink target.
+    expect(statSync(outsideTarget).size).toBe(0);
+    expect(existsSync(`${dbLink}-wal`)).toBe(false);
+    expect(existsSync(`${outsideTarget}-wal`)).toBe(false);
+
+    // 2. State directory itself is a symlink to another private directory.
+    const dirLink = join(root, "linked-dir");
+    symlinkSync(outsideDir, dirLink);
+    const dbInLinkedDir = join(dirLink, "nested.db");
+    expect(() => new SecurityStore(dbInLinkedDir)).toThrow(/symbolic link/i);
+    expect(existsSync(join(outsideDir, "nested.db"))).toBe(false);
+
+    // 3. WAL or SHM sidecar is a symlink.
+    const realDb = join(root, "real.db");
+    writeFileSync(realDb, "", { mode: 0o600 });
+    chmodSync(realDb, 0o600);
+
+    const walTarget = join(outsideDir, "outside.wal");
+    writeFileSync(walTarget, "", { mode: 0o600 });
+    chmodSync(walTarget, 0o600);
+    symlinkSync(walTarget, `${realDb}-wal`);
+    expect(() => new SecurityStore(realDb)).toThrow(/symbolic link/i);
+    expect(statSync(realDb).size).toBe(0);
+    rmSync(`${realDb}-wal`);
+
+    const shmTarget = join(outsideDir, "outside.shm");
+    writeFileSync(shmTarget, "", { mode: 0o600 });
+    chmodSync(shmTarget, 0o600);
+    symlinkSync(shmTarget, `${realDb}-shm`);
+    expect(() => new SecurityStore(realDb)).toThrow(/symbolic link/i);
+    expect(statSync(realDb).size).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test("commitEventBatch transitively merges chained bursts when a larger burstWindowMs connects A -> B -> C", () => {
+  const store = memoryStore();
+  try {
+    const base = Date.UTC(2026, 3, 20, 10, 0, 0);
+
+    // Three separate bursts created with a tight 1s window, spaced 3s apart:
+    // A at [base + 1_000, base + 1_500] (count 2)
+    // B at [base + 4_500, base + 5_000] (count 2)
+    // C at [base + 8_000, base + 8_500] (count 1)
+    store.commitEventBatch({
+      events: [
+        eventFixture("chain-a1", base + 1_000, { severity: "info", summary: "a1" }),
+        eventFixture("chain-a2", base + 1_500, { severity: "info", summary: "a2" }),
+      ],
+      burstWindowMs: 1_000,
+    });
+    store.commitEventBatch({
+      events: [
+        eventFixture("chain-b1", base + 4_500, { severity: "warning", summary: "b1" }),
+        eventFixture("chain-b2", base + 5_000, { severity: "warning", summary: "b2" }),
+      ],
+      burstWindowMs: 1_000,
+    });
+    store.commitEventBatch({
+      events: [eventFixture("chain-c1", base + 8_000, { severity: "critical", summary: "c1-latest" })],
+      burstWindowMs: 1_000,
+    });
+
+    expect(store.recentEvents(0, 10)).toHaveLength(3);
+
+    // Incoming observation near A with burstWindowMs = 4_000:
+    // Initial window [base - 2_800, base + 5_200] overlaps A and B, NOT C (base + 8_000).
+    // Merging A + B expands mergedLast to base + 5_000; new window reaches base + 9_000,
+    // which transitively connects C.
+    store.commitEventBatch({
+      events: [
+        eventFixture("chain-trigger", base + 1_200, {
+          severity: "info",
+          summary: "trigger-near-a",
+        }),
+      ],
+      burstWindowMs: 4_000,
+    });
+
+    const events = store.recentEvents(0, 10);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      rule: "ssh_burst",
+      target: "198.51.100.42",
+      count: 6,
+      firstAt: base + 1_000,
+      lastAt: base + 8_000,
+      severity: "critical",
+      summary: "c1-latest",
+    });
+
+    // Reverse direction (right-to-left transitive merge) on a separate target:
+    // D at [base + 1_000, base + 1_500], E at [base + 4_500, base + 5_000], F at [base + 8_000, base + 8_500]
+    const reverseTarget = "203.0.113.55";
+    store.commitEventBatch({
+      events: [
+        eventFixture("rev-d1", base + 1_000, { target: reverseTarget, severity: "breach", summary: "d1" }),
+      ],
+      burstWindowMs: 1_000,
+    });
+    store.commitEventBatch({
+      events: [
+        eventFixture("rev-e1", base + 4_500, { target: reverseTarget, severity: "warning", summary: "e1" }),
+      ],
+      burstWindowMs: 1_000,
+    });
+    store.commitEventBatch({
+      events: [
+        eventFixture("rev-f1", base + 8_000, { target: reverseTarget, severity: "info", summary: "f1" }),
+      ],
+      burstWindowMs: 1_000,
+    });
+    store.commitEventBatch({
+      events: [
+        eventFixture("rev-trigger", base + 8_200, {
+          target: reverseTarget,
+          severity: "info",
+          summary: "rev-trigger-latest",
+        }),
+      ],
+      burstWindowMs: 4_000,
+    });
+
+    const revEvents = store.recentEvents(0, 10).filter((event) => event.target === reverseTarget);
+    expect(revEvents).toHaveLength(1);
+    expect(revEvents[0]).toMatchObject({
+      target: reverseTarget,
+      count: 4,
+      firstAt: base + 1_000,
+      lastAt: base + 8_200,
+      severity: "breach",
+      summary: "rev-trigger-latest",
+    });
+  } finally {
+    store.close();
   }
 });
