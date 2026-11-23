@@ -12,6 +12,10 @@ _Avoid_: System health dump, audit blob
 The deterministic read-only component that gathers host facts through allowlisted commands and config files to produce a `PostureSnapshot`, `ExposureEntry` inventory, and deterministic `SecurityFinding` records.
 _Avoid_: Host scanner, audit runner, collector daemon
 
+**EventMonitor**:
+The continuous polling component that ingests bounded journald streams and listening socket diffs into `SecurityEvent` batches, emitting `SecurityAlert` notices and expiring `Corroboration` signals.
+_Avoid_: Log tailer, socket watcher, daemon loop
+
 **SecurityEvent**:
 A normalized host observation bound to a source, category, severity, and timestamp, optionally aggregating repeated equivalent occurrences into a count.
 _Avoid_: Raw log line, breach

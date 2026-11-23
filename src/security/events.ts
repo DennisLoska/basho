@@ -1,0 +1,1071 @@
+import { createHash } from "node:crypto";
+import { parseListeners } from "./collector";
+import { isValidJournalCursor, isValidSystemdUnitName } from "./runner";
+import type { SecurityStoreContract } from "./store";
+import type {
+  Clock,
+  CommandRunner,
+  Corroboration,
+  Coverage,
+  EnrolledWorkload,
+  ExposureEntry,
+  Listener,
+  SecurityAlert,
+  SecurityEvent,
+} from "./types";
+
+const JOURNAL_PAGE_LIMIT = 200;
+const BURST_WINDOW_MS = 300_000;
+const SSH_BURST_THRESHOLD = 5;
+const MAX_TRACKED_SSH_PEERS = 5_000;
+const MAX_OBSERVATIONS_PER_PEER = 500;
+
+const SYSTEMD_UNIT_SUFFIXES = [
+  ".service",
+  ".socket",
+  ".device",
+  ".mount",
+  ".automount",
+  ".swap",
+  ".target",
+  ".path",
+  ".timer",
+  ".slice",
+  ".scope",
+] as const;
+
+const SAFE_PROC_NAME_PATTERN = /^[A-Za-z0-9._-]{1,32}$/;
+const SAFE_USER_NAME_PATTERN = /^[A-Za-z0-9._-]{1,32}$/;
+const SAFE_PROTO_PATTERN = /^[A-Za-z0-9]{1,16}$/;
+const PACMAN_ACTION_PATTERN =
+  /^(?:\[ALPM\]\s+)?(installed|upgraded|removed|downgraded)\s+([A-Za-z0-9@._+-]{1,128})(?:\s|$)/;
+
+const HIGH_SIGNAL_JOURNAL_RULES = new Set([
+  "oom_kill",
+  "sudo_escalation",
+  "polkit_escalation",
+  "unit_failed",
+]);
+
+const SYSTEM_ANOMALY_RULES = new Set(["oom_kill", "unit_failed"]);
+
+export interface MonitorResult {
+  alerts: SecurityAlert[];
+  corroboration: Corroboration[];
+  coverage: Coverage;
+}
+
+export interface EventMonitorDeps {
+  store: SecurityStoreContract;
+  runner: CommandRunner;
+  clock: Clock;
+  workloads?: readonly EnrolledWorkload[];
+}
+
+export interface ParsedJournalRecord {
+  cursor: string;
+  event?: SecurityEvent;
+}
+
+// ---------------------------------------------------------------------------
+// IP parsing, RFC 5952 canonicalization, and range classification
+// ---------------------------------------------------------------------------
+
+function parseIpv4ToUint32(ip: string): number | null {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let value = 0;
+  for (const part of parts) {
+    if (!/^(?:0|[1-9]\d{0,2})$/.test(part)) return null;
+    const octet = Number(part);
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null;
+    value = (value << 8) | octet;
+  }
+  return value >>> 0;
+}
+
+function uint32ToIpv4(value: number): string {
+  return [
+    (value >>> 24) & 0xff,
+    (value >>> 16) & 0xff,
+    (value >>> 8) & 0xff,
+    value & 0xff,
+  ].join(".");
+}
+
+function parseIpv6Groups(raw: string): number[] | null {
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed || !trimmed.includes(":")) return null;
+
+  const parseSegment = (segment: string): number[] | null => {
+    if (segment.length === 0) return [];
+    const tokens = segment.split(":");
+    const groups: number[] = [];
+    for (let i = 0; i < tokens.length; i += 1) {
+      const tok = tokens[i]!;
+      if (tok.includes(".")) {
+        if (i !== tokens.length - 1) return null;
+        const v4 = parseIpv4ToUint32(tok);
+        if (v4 === null) return null;
+        groups.push((v4 >>> 16) & 0xffff, v4 & 0xffff);
+      } else {
+        if (!/^[0-9a-f]{1,4}$/.test(tok)) return null;
+        groups.push(Number.parseInt(tok, 16));
+      }
+    }
+    return groups;
+  };
+
+  const doubleColonParts = trimmed.split("::");
+  if (doubleColonParts.length > 2) return null;
+
+  if (doubleColonParts.length === 2) {
+    const left = parseSegment(doubleColonParts[0]!);
+    const right = parseSegment(doubleColonParts[1]!);
+    if (!left || !right) return null;
+    const missing = 8 - (left.length + right.length);
+    if (missing < 1) return null;
+    return [...left, ...Array<number>(missing).fill(0), ...right];
+  }
+
+  const parsed = parseSegment(trimmed);
+  if (!parsed || parsed.length !== 8) return null;
+  return parsed;
+}
+
+function formatCanonicalIpv6(groups: readonly number[]): string {
+  let bestStart = -1;
+  let bestLen = 0;
+  let runStart = -1;
+  let runLen = 0;
+
+  for (let i = 0; i < groups.length; i += 1) {
+    if (groups[i] === 0) {
+      if (runStart === -1) {
+        runStart = i;
+        runLen = 1;
+      } else {
+        runLen += 1;
+      }
+      if (runLen > bestLen) {
+        bestStart = runStart;
+        bestLen = runLen;
+      }
+    } else {
+      runStart = -1;
+      runLen = 0;
+    }
+  }
+
+  // RFC 5952 section 4.2.2: do not compress a single zero field.
+  if (bestLen < 2) {
+    return groups.map((g) => g.toString(16)).join(":");
+  }
+
+  const left = groups
+    .slice(0, bestStart)
+    .map((g) => g.toString(16))
+    .join(":");
+  const right = groups
+    .slice(bestStart + bestLen)
+    .map((g) => g.toString(16))
+    .join(":");
+  return `${left}::${right}`;
+}
+
+function canonicalizeIp(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128) return null;
+
+  const zoneIdx = trimmed.indexOf("%");
+  let addrPart = trimmed;
+  if (zoneIdx !== -1) {
+    const zone = trimmed.slice(zoneIdx + 1);
+    if (!/^[A-Za-z0-9_.-]{1,32}$/.test(zone)) return null;
+    addrPart = trimmed.slice(0, zoneIdx);
+  }
+
+  const v4 = parseIpv4ToUint32(addrPart);
+  if (v4 !== null) {
+    return uint32ToIpv4(v4);
+  }
+
+  const groups = parseIpv6Groups(addrPart);
+  if (!groups) return null;
+
+  // Unwrap IPv4-mapped IPv6 addresses (::ffff:0:0/96) to canonical IPv4.
+  if (
+    groups[0] === 0 &&
+    groups[1] === 0 &&
+    groups[2] === 0 &&
+    groups[3] === 0 &&
+    groups[4] === 0 &&
+    groups[5] === 0xffff
+  ) {
+    const mappedV4 = (((groups[6]! << 16) | groups[7]!) >>> 0);
+    return uint32ToIpv4(mappedV4);
+  }
+
+  return formatCanonicalIpv6(groups);
+}
+
+function ipv6GroupsToBigInt(groups: readonly number[]): bigint {
+  let value = 0n;
+  for (const g of groups) {
+    value = (value << 16n) | BigInt(g);
+  }
+  return value;
+}
+
+function isLoopbackIp(canonicalIp: string): boolean {
+  const v4 = parseIpv4ToUint32(canonicalIp);
+  if (v4 !== null) {
+    return ((v4 >>> 24) & 0xff) === 127;
+  }
+  const groups = parseIpv6Groups(canonicalIp);
+  if (groups) {
+    return ipv6GroupsToBigInt(groups) === 1n;
+  }
+  return false;
+}
+
+function isMulticastIp(canonicalIp: string): boolean {
+  const v4 = parseIpv4ToUint32(canonicalIp);
+  if (v4 !== null) {
+    // 224.0.0.0/4
+    return ((v4 & 0xf0000000) >>> 0) === 0xe0000000;
+  }
+  const groups = parseIpv6Groups(canonicalIp);
+  if (groups) {
+    // ff00::/8
+    return (groups[0]! & 0xff00) === 0xff00;
+  }
+  return false;
+}
+
+function isTailnetIp(canonicalIp: string): boolean {
+  const v4 = parseIpv4ToUint32(canonicalIp);
+  if (v4 !== null) {
+    // Tailscale CGNAT: 100.64.0.0/10
+    return ((v4 & 0xffc00000) >>> 0) === 0x64400000;
+  }
+  const groups = parseIpv6Groups(canonicalIp);
+  if (groups) {
+    // Tailscale ULA: fd7a:115c:a1e0::/48
+    return groups[0] === 0xfd7a && groups[1] === 0x115c && groups[2] === 0xa1e0;
+  }
+  return false;
+}
+
+function isUnspecifiedIp(canonicalIp: string): boolean {
+  if (canonicalIp === "0.0.0.0" || canonicalIp === "::") return true;
+  const v4 = parseIpv4ToUint32(canonicalIp);
+  if (v4 !== null) return v4 === 0;
+  const groups = parseIpv6Groups(canonicalIp);
+  if (groups) return ipv6GroupsToBigInt(groups) === 0n;
+  return false;
+}
+
+function isProtectedPeerIp(canonicalIp: string): boolean {
+  return (
+    isLoopbackIp(canonicalIp) ||
+    isTailnetIp(canonicalIp) ||
+    isUnspecifiedIp(canonicalIp)
+  );
+}
+
+function isWildcardAddress(address: string): boolean {
+  if (address === "*") return true;
+  const canonical = canonicalizeIp(address);
+  return canonical === "0.0.0.0" || canonical === "::";
+}
+
+function isLoopbackListener(listener: Listener): boolean {
+  if (listener.address === "*") return false;
+  const canonical = canonicalizeIp(listener.address);
+  return canonical !== null && isLoopbackIp(canonical);
+}
+
+// ---------------------------------------------------------------------------
+// Journal record parsing
+// ---------------------------------------------------------------------------
+
+function deterministicJournalEventId(cursor: string): string {
+  const digest = createHash("sha256").update(cursor).digest("hex").slice(0, 24);
+  return `journal:${digest}`;
+}
+
+function parseRealtimeTimestampMs(raw: unknown): number | null {
+  if (typeof raw === "string") {
+    if (!/^\d{1,20}$/.test(raw)) return null;
+    const ms = Number(BigInt(raw) / 1000n);
+    return Number.isSafeInteger(ms) && ms >= 0 ? ms : null;
+  }
+  if (typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0) {
+    const ms = Math.floor(raw / 1000);
+    return Number.isSafeInteger(ms) && ms >= 0 ? ms : null;
+  }
+  return null;
+}
+
+function extractSshPeerIp(message: string, isAuthenticatingClose: boolean): string | null {
+  const patterns = isAuthenticatingClose
+    ? [
+        /\s([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]{1,32})?)\s+port\s+\d+\b/g,
+        /\bfrom\s+([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]{1,32})?)(?:\s|$)/g,
+      ]
+    : [
+        /\bfrom\s+([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]{1,32})?)\s+port\s+\d+\b/g,
+        /\bfrom\s+([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]{1,32})?)(?:\s|$)/g,
+      ];
+
+  for (const pattern of patterns) {
+    let lastCandidate: string | null = null;
+    for (const match of message.matchAll(pattern)) {
+      const candidate = match[1];
+      if (!candidate) continue;
+      const canonical = canonicalizeIp(candidate);
+      if (canonical !== null) {
+        lastCandidate = canonical;
+      }
+    }
+    if (lastCandidate !== null) {
+      return lastCandidate;
+    }
+  }
+  return null;
+}
+
+function parseUfwBlockEvent(
+  id: string,
+  timestampMs: number,
+  message: string,
+): SecurityEvent | null {
+  const markerIndex = message.indexOf("[UFW BLOCK]");
+  if (markerIndex === -1) return null;
+
+  const rest = message.slice(markerIndex + "[UFW BLOCK]".length);
+  let srcRaw: string | undefined;
+  let dstRaw: string | undefined;
+  let dptRaw: string | undefined;
+  let protoRaw: string | undefined;
+
+  for (const token of rest.split(/\s+/)) {
+    if (!token) continue;
+    const eqIdx = token.indexOf("=");
+    if (eqIdx <= 0) continue;
+    const key = token.slice(0, eqIdx);
+    const val = token.slice(eqIdx + 1);
+    if (!val) continue;
+    if (key === "SRC" && srcRaw === undefined) srcRaw = val;
+    else if (key === "DST" && dstRaw === undefined) dstRaw = val;
+    else if (key === "DPT" && dptRaw === undefined) dptRaw = val;
+    else if (key === "PROTO" && protoRaw === undefined) protoRaw = val;
+  }
+
+  if (!srcRaw || !dstRaw) return null;
+  const srcIp = canonicalizeIp(srcRaw);
+  const dstIp = canonicalizeIp(dstRaw);
+  if (!srcIp || !dstIp) return null;
+
+  const proto =
+    protoRaw && SAFE_PROTO_PATTERN.test(protoRaw) ? protoRaw.toUpperCase() : "UNKNOWN";
+
+  let port: number | null = null;
+  if (dptRaw && /^\d{1,5}$/.test(dptRaw)) {
+    const parsedPort = Number(dptRaw);
+    if (Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535) {
+      port = parsedPort;
+    }
+  }
+
+  const isNoise = isMulticastIp(dstIp) || isLoopbackIp(srcIp) || isLoopbackIp(dstIp);
+  const summary =
+    port !== null
+      ? `UFW blocked ${proto} traffic from ${srcIp} to port ${port}`
+      : `UFW blocked ${proto} traffic from ${srcIp}`;
+
+  return {
+    id,
+    source: "journal",
+    category: "firewall",
+    severity: "info",
+    rule: "ufw_block",
+    target: srcIp,
+    firstAt: timestampMs,
+    lastAt: timestampMs,
+    count: 1,
+    isNoise,
+    summary,
+  };
+}
+
+function extractFailedUnitName(
+  record: Record<string, unknown>,
+  message: string,
+): string {
+  const candidates: unknown[] = [record.UNIT, record._SYSTEMD_UNIT];
+  for (const candidate of candidates) {
+    if (
+      typeof candidate === "string" &&
+      candidate !== "init.scope" &&
+      isValidSystemdUnitName(candidate)
+    ) {
+      return candidate;
+    }
+  }
+
+  const colonIdx = message.indexOf(":");
+  if (colonIdx > 0) {
+    const prefix = message.slice(0, colonIdx).trim();
+    if (isValidSystemdUnitName(prefix)) {
+      return prefix;
+    }
+  }
+
+  return "unknown.service";
+}
+
+function classifyJournalMessage(
+  record: Record<string, unknown>,
+  cursor: string,
+  timestampMs: number,
+  message: string,
+): SecurityEvent | undefined {
+  const identifier =
+    typeof record.SYSLOG_IDENTIFIER === "string" ? record.SYSLOG_IDENTIFIER : "";
+  const transport = typeof record._TRANSPORT === "string" ? record._TRANSPORT : "";
+  const id = deterministicJournalEventId(cursor);
+
+  // 1. SSH authentication failures
+  if (identifier === "sshd" || identifier === "sshd-session") {
+    const isAuthClose = message.includes("Connection closed by authenticating user");
+    const isAuthFailure =
+      isAuthClose ||
+      message.includes("Failed password") ||
+      message.includes("Invalid user") ||
+      message.includes("Failed publickey");
+    if (isAuthFailure) {
+      const peerIp = extractSshPeerIp(message, isAuthClose);
+      if (peerIp !== null) {
+        return {
+          id,
+          source: "journal",
+          category: "auth",
+          severity: "warning",
+          rule: "ssh_auth_failure",
+          target: peerIp,
+          firstAt: timestampMs,
+          lastAt: timestampMs,
+          count: 1,
+          isNoise: false,
+          summary: `SSH authentication failure from ${peerIp}`,
+        };
+      }
+    }
+    return undefined;
+  }
+
+  // 2. Kernel events: UFW blocks and OOM kills
+  if (identifier === "kernel" || transport === "kernel") {
+    if (message.includes("[UFW BLOCK]")) {
+      return parseUfwBlockEvent(id, timestampMs, message) ?? undefined;
+    }
+    if (/\bOut of memory\b/i.test(message) || /\bKilled process\b/.test(message)) {
+      const procMatch = /Killed process \d+ \(([^)]+)\)/.exec(message);
+      const rawProc = procMatch?.[1]?.trim() ?? "";
+      const safeProc = SAFE_PROC_NAME_PATTERN.test(rawProc) ? rawProc : null;
+      return {
+        id,
+        source: "journal",
+        category: "units",
+        severity: "critical",
+        rule: "oom_kill",
+        target: safeProc ?? "kernel",
+        firstAt: timestampMs,
+        lastAt: timestampMs,
+        count: 1,
+        isNoise: false,
+        summary: safeProc
+          ? `Kernel OOM killer terminated process ${safeProc}`
+          : "Kernel OOM killer terminated a process",
+      };
+    }
+    return undefined;
+  }
+
+  // 3. Privilege escalations: sudo & polkitd
+  if (identifier === "sudo") {
+    const isCommand = /\bCOMMAND=/.test(message);
+    const isAuthError =
+      /authentication failure|incorrect password|user NOT in sudoers/i.test(message);
+    if (isCommand || isAuthError) {
+      const commandIdx = message.indexOf("COMMAND=");
+      const headerPart = commandIdx >= 0 ? message.slice(0, commandIdx) : message;
+      const userMatch = /\bUSER=([A-Za-z0-9._-]{1,32})\b/.exec(headerPart);
+      const rawTargetUser = userMatch?.[1] ?? "root";
+      const targetUser = SAFE_USER_NAME_PATTERN.test(rawTargetUser)
+        ? rawTargetUser
+        : "root";
+      return {
+        id,
+        source: "journal",
+        category: "auth",
+        severity: "warning",
+        rule: "sudo_escalation",
+        target: `sudo:${targetUser}`,
+        firstAt: timestampMs,
+        lastAt: timestampMs,
+        count: 1,
+        isNoise: false,
+        summary: isAuthError
+          ? `Sudo authentication failure targeting ${targetUser}`
+          : `Sudo privilege escalation targeting ${targetUser}`,
+      };
+    }
+    return undefined;
+  }
+
+  if (identifier === "polkitd") {
+    if (/\b(?:authenticated|authorization)\b/i.test(message)) {
+      return {
+        id,
+        source: "journal",
+        category: "auth",
+        severity: "warning",
+        rule: "polkit_escalation",
+        target: "polkitd",
+        firstAt: timestampMs,
+        lastAt: timestampMs,
+        count: 1,
+        isNoise: false,
+        summary: "Polkit privilege authorization event recorded",
+      };
+    }
+    return undefined;
+  }
+
+  // 4. Failed systemd units
+  if (identifier === "systemd") {
+    if (
+      /\bFailed with result\b|\bFailed to start\b|\bEntered failed state\b/i.test(message)
+    ) {
+      const unitName = extractFailedUnitName(record, message);
+      return {
+        id,
+        source: "journal",
+        category: "units",
+        severity: "warning",
+        rule: "unit_failed",
+        target: unitName,
+        firstAt: timestampMs,
+        lastAt: timestampMs,
+        count: 1,
+        isNoise: false,
+        summary: `Systemd unit ${unitName} entered failed state`,
+      };
+    }
+    return undefined;
+  }
+
+  // 5. Pacman package changes
+  if (identifier === "pacman" || identifier === "alpm") {
+    const match = PACMAN_ACTION_PATTERN.exec(message);
+    if (match) {
+      const action = match[1]!;
+      const pkg = match[2]!;
+      return {
+        id,
+        source: "journal",
+        category: "packages",
+        severity: "info",
+        rule: `pacman_${action}`,
+        target: pkg,
+        firstAt: timestampMs,
+        lastAt: timestampMs,
+        count: 1,
+        isNoise: false,
+        summary: `Package ${pkg} ${action}`,
+      };
+    }
+    return undefined;
+  }
+
+  return undefined;
+}
+
+export function parseJournalRecord(line: string): ParsedJournalRecord | null {
+  if (typeof line !== "string" || line.length === 0) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const cursor = record.__CURSOR;
+  if (typeof cursor !== "string" || !isValidJournalCursor(cursor)) {
+    return null;
+  }
+
+  const rawTs = record.__REALTIME_TIMESTAMP;
+  const timestampMs = rawTs === undefined ? null : parseRealtimeTimestampMs(rawTs);
+  if (rawTs !== undefined && timestampMs === null) {
+    return null;
+  }
+
+  const message = typeof record.MESSAGE === "string" ? record.MESSAGE : "";
+  if (!message || timestampMs === null) {
+    return { cursor };
+  }
+
+  const event = classifyJournalMessage(record, cursor, timestampMs, message);
+  return event ? { cursor, event } : { cursor };
+}
+
+// ---------------------------------------------------------------------------
+// Listener keying & workload identity matching
+// ---------------------------------------------------------------------------
+
+function listenerKey(listener: Listener): string {
+  const addr =
+    listener.address === "*" ? "*" : (canonicalizeIp(listener.address) ?? listener.address);
+  return `${listener.family}|${listener.protocol}|${addr}|${listener.interfaceName ?? ""}|${listener.port}`;
+}
+
+function unitStem(unit: string): string {
+  let base = unit.trim();
+  for (const suffix of SYSTEMD_UNIT_SUFFIXES) {
+    if (base.endsWith(suffix)) {
+      base = base.slice(0, -suffix.length);
+      break;
+    }
+  }
+  const atIdx = base.indexOf("@");
+  if (atIdx > 0) {
+    base = base.slice(0, atIdx);
+  }
+  return base.toLowerCase();
+}
+
+function matchEnrolledWorkload(
+  listener: Listener,
+  workloads: readonly EnrolledWorkload[],
+): EnrolledWorkload | null {
+  if (
+    workloads.length === 0 ||
+    listener.pid === undefined ||
+    !Number.isInteger(listener.pid) ||
+    listener.pid <= 0 ||
+    !listener.process
+  ) {
+    return null;
+  }
+
+  const proc = listener.process.trim().toLowerCase();
+  if (!proc) return null;
+
+  const matches: EnrolledWorkload[] = [];
+  for (const workload of workloads) {
+    const names = new Set<string>();
+    const idNorm = workload.id.trim().toLowerCase();
+    if (idNorm) names.add(idNorm);
+    const nameNorm = workload.name?.trim().toLowerCase();
+    if (nameNorm) names.add(nameNorm);
+    const stem = unitStem(workload.unit);
+    if (stem) names.add(stem);
+
+    if (!names.has(proc)) {
+      continue;
+    }
+
+    if (workload.ports && workload.ports.length > 0 && !workload.ports.includes(listener.port)) {
+      continue;
+    }
+
+    matches.push(workload);
+  }
+
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+// ---------------------------------------------------------------------------
+// EventMonitor
+// ---------------------------------------------------------------------------
+
+export class EventMonitor {
+  private readonly store: SecurityStoreContract;
+  private readonly runner: CommandRunner;
+  private readonly clock: Clock;
+  private readonly workloads: readonly EnrolledWorkload[];
+
+  /** Exact SSH auth failure observations per canonical peer IP: peerIp -> (eventId -> timestampMs). */
+  private readonly sshObservations = new Map<string, Map<string, number>>();
+  private hasSocketBaseline = false;
+  private socketBaseline = new Map<string, Listener[]>();
+  private socketPollSeq = 0;
+
+  constructor(deps: EventMonitorDeps) {
+    this.store = deps.store;
+    this.runner = deps.runner;
+    this.clock = deps.clock;
+    this.workloads = deps.workloads ? [...deps.workloads] : [];
+  }
+
+  async pollJournal(signal?: AbortSignal): Promise<MonitorResult> {
+    const previous = this.store.getCursor("journal");
+    const result = await this.runner.run(
+      {
+        kind: "journal",
+        after: previous ?? undefined,
+        limit: JOURNAL_PAGE_LIMIT,
+      },
+      signal,
+    );
+
+    if (result.status !== "ok") {
+      return {
+        alerts: [],
+        corroboration: [],
+        coverage: result.status === "unavailable" ? "unavailable" : "partial",
+      };
+    }
+
+    const events: SecurityEvent[] = [];
+    let lastCursor: string | null = null;
+    let malformed = false;
+
+    if (result.stdout.length > 0) {
+      for (const rawLine of result.stdout.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (line.length === 0) continue;
+
+        const parsed = parseJournalRecord(line);
+        if (parsed === null) {
+          malformed = true;
+          break;
+        }
+
+        lastCursor = parsed.cursor;
+        if (parsed.event) {
+          events.push(parsed.event);
+        }
+      }
+    }
+
+    const coverage: Coverage = malformed ? "partial" : "complete";
+    if (lastCursor === null) {
+      return { alerts: [], corroboration: [], coverage };
+    }
+
+    const committed = this.store.commitEventBatch({
+      events,
+      cursor: {
+        source: "journal",
+        expected: previous,
+        next: lastCursor,
+      },
+      burstWindowMs: BURST_WINDOW_MS,
+    });
+
+    if (!committed) {
+      return { alerts: [], corroboration: [], coverage: "partial" };
+    }
+
+    const now = this.clock.now();
+    const windowStart = now - BURST_WINDOW_MS;
+    const alerts: SecurityAlert[] = [];
+    const seenAlertFingerprints = new Set<string>();
+    const corroboration: Corroboration[] = [];
+    const affectedSshPeers = new Set<string>();
+    const anomalyEventIds: string[] = [];
+
+    for (const event of events) {
+      if (event.rule === "ssh_auth_failure") {
+        this.recordSshObservation(event.target, event.id, event.lastAt);
+        affectedSshPeers.add(event.target);
+        continue;
+      }
+
+      if (HIGH_SIGNAL_JOURNAL_RULES.has(event.rule)) {
+        const fingerprint = `journal:${event.rule}:${event.target}`;
+        if (!seenAlertFingerprints.has(fingerprint)) {
+          seenAlertFingerprints.add(fingerprint);
+          alerts.push({
+            id: `alert:${event.id}`,
+            fingerprint,
+            severity: event.severity,
+            summary: event.summary,
+            createdAt: now,
+          });
+        }
+        if (SYSTEM_ANOMALY_RULES.has(event.rule)) {
+          anomalyEventIds.push(event.id);
+        }
+      }
+    }
+
+    this.pruneSshObservations(windowStart);
+
+    for (const peer of affectedSshPeers) {
+      if (isProtectedPeerIp(peer)) continue;
+      const peerObs = this.sshObservations.get(peer);
+      if (!peerObs) continue;
+
+      const inWindowIds: string[] = [];
+      for (const [eventId, at] of peerObs.entries()) {
+        if (at >= windowStart && at <= now) {
+          inWindowIds.push(eventId);
+        }
+      }
+
+      if (inWindowIds.length >= SSH_BURST_THRESHOLD) {
+        corroboration.push({
+          rule: "ssh_burst",
+          eventIds: inWindowIds,
+          expiresAt: now + BURST_WINDOW_MS,
+          target: { kind: "deny_peer_ip", ip: peer },
+        });
+
+        const fingerprint = `ssh_burst:${peer}`;
+        if (!seenAlertFingerprints.has(fingerprint)) {
+          seenAlertFingerprints.add(fingerprint);
+          alerts.push({
+            id: `alert:ssh_burst:${peer}:${now}`,
+            fingerprint,
+            severity: "critical",
+            summary: `SSH authentication failure burst from ${peer} (${inWindowIds.length} failures in 5m)`,
+            createdAt: now,
+          });
+        }
+      }
+    }
+
+    if (anomalyEventIds.length > 0) {
+      corroboration.push({
+        rule: "system_anomaly",
+        eventIds: anomalyEventIds,
+        expiresAt: now + BURST_WINDOW_MS,
+      });
+    }
+
+    return { alerts, corroboration, coverage };
+  }
+
+  async pollSockets(
+    classify: (listeners: Listener[]) => Promise<ExposureEntry[]> | ExposureEntry[],
+    signal?: AbortSignal,
+  ): Promise<MonitorResult> {
+    const result = await this.runner.run({ kind: "sockets" }, signal);
+    if (result.status !== "ok") {
+      return { alerts: [], corroboration: [], coverage: "unavailable" };
+    }
+
+    const listeners = parseListeners(result.stdout);
+    const currentNonLoopback = new Map<string, Listener[]>();
+    for (const listener of listeners) {
+      if (isLoopbackListener(listener)) continue;
+      const key = listenerKey(listener);
+      const existing = currentNonLoopback.get(key);
+      if (existing) {
+        existing.push(listener);
+      } else {
+        currentNonLoopback.set(key, [listener]);
+      }
+    }
+
+    const exposure = await classify(listeners);
+
+    if (!this.hasSocketBaseline) {
+      this.socketBaseline = currentNonLoopback;
+      this.hasSocketBaseline = true;
+      return { alerts: [], corroboration: [], coverage: "complete" };
+    }
+
+    const now = this.clock.now();
+    this.socketPollSeq += 1;
+    const pollSeq = this.socketPollSeq;
+
+    const exposureByListenerId = new Map<string, ExposureEntry>();
+    const exposureByKey = new Map<string, ExposureEntry[]>();
+    for (const entry of exposure) {
+      exposureByListenerId.set(entry.listener.id, entry);
+      const key = listenerKey(entry.listener);
+      const list = exposureByKey.get(key);
+      if (list) {
+        list.push(entry);
+      } else {
+        exposureByKey.set(key, [entry]);
+      }
+    }
+
+    const events: SecurityEvent[] = [];
+    const alerts: SecurityAlert[] = [];
+    const corroboration: Corroboration[] = [];
+    const seenAlertFingerprints = new Set<string>();
+
+    // Newly opened non-loopback listeners
+    for (const [key, openedListeners] of currentNonLoopback.entries()) {
+      if (this.socketBaseline.has(key)) continue;
+
+      const primary = openedListeners[0]!;
+      const matchingEntries = openedListeners
+        .map((l) => exposureByListenerId.get(l.id))
+        .filter((e): e is ExposureEntry => e !== undefined);
+      const effectiveEntries =
+        matchingEntries.length > 0 ? matchingEntries : (exposureByKey.get(key) ?? []);
+
+      const unexpectedExposed = effectiveEntries.find(
+        (entry) =>
+          entry.expected === false &&
+          (entry.reachability === "exposed_v4_v6" || entry.reachability === "exposed_lan") &&
+          isWildcardAddress(entry.listener.address),
+      );
+
+      const eventId = `socket:${pollSeq}:opened:${key}`;
+      const target = `${primary.protocol}:${primary.address}:${primary.port}`;
+      events.push({
+        id: eventId,
+        source: "socket",
+        category: "network",
+        severity: unexpectedExposed ? "critical" : "info",
+        rule: "listener_opened",
+        target,
+        firstAt: now,
+        lastAt: now,
+        count: 1,
+        isNoise: false,
+        summary: `Network listener opened on ${primary.protocol} ${primary.address}:${primary.port}`,
+      });
+
+      if (unexpectedExposed) {
+        const matchedListener = unexpectedExposed.listener;
+        const workload = matchEnrolledWorkload(matchedListener, this.workloads);
+
+        if (workload && matchedListener.pid !== undefined) {
+          corroboration.push({
+            rule: "unexpected_workload",
+            eventIds: [eventId],
+            expiresAt: now + BURST_WINDOW_MS,
+            target: {
+              kind: "pause_workload",
+              workloadId: workload.id,
+              pid: matchedListener.pid,
+              startedAt: now,
+            },
+          });
+
+          const fingerprint = `unexpected_workload:${workload.id}:${matchedListener.protocol}:${matchedListener.port}`;
+          if (!seenAlertFingerprints.has(fingerprint)) {
+            seenAlertFingerprints.add(fingerprint);
+            alerts.push({
+              id: `alert:${eventId}`,
+              fingerprint,
+              severity: "critical",
+              summary: `Unexpected exposed listener for workload ${workload.id} on ${matchedListener.protocol} ${matchedListener.address}:${matchedListener.port}`,
+              createdAt: now,
+            });
+          }
+        } else {
+          corroboration.push({
+            rule: "unexpected_listener",
+            eventIds: [eventId],
+            expiresAt: now + BURST_WINDOW_MS,
+          });
+
+          const fingerprint = `unexpected_listener:${matchedListener.protocol}:${matchedListener.address}:${matchedListener.port}`;
+          if (!seenAlertFingerprints.has(fingerprint)) {
+            seenAlertFingerprints.add(fingerprint);
+            alerts.push({
+              id: `alert:${eventId}`,
+              fingerprint,
+              severity: "critical",
+              summary: `Unexpected exposed listener on ${matchedListener.protocol} ${matchedListener.address}:${matchedListener.port}`,
+              createdAt: now,
+            });
+          }
+        }
+      }
+    }
+
+    // Closed non-loopback listeners
+    for (const [key, closedListeners] of this.socketBaseline.entries()) {
+      if (currentNonLoopback.has(key)) continue;
+
+      const primary = closedListeners[0]!;
+      const eventId = `socket:${pollSeq}:closed:${key}`;
+      const target = `${primary.protocol}:${primary.address}:${primary.port}`;
+      events.push({
+        id: eventId,
+        source: "socket",
+        category: "network",
+        severity: "info",
+        rule: "listener_closed",
+        target,
+        firstAt: now,
+        lastAt: now,
+        count: 1,
+        isNoise: false,
+        summary: `Network listener closed on ${primary.protocol} ${primary.address}:${primary.port}`,
+      });
+    }
+
+    if (events.length > 0) {
+      this.store.commitEventBatch({
+        events,
+        burstWindowMs: BURST_WINDOW_MS,
+      });
+    }
+
+    this.socketBaseline = currentNonLoopback;
+    return { alerts, corroboration, coverage: "complete" };
+  }
+
+  private recordSshObservation(peer: string, eventId: string, at: number): void {
+    let entries = this.sshObservations.get(peer);
+    if (!entries) {
+      if (this.sshObservations.size >= MAX_TRACKED_SSH_PEERS) {
+        const oldestKey = this.sshObservations.keys().next().value;
+        if (oldestKey !== undefined) {
+          this.sshObservations.delete(oldestKey);
+        }
+      }
+      entries = new Map<string, number>();
+      this.sshObservations.set(peer, entries);
+    }
+
+    entries.set(eventId, at);
+    if (entries.size > MAX_OBSERVATIONS_PER_PEER) {
+      let oldestId: string | undefined;
+      let oldestAt = Infinity;
+      for (const [id, ts] of entries.entries()) {
+        if (ts < oldestAt) {
+          oldestAt = ts;
+          oldestId = id;
+        }
+      }
+      if (oldestId !== undefined) {
+        entries.delete(oldestId);
+      }
+    }
+  }
+
+  private pruneSshObservations(windowStart: number): void {
+    for (const [peer, entries] of this.sshObservations.entries()) {
+      for (const [eventId, at] of entries.entries()) {
+        if (at < windowStart) {
+          entries.delete(eventId);
+        }
+      }
+      if (entries.size === 0) {
+        this.sshObservations.delete(peer);
+      }
+    }
+  }
+}
