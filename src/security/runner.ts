@@ -1,6 +1,3 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { CommandRequest, CommandResult, CommandRunner } from "./types";
 
 const TRUSTED_SEARCH_PATH =
@@ -11,7 +8,6 @@ const COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_PAGE_SETTLE_MS = 50;
 const POST_EXIT_DRAIN_MS = 50;
 const EARLY_STOP_REAP_GRACE_MS = 150;
-const GRACEFUL_KILL_ESCALATE_MS = 50;
 const MAX_CURSOR_LENGTH = 512;
 const MAX_JOURNAL_LIMIT = 1_000;
 
@@ -277,7 +273,8 @@ interface BuiltRecipe {
   benignExitCodes: readonly number[];
   includeUserRuntimeEnv: boolean;
   streamLineLimit?: number;
-  isolatedCheckupdatesDb?: boolean;
+  requireEmptyStderr?: boolean;
+  requireEmptyStdoutOnExitCodes?: readonly number[];
 }
 
 function buildRecipe(request: CommandRequest): BuiltRecipe {
@@ -308,10 +305,11 @@ function buildRecipe(request: CommandRequest): BuiltRecipe {
       };
     case "updates":
       return {
-        argv: ["checkupdates"],
-        benignExitCodes: [0, 2],
+        argv: ["pacman", "-Qu"],
+        benignExitCodes: [0, 1],
         includeUserRuntimeEnv: false,
-        isolatedCheckupdatesDb: true,
+        requireEmptyStderr: true,
+        requireEmptyStdoutOnExitCodes: [1],
       };
     case "arch_audit":
       return {
@@ -547,27 +545,7 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
 
       const argv = [executable, ...recipe.argv.slice(1)];
       const env = buildChildEnv(recipe.includeUserRuntimeEnv);
-
-      let checkupdatesDbDir: string | undefined;
-      if (recipe.isolatedCheckupdatesDb) {
-        try {
-          checkupdatesDbDir = mkdtempSync(join(tmpdir(), "basho-checkupdates-"));
-        } catch {
-          return { status: "failed" };
-        }
-        env.CHECKUPDATES_DB = checkupdatesDbDir;
-      }
-
-      const cleanupCheckupdatesDb = () => {
-        if (!checkupdatesDbDir) return;
-        const dir = checkupdatesDbDir;
-        checkupdatesDbDir = undefined;
-        try {
-          rmSync(dir, { recursive: true, force: true });
-        } catch {
-          // Best-effort cleanup of per-run checkupdates temp directory.
-        }
-      };
+      const useProcessGroup = process.platform !== "win32";
 
       let proc: ReturnType<typeof Bun.spawn>;
       try {
@@ -576,9 +554,9 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
           stdout: "pipe",
           stderr: "pipe",
           env,
+          ...(useProcessGroup ? { detached: true } : {}),
         });
       } catch {
-        cleanupCheckupdatesDb();
         return { status: "unavailable" };
       }
 
@@ -589,7 +567,6 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
       let processExited = false;
       let finished = false;
       let killInitiated = false;
-      let killEscalateTimer: ReturnType<typeof setTimeout> | undefined;
       const cancelCallbacks: Array<() => void> = [];
 
       const registerCancel = (cancel: () => void) => {
@@ -602,23 +579,22 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
         }
       };
 
+      const killProcessGroup = (): boolean => {
+        if (!useProcessGroup || !Number.isInteger(proc.pid) || proc.pid <= 0) {
+          return false;
+        }
+        try {
+          process.kill(-proc.pid, "SIGKILL");
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
       const killChild = () => {
         if (killInitiated) return;
         killInitiated = true;
-        if (recipe.isolatedCheckupdatesDb) {
-          try {
-            proc.kill("SIGTERM");
-          } catch {
-            return;
-          }
-          killEscalateTimer = setTimeout(() => {
-            if (processExited) return;
-            try {
-              proc.kill("SIGKILL");
-            } catch {
-              // Process may have already exited.
-            }
-          }, GRACEFUL_KILL_ESCALATE_MS);
+        if (killProcessGroup()) {
           return;
         }
         try {
@@ -637,18 +613,17 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
       const exitedPromise = proc.exited.then(
         (code) => {
           processExited = true;
-          clearTimeout(killEscalateTimer);
-          cleanupCheckupdatesDb();
           if (!finished) {
             // Descendants can hold either pipe open after the direct child exits.
-            postExitTimer = setTimeout(cancelReaders, POST_EXIT_DRAIN_MS);
+            postExitTimer = setTimeout(() => {
+              cancelReaders();
+              killProcessGroup();
+            }, POST_EXIT_DRAIN_MS);
           }
           return code;
         },
         (err) => {
           processExited = true;
-          clearTimeout(killEscalateTimer);
-          cleanupCheckupdatesDb();
           throw err;
         },
       );
@@ -710,7 +685,7 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
               )
           : Promise.resolve({ text: "", complete: true });
 
-      const stderrPromise: Promise<unknown> =
+      const stderrPromise: Promise<{ text: string; complete: boolean }> =
         stderrStream && typeof stderrStream !== "number"
           ? readBoundedStream(stderrStream, MAX_OUTPUT_BYTES, registerCancel).catch(
               (err: unknown) => {
@@ -721,7 +696,7 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
                 throw err;
               },
             )
-          : Promise.resolve("");
+          : Promise.resolve({ text: "", complete: true });
 
       if (signal?.aborted) {
         onAbort();
@@ -732,7 +707,7 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
         () => ({ ok: false as const }),
       );
       const stderrOutcome = stderrPromise.then(
-        () => ({ ok: true as const }),
+        (result) => ({ ok: true as const, value: result.text, complete: result.complete }),
         () => ({ ok: false as const }),
       );
 
@@ -781,6 +756,18 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
           return { status: "failed" };
         }
         if (proc.signalCode === null && recipe.benignExitCodes.includes(exitCode)) {
+          if (
+            recipe.requireEmptyStderr &&
+            (!stderrResult.complete || stderrResult.value.length > 0)
+          ) {
+            return { status: "failed" };
+          }
+          if (
+            recipe.requireEmptyStdoutOnExitCodes?.includes(exitCode) &&
+            stdoutResult.value.length > 0
+          ) {
+            return { status: "failed" };
+          }
           return { status: "ok", stdout: stdoutResult.value, exitCode };
         }
         return { status: "failed" };

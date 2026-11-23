@@ -59,3 +59,23 @@ _Avoid_: AI hunch, raw alert
 **EnrolledWorkload**:
 An operator-registered host service identified by a unique ID and systemd unit name (with optional display name and expected ports) that Basho monitors and may target for guardrailed containment.
 _Avoid_: Arbitrary PID, unmanaged process
+
+**Evidence**:
+A typed, immutable host observation identified by a stable ID and structured scalar facts (for a criterion, listener, event, process, or unit) that rules, `SecurityFinding` records, and `LockdownProposal` drafts cite.
+_Avoid_: Raw command output, unparsed log blob
+
+**PostureCheck**:
+The evaluated result of a single host security checklist criterion inside a `PostureSnapshot`, pairing a status (`pass`, `warn`, `fail`, `unknown`, or `disabled`) with summary, optional remediation, cited `Evidence` IDs, and per-source collection coverage.
+_Avoid_: Snapshot, raw scan finding
+
+**Listener**:
+A raw local TCP or UDP listening socket observed on the host (address, port, IP family, and optional interface, PID, and process name). Unlike `ExposureEntry`, a `Listener` records only the local bind before firewall or Tailscale reachability correlation.
+_Avoid_: ExposureEntry, open port, exposed service
+
+**AiVerdict**:
+The single scan-level disposition (`healthy`, `warn`, or `breach`) with confidence score and summary produced by the AI analyst at the end of an investigation. Unlike `SecurityFinding`, which captures an individual evidence-backed issue, `AiVerdict` summarizes the overall host assessment for a `SecurityScan`.
+_Avoid_: SecurityFinding, alert, containment decision
+
+**ContainmentTarget**:
+A closed, typed union identifying the exact allowlisted subject of a containment operation (`pause_workload`, `deny_peer_ip`, or `isolate_lan_ingress`) referenced by `Corroboration`, `LockdownProposal`, and `LockdownAction`.
+_Avoid_: Target string, shell argument, arbitrary host resource

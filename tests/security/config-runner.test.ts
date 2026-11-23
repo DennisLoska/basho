@@ -1015,92 +1015,230 @@ test("journal after-cursor fails when an incomplete page has stdout held open pa
   }
 });
 
-test("updates recipe passes an isolated CHECKUPDATES_DB and removes it after exit", async () => {
+test("updates recipe queries cached metadata read-only with pacman -Qu", async () => {
   const realSpawn = Bun.spawn.bind(Bun);
-  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
-  const seenDbDirs: string[] = [];
-  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) => {
-    const env = (options as { env?: Record<string, string> } | undefined)?.env;
-    if (env?.CHECKUPDATES_DB) {
-      seenDbDirs.push(env.CHECKUPDATES_DB);
+
+  // Missing pacman reports unavailable.
+  const missingWhich = spyOn(Bun, "which").mockReturnValue(null);
+  try {
+    const missing = await createCommandRunner().run({ kind: "updates" });
+    expect(missing).toEqual({ status: "unavailable" });
+    expect(missingWhich).toHaveBeenCalledWith("pacman", expect.any(Object));
+  } finally {
+    missingWhich.mockRestore();
+  }
+
+  const whichSpy = spyOn(Bun, "which").mockImplementation((cmd) =>
+    cmd === "pacman" ? "/usr/bin/pacman" : null,
+  );
+
+  const runUpdatesWithScript = async (script: string) => {
+    let seenArgv: unknown;
+    let seenEnv: Record<string, string | undefined> | undefined;
+    const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((argv, options) => {
+      seenArgv = argv;
+      seenEnv = (options as { env?: Record<string, string | undefined> } | undefined)?.env;
+      return realSpawn(
+        ["/bin/sh", "-c", script],
+        options as Parameters<typeof Bun.spawn>[1],
+      );
+    }) as typeof Bun.spawn);
+
+    try {
+      const result = await createCommandRunner().run({ kind: "updates" });
+      return { result, seenArgv, seenEnv };
+    } finally {
+      spawnSpy.mockRestore();
     }
-    return realSpawn(
-      [
-        "/bin/sh",
-        "-c",
-        'test -n "$CHECKUPDATES_DB" && test -d "$CHECKUPDATES_DB" && : > "$CHECKUPDATES_DB/db.lck" && printf "%s" "$CHECKUPDATES_DB"',
-      ],
-      options as Parameters<typeof Bun.spawn>[1],
-    );
-  }) as typeof Bun.spawn);
+  };
 
   try {
-    const runner = createCommandRunner();
-    const first = await runner.run({ kind: "updates" });
-    const second = await runner.run({ kind: "updates" });
+    // Exit 0 with pending updates listed on stdout.
+    const pending = await runUpdatesWithScript(
+      "printf 'linux 6.12.1-1 -> 6.12.2-1\\n'; exit 0",
+    );
+    expect(pending.seenArgv).toEqual(["/usr/bin/pacman", "-Qu"]);
+    expect(pending.seenEnv?.CHECKUPDATES_DB).toBeUndefined();
+    expect(pending.result).toEqual({
+      status: "ok",
+      stdout: "linux 6.12.1-1 -> 6.12.2-1\n",
+      exitCode: 0,
+    });
 
-    expect(first.status).toBe("ok");
-    expect(second.status).toBe("ok");
-    expect(seenDbDirs).toHaveLength(2);
-    const [firstDbDir, secondDbDir] = seenDbDirs;
-    expect(firstDbDir).toBeDefined();
-    expect(secondDbDir).toBeDefined();
-    expect(firstDbDir).not.toBe(secondDbDir);
-    if (first.status === "ok") {
-      expect(first.stdout).toBe(firstDbDir!);
-    }
-    if (second.status === "ok") {
-      expect(second.stdout).toBe(secondDbDir!);
-    }
-    expect(existsSync(firstDbDir!)).toBe(false);
-    expect(existsSync(secondDbDir!)).toBe(false);
+    // Exit 1 with empty stdout and empty stderr means up to date.
+    const upToDate = await runUpdatesWithScript("exit 1");
+    expect(upToDate.seenArgv).toEqual(["/usr/bin/pacman", "-Qu"]);
+    expect(upToDate.seenEnv?.CHECKUPDATES_DB).toBeUndefined();
+    expect(upToDate.result).toEqual({
+      status: "ok",
+      stdout: "",
+      exitCode: 1,
+    });
+
+    // Exit 1 with non-empty stderr is a failure (not "up to date").
+    const stderrOnExit1 = await runUpdatesWithScript(
+      "printf 'error: failed to init transaction\\n' >&2; exit 1",
+    );
+    expect(stderrOnExit1.result).toEqual({ status: "failed" });
+
+    // Exit 0 with non-empty stderr is a failure.
+    const stderrOnExit0 = await runUpdatesWithScript(
+      "printf 'linux 6.12.1-1 -> 6.12.2-1\\n'; printf 'warning: corrupt db\\n' >&2; exit 0",
+    );
+    expect(stderrOnExit0.result).toEqual({ status: "failed" });
+
+    // Exit 1 with non-empty stdout is a failure.
+    const stdoutOnExit1 = await runUpdatesWithScript(
+      "printf 'unexpected output\\n'; exit 1",
+    );
+    expect(stdoutOnExit1.result).toEqual({ status: "failed" });
+
+    // Other exit codes (e.g. 2) fail.
+    const otherExit = await runUpdatesWithScript("exit 2");
+    expect(otherExit.result).toEqual({ status: "failed" });
   } finally {
-    spawnSpy.mockRestore();
     whichSpy.mockRestore();
-    for (const dir of seenDbDirs) {
-      rmSync(dir, { recursive: true, force: true });
-    }
   }
 });
 
-test("updates timeout sends SIGTERM then escalates to SIGKILL and cleans CHECKUPDATES_DB", async () => {
+test("timeout terminates the full process tree including background descendants", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "basho-runner-tree-timeout-"));
+  const pidFile = join(dir, "descendant.pid");
   const realSpawn = Bun.spawn.bind(Bun);
   const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
-  let capturedDbDir: string | undefined;
-  const signals: Array<string | number | undefined> = [];
-
-  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) => {
-    const env = (options as { env?: Record<string, string> } | undefined)?.env;
-    capturedDbDir = env?.CHECKUPDATES_DB;
-    const child = realSpawn(
-      ["/bin/sh", "-c", 'trap "" TERM; : > "$CHECKUPDATES_DB/db.lck"; while true; do sleep 0.05; done'],
+  const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+    realSpawn(
+      ["/bin/sh", "-c", `sleep 30 & echo $! > '${pidFile}'; sleep 30`],
       options as Parameters<typeof Bun.spawn>[1],
-    );
-    const origKill = child.kill.bind(child);
-    child.kill = ((sig?: number | NodeJS.Signals) => {
-      signals.push(sig);
-      return origKill(sig);
-    }) as typeof child.kill;
-    return child;
-  }) as typeof Bun.spawn);
+    )) as typeof Bun.spawn);
+
+  const isPidAlive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   try {
     const startedAt = performance.now();
-    const result = await createCommandRunner({ timeoutMs: 80 }).run({ kind: "updates" });
+    const result = await createCommandRunner({ timeoutMs: 150 }).run({ kind: "processes" });
     const elapsedMs = performance.now() - startedAt;
 
     expect(result).toEqual({ status: "timeout" });
     expect(elapsedMs).toBeLessThan(1_000);
-    expect(signals[0]).toBe("SIGTERM");
-    expect(signals).toContain("SIGKILL");
-    expect(capturedDbDir).toBeDefined();
-    expect(existsSync(capturedDbDir!)).toBe(false);
+    expect(existsSync(pidFile)).toBe(true);
+
+    const descendantPid = Number(readFileSync(pidFile, "utf8").trim());
+    expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+
+    // Allow brief kernel subreaper latency for the already-SIGKILLed descendant to vanish.
+    const deadline = performance.now() + 500;
+    while (isPidAlive(descendantPid) && performance.now() < deadline) {
+      await Bun.sleep(10);
+    }
+    expect(isPidAlive(descendantPid)).toBe(false);
   } finally {
     spawnSpy.mockRestore();
     whichSpy.mockRestore();
-    if (capturedDbDir) {
-      rmSync(capturedDbDir, { recursive: true, force: true });
+    try {
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      if (Number.isInteger(pid) && pid > 0) {
+        process.kill(pid, "SIGKILL");
+      }
+    } catch {
+      // Descendant already terminated.
     }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("abort and overflow terminate background descendants in the child process tree", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "basho-runner-tree-stop-"));
+  const abortPidFile = join(dir, "abort-descendant.pid");
+  const overflowPidFile = join(dir, "overflow-descendant.pid");
+  const realSpawn = Bun.spawn.bind(Bun);
+  const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+
+  const isPidAlive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const waitUntilDead = async (pid: number) => {
+    const deadline = performance.now() + 500;
+    while (isPidAlive(pid) && performance.now() < deadline) {
+      await Bun.sleep(10);
+    }
+    return !isPidAlive(pid);
+  };
+
+  try {
+    // Abort path
+    const abortSpawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+      realSpawn(
+        ["/bin/sh", "-c", `sleep 30 & echo $! > '${abortPidFile}'; sleep 30`],
+        options as Parameters<typeof Bun.spawn>[1],
+      )) as typeof Bun.spawn);
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), 100);
+    try {
+      const abortResult = await createCommandRunner({ timeoutMs: 2_000 }).run(
+        { kind: "processes" },
+        controller.signal,
+      );
+      expect(abortResult).toEqual({ status: "failed" });
+    } finally {
+      clearTimeout(abortTimer);
+      abortSpawnSpy.mockRestore();
+    }
+
+    expect(existsSync(abortPidFile)).toBe(true);
+    const abortPid = Number(readFileSync(abortPidFile, "utf8").trim());
+    expect(Number.isInteger(abortPid) && abortPid > 0).toBe(true);
+    expect(await waitUntilDead(abortPid)).toBe(true);
+
+    // Overflow path (> 256 KiB on stdout while descendant sleeps)
+    const overflowSpawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+      realSpawn(
+        [
+          "/bin/sh",
+          "-c",
+          `sleep 30 & echo $! > '${overflowPidFile}'; head -c 300000 /dev/zero | tr '\\0' 'x'; sleep 30`,
+        ],
+        options as Parameters<typeof Bun.spawn>[1],
+      )) as typeof Bun.spawn);
+    try {
+      const overflowResult = await createCommandRunner({ timeoutMs: 2_000 }).run({
+        kind: "processes",
+      });
+      expect(overflowResult).toEqual({ status: "overflow" });
+    } finally {
+      overflowSpawnSpy.mockRestore();
+    }
+
+    expect(existsSync(overflowPidFile)).toBe(true);
+    const overflowPid = Number(readFileSync(overflowPidFile, "utf8").trim());
+    expect(Number.isInteger(overflowPid) && overflowPid > 0).toBe(true);
+    expect(await waitUntilDead(overflowPid)).toBe(true);
+  } finally {
+    whichSpy.mockRestore();
+    for (const file of [abortPidFile, overflowPidFile]) {
+      try {
+        const pid = Number(readFileSync(file, "utf8").trim());
+        if (Number.isInteger(pid) && pid > 0) {
+          process.kill(pid, "SIGKILL");
+        }
+      } catch {
+        // Descendant already terminated.
+      }
+    }
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
