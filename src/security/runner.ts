@@ -620,8 +620,8 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
                   if (!processExited && proc.exitCode === null && proc.signalCode === null) {
                     stoppedByLineLimit = true;
                     killChild();
-                    cancelReaders();
                   }
+                  cancelReaders();
                 },
                 registerCancel,
               )

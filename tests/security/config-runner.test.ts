@@ -696,6 +696,35 @@ test("journal after-cursor succeeds when command emits an exact full page and ex
   }
 });
 
+test.each([
+  [0, { status: "ok", stdout: '{"MESSAGE":"one"}\n{"MESSAGE":"two"}', exitCode: 0 }],
+  [7, { status: "failed" }],
+] as const)(
+  "journal after-cursor preserves exit %i when a grandchild holds both pipes open",
+  async (exitCode, expected) => {
+    const realSpawn = Bun.spawn.bind(Bun);
+    const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
+    const spawnSpy = spyOn(Bun, "spawn").mockImplementation(((_argv, options) =>
+      realSpawn(
+        ["/bin/sh", "-c", `sleep 1 & printf '{"MESSAGE":"one"}\\n{"MESSAGE":"two"}\\n'; exit ${exitCode}`],
+        options as Parameters<typeof Bun.spawn>[1],
+      )) as typeof Bun.spawn);
+
+    try {
+      // The runner must finish before the sleeping grandchild closes the pipes.
+      const result = await createCommandRunner({ timeoutMs: 500 }).run({
+        kind: "journal",
+        after: "s=abc123",
+        limit: 2,
+      });
+      expect(result).toEqual(expected);
+    } finally {
+      spawnSpy.mockRestore();
+      whichSpy.mockRestore();
+    }
+  },
+);
+
 test("journal after-cursor succeeds when runner stops a streaming command exceeding the line limit", async () => {
   const realSpawn = Bun.spawn.bind(Bun);
   const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
