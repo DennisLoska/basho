@@ -1721,3 +1721,32 @@ test("commitEventBatch transitively merges chained bursts when a larger burstWin
     store.close();
   }
 });
+
+test("file-backed store rejects symlinked or unsafe -journal sidecar before opening SQLite", () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-journal-sidecar-"));
+  const outsideDir = mkdtempSync(join(tmpdir(), "basho-journal-outside-"));
+  try {
+    const realDb = join(root, "real.db");
+    writeFileSync(realDb, "", { mode: 0o600 });
+    chmodSync(realDb, 0o600);
+
+    const journalTarget = join(outsideDir, "outside.journal");
+    writeFileSync(journalTarget, "", { mode: 0o600 });
+    chmodSync(journalTarget, 0o600);
+    symlinkSync(journalTarget, `${realDb}-journal`);
+
+    expect(() => new SecurityStore(realDb)).toThrow(/symbolic link/i);
+    expect(statSync(realDb).size).toBe(0);
+    expect(statSync(journalTarget).size).toBe(0);
+    rmSync(`${realDb}-journal`);
+
+    writeFileSync(`${realDb}-journal`, "", { mode: 0o644 });
+    chmodSync(`${realDb}-journal`, 0o644);
+    expect(() => new SecurityStore(realDb)).toThrow(/private.*sidecar/i);
+    expect(statSync(`${realDb}-journal`).mode & 0o777).toBe(0o644);
+    expect(statSync(realDb).size).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  }
+});

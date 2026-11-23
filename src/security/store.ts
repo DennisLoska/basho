@@ -189,7 +189,7 @@ function ensurePrivateDatabasePath(dbPath: string): void {
     );
   }
 
-  for (const suffix of ["-wal", "-shm"] as const) {
+  for (const suffix of ["-wal", "-shm", "-journal"] as const) {
     const sidecarPath = `${resolvedDbPath}${suffix}`;
     const sidecarStat = lstatIfExists(sidecarPath);
     if (sidecarStat === null) {
