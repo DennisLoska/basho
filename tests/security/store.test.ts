@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SecurityStore } from "../../src/security/store";
@@ -1201,19 +1201,310 @@ test("saveScan updates an existing scan ID in place and replaces child rows clea
   }
 });
 
-test("file-backed store never alters permissions of an existing parent directory", () => {
+test("file-backed store never alters permissions of an existing shared parent directory", () => {
   const root = mkdtempSync(join(tmpdir(), "basho-shared-parent-"));
-  const dbPath = join(root, "state.db");
+  const privateDir = join(root, "private");
+  const dbPath = join(privateDir, "state.db");
   try {
     chmodSync(root, 0o755);
     const store = new SecurityStore(dbPath);
     try {
       expect(statSync(root).mode & 0o777).toBe(0o755);
+      expect(statSync(privateDir).mode & 0o777).toBe(0o700);
       expect(statSync(dbPath).mode & 0o777).toBe(0o600);
     } finally {
       store.close();
     }
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("no-arg SecurityStore uses BASHO_SECURITY_DB when set", () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-env-db-"));
+  const dbPath = join(root, "private", "env-state.db");
+  const previous = process.env.BASHO_SECURITY_DB;
+  try {
+    process.env.BASHO_SECURITY_DB = `  ${dbPath}  `;
+    const store = new SecurityStore();
+    try {
+      store.writeOverrides({ mode: "monitor", scanIntervalMinutes: 10 });
+      expect(existsSync(dbPath)).toBe(true);
+      expect(statSync(dbPath).mode & 0o777).toBe(0o600);
+    } finally {
+      store.close();
+    }
+
+    const reopened = new SecurityStore(dbPath);
+    try {
+      expect(reopened.readOverrides()).toEqual({ mode: "monitor", scanIntervalMinutes: 10 });
+    } finally {
+      reopened.close();
+    }
+
+    process.env.BASHO_SECURITY_DB = ":memory:";
+    const memStore = new SecurityStore();
+    try {
+      expect(memStore.latestScan()).toBeNull();
+    } finally {
+      memStore.close();
+    }
+  } finally {
+    if (previous === undefined) {
+      delete process.env.BASHO_SECURITY_DB;
+    } else {
+      process.env.BASHO_SECURITY_DB = previous;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("file-backed store rejects an existing unsafe state directory without altering its mode", () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-unsafe-dir-"));
+  const dbPath = join(root, "state.db");
+  try {
+    chmodSync(root, 0o755);
+    expect(() => new SecurityStore(dbPath)).toThrow(/private.*directory/i);
+    expect(statSync(root).mode & 0o777).toBe(0o755);
+    expect(existsSync(dbPath)).toBe(false);
+
+    chmodSync(root, 0o777);
+    expect(() => new SecurityStore(dbPath)).toThrow(/private.*directory/i);
+    expect(statSync(root).mode & 0o777).toBe(0o777);
+    expect(existsSync(dbPath)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("file-backed store rejects an existing unsafe database file without altering its mode", () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-unsafe-file-"));
+  const dbPath = join(root, "state.db");
+  try {
+    writeFileSync(dbPath, "", { mode: 0o644 });
+    chmodSync(dbPath, 0o644);
+    expect(() => new SecurityStore(dbPath)).toThrow(/private.*file/i);
+    expect(statSync(dbPath).mode & 0o777).toBe(0o644);
+
+    chmodSync(dbPath, 0o640);
+    expect(() => new SecurityStore(dbPath)).toThrow(/private.*file/i);
+    expect(statSync(dbPath).mode & 0o777).toBe(0o640);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("commitEventBatch merges multiple bursts bridged by a late observation while preserving hourly counts", () => {
+  const store = memoryStore();
+  try {
+    const hourStart = Date.UTC(2026, 2, 10, 14, 0, 0);
+    const burstWindowMs = 2_000;
+
+    // Burst 1 in the previous hour: [hourStart - 1_500, hourStart - 1_000], count 2
+    store.commitEventBatch({
+      events: [
+        eventFixture("b1-a", hourStart - 1_500, {
+          severity: "warning",
+          summary: "burst-1-first",
+        }),
+        eventFixture("b1-b", hourStart - 1_000, {
+          severity: "warning",
+          summary: "burst-1-second",
+        }),
+      ],
+      burstWindowMs,
+    });
+
+    // Burst 2 in the current hour: [hourStart + 1_500, hourStart + 1_500], count 1 (outside 2s window of burst 1)
+    store.commitEventBatch({
+      events: [
+        eventFixture("b2-a", hourStart + 1_500, {
+          severity: "info",
+          summary: "burst-2-latest",
+        }),
+      ],
+      burstWindowMs,
+    });
+
+    expect(store.recentEvents(0, 10)).toHaveLength(2);
+
+    // Late observation at hourStart + 250 bridges both bursts:
+    // distance to burst 1 lastAt (hourStart - 1_000) is 1_250 < 2_000
+    // distance to burst 2 firstAt (hourStart + 1_500) is 1_250 < 2_000
+    store.commitEventBatch({
+      events: [
+        eventFixture("b-bridge", hourStart + 250, {
+          severity: "critical",
+          summary: "bridge-critical",
+        }),
+      ],
+      burstWindowMs,
+    });
+
+    const events = store.recentEvents(0, 10);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      rule: "ssh_burst",
+      target: "198.51.100.42",
+      count: 4,
+      firstAt: hourStart - 1_500,
+      lastAt: hourStart + 1_500,
+      severity: "critical",
+      summary: "burst-2-latest",
+    });
+
+    const buckets = store.hourlyEvents(hourStart + 30_000);
+    const byHour = new Map(buckets.map((bucket) => [bucket.hour, bucket]));
+    expect(byHour.get(hourStart - HOUR_MS)).toEqual({
+      hour: hourStart - HOUR_MS,
+      signal: 2,
+      noise: 0,
+    });
+    expect(byHour.get(hourStart)).toEqual({
+      hour: hourStart,
+      signal: 2,
+      noise: 0,
+    });
+  } finally {
+    store.close();
+  }
+});
+
+test("two connections reclaim expired delivery lease and reject first connection stale claimToken", () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-delivery-race-"));
+  const dbPath = join(root, "deliveries.db");
+  const first = new SecurityStore(dbPath);
+  const second = new SecurityStore(dbPath);
+  try {
+    const createdAt = 5_000_000;
+    expect(
+      first.enqueueAlert(
+        alertFixture("race-delivery-alert", "auth:ssh_burst:203.0.113.77", "critical", createdAt),
+        ["ntfy"],
+        900_000,
+      ),
+    ).toBe(true);
+
+    const claim1 = first.claimDeliveries(createdAt, 5, 30_000)[0]!;
+    expect(claim1).toBeDefined();
+    expect(claim1.attempts).toBe(1);
+
+    // Before expiry, second connection cannot steal the lease.
+    expect(second.claimDeliveries(createdAt + 29_999, 5, 30_000)).toEqual([]);
+
+    // After expiry, second connection reclaims with a new claimToken.
+    const claim2 = second.claimDeliveries(createdAt + 30_001, 5, 30_000)[0]!;
+    expect(claim2).toBeDefined();
+    expect(claim2.id).toBe(claim1.id);
+    expect(claim2.claimToken).not.toBe(claim1.claimToken);
+    expect(claim2.attempts).toBe(2);
+
+    // First connection's stale claimToken is rejected.
+    expect(first.settleDelivery(claim1.id, claim1.claimToken, createdAt + 30_002, "sent")).toBe(false);
+    expect(first.channelHealth()).toEqual({});
+
+    // Second connection settles cleanly and first connection observes the settled health.
+    expect(second.settleDelivery(claim2.id, claim2.claimToken, createdAt + 30_003, "sent")).toBe(true);
+    expect(first.channelHealth().ntfy).toEqual({ status: "sent", at: createdAt + 30_003 });
+    expect(first.claimDeliveries(createdAt + 100_000, 5, 30_000)).toEqual([]);
+  } finally {
+    first.close();
+    second.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("two connections observe pruned scans, events, and terminal actions while retaining unresolved actions", () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-prune-two-conn-"));
+  const dbPath = join(root, "prune-two-conn.db");
+  const writer = new SecurityStore(dbPath);
+  const reader = new SecurityStore(dbPath);
+  try {
+    const start = 50 * DAY_MS;
+    const now = start + 2_000 + 90 * DAY_MS + 1;
+
+    for (let index = 1; index <= 55; index += 1) {
+      writer.saveScan(
+        scanFixture({
+          id: `scan-${index}`,
+          startedAt: index * 1_000,
+          finishedAt: index * 1_000 + 10,
+          snapshot: { ...scanFixture().snapshot, id: `snapshot-${index}` },
+        }),
+      );
+    }
+
+    writer.commitEventBatch({
+      events: [
+        eventFixture("ev-expired", now - 15 * DAY_MS, { rule: "old_rule" }),
+        eventFixture("ev-kept", now - 13 * DAY_MS, { rule: "recent_rule" }),
+      ],
+      burstWindowMs: 1_000,
+    });
+
+    writer.insertProposal(proposalFixture({ id: "prop-terminal", expiresAt: start + 600_000 }));
+    const terminal = writer.claimProposal("prop-terminal", 1, start)!;
+    expect(writer.transitionAction(terminal.id, "pending", "active", start + 1_000)).toBe(true);
+    expect(writer.transitionAction(terminal.id, "active", "rolled_back", start + 2_000)).toBe(true);
+
+    writer.insertProposal(proposalFixture({ id: "prop-active", expiresAt: start + 600_000 }));
+    const unresolvedActive = writer.claimProposal("prop-active", 1, start)!;
+    expect(writer.transitionAction(unresolvedActive.id, "pending", "active", start + 1_000)).toBe(true);
+
+    writer.insertProposal(proposalFixture({ id: "prop-pending", expiresAt: start + 600_000 }));
+    const unresolvedPending = writer.claimProposal("prop-pending", 1, start)!;
+
+    writer.prune(now);
+
+    expect(reader.latestScan()!.id).toBe("scan-55");
+    expect(reader.recentEvents(0, 100).map((event) => event.id)).toEqual(["ev-kept"]);
+    expect(reader.listActions().map((action) => action.id).sort()).toEqual(
+      [unresolvedActive.id, unresolvedPending.id].sort(),
+    );
+
+    const inspectDb = new Database(dbPath, { readonly: true });
+    try {
+      const scanCount = (inspectDb.query("SELECT COUNT(*) AS n FROM scans").get() as { n: number }).n;
+      expect(scanCount).toBe(50);
+    } finally {
+      inspectDb.close();
+    }
+  } finally {
+    writer.close();
+    reader.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("latestScan reads a consistent snapshot in a deferred read transaction under WAL concurrency", () => {
+  const root = mkdtempSync(join(tmpdir(), "basho-latest-snapshot-"));
+  const dbPath = join(root, "snapshot.db");
+  const writer = new SecurityStore(dbPath);
+  const reader = new SecurityStore(dbPath);
+  try {
+    const committed = scanFixture({ id: "scan-committed", startedAt: 1_000, finishedAt: 2_000 });
+    writer.saveScan(committed);
+
+    // Hold an uncommitted write transaction modifying scans and deleting child rows on a third connection.
+    const rawWriter = new Database(dbPath);
+    try {
+      rawWriter.run("BEGIN IMMEDIATE");
+      rawWriter
+        .query("UPDATE scans SET ai_status = 'offline', verdict_json = NULL WHERE id = ?")
+        .run("scan-committed");
+      rawWriter.query("DELETE FROM posture_checks WHERE scan_id = ?").run("scan-committed");
+      rawWriter.query("DELETE FROM findings WHERE scan_id = ?").run("scan-committed");
+
+      // Deferred read transaction on reader must see the complete committed snapshot without blocking.
+      expect(reader.latestScan()).toEqual(committed);
+
+      rawWriter.run("ROLLBACK");
+    } finally {
+      rawWriter.close();
+    }
+  } finally {
+    writer.close();
+    reader.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

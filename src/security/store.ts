@@ -1,5 +1,14 @@
 import { Database } from "bun:sqlite";
-import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  existsSync,
+  fchmodSync,
+  mkdirSync,
+  openSync,
+  statSync,
+} from "node:fs";
 import { dirname, resolve } from "node:path";
 import type {
   AiVerdict,
@@ -93,9 +102,10 @@ export interface SecurityStoreContract {
 }
 
 function ensurePrivateDatabasePath(dbPath: string): void {
-  const parentDir = dirname(dbPath);
+  const resolvedDbPath = resolve(dbPath);
+  const parentDir = dirname(resolvedDbPath);
   const dirsToCreate: string[] = [];
-  let cursor = resolve(parentDir);
+  let cursor = parentDir;
 
   while (!existsSync(cursor)) {
     dirsToCreate.push(cursor);
@@ -116,14 +126,25 @@ function ensurePrivateDatabasePath(dbPath: string): void {
     }
   }
 
+  const dirStat = statSync(parentDir);
+  if (!dirStat.isDirectory()) {
+    throw new Error(`SecurityStore state path is not a directory: ${parentDir}`);
+  }
+  if ((dirStat.mode & 0o077) !== 0) {
+    const modeOctal = (dirStat.mode & 0o7777).toString(8).padStart(4, "0");
+    throw new Error(
+      `SecurityStore requires a private state directory (0700): ${parentDir} has mode ${modeOctal}`,
+    );
+  }
+
   try {
     const fd = openSync(
-      dbPath,
+      resolvedDbPath,
       constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
       0o600,
     );
     try {
-      chmodSync(dbPath, 0o600);
+      fchmodSync(fd, 0o600);
     } finally {
       closeSync(fd);
     }
@@ -131,6 +152,17 @@ function ensurePrivateDatabasePath(dbPath: string): void {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
       throw error;
     }
+  }
+
+  const fileStat = statSync(resolvedDbPath);
+  if (!fileStat.isFile()) {
+    throw new Error(`SecurityStore database path is not a regular file: ${resolvedDbPath}`);
+  }
+  if ((fileStat.mode & 0o077) !== 0) {
+    const modeOctal = (fileStat.mode & 0o7777).toString(8).padStart(4, "0");
+    throw new Error(
+      `SecurityStore requires a private database file (0600): ${resolvedDbPath} has mode ${modeOctal}`,
+    );
   }
 }
 
@@ -247,13 +279,14 @@ interface DueDeliveryRow {
 export class SecurityStore implements SecurityStoreContract {
   private readonly db: Database;
 
-  constructor(dbPath: string = DEFAULT_DB_PATH) {
-    const isMemory = dbPath === ":memory:";
+  constructor(dbPath?: string) {
+    const resolvedPath = dbPath ?? (process.env.BASHO_SECURITY_DB?.trim() || DEFAULT_DB_PATH);
+    const isMemory = resolvedPath === ":memory:";
     if (!isMemory) {
-      ensurePrivateDatabasePath(dbPath);
+      ensurePrivateDatabasePath(resolvedPath);
     }
 
-    this.db = new Database(dbPath, { create: true });
+    this.db = new Database(resolvedPath, { create: true });
     this.db.run(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     this.db.run("PRAGMA foreign_keys = ON");
     if (!isMemory) {
@@ -634,124 +667,128 @@ export class SecurityStore implements SecurityStoreContract {
   }
 
   latestScan(): SecurityScan | null {
-    const row = this.db
-      .query(
-        `SELECT id, trigger_kind, started_at, finished_at,
-                snapshot_id, snapshot_captured_at, evidence_json,
-                ai_status, verdict_json
-         FROM scans
-         ORDER BY finished_at DESC, started_at DESC, rowid DESC
-         LIMIT 1`,
-      )
-      .get() as ScanRow | null;
-    if (!row) {
-      return null;
-    }
+    return this.db
+      .transaction((): SecurityScan | null => {
+        const row = this.db
+          .query(
+            `SELECT id, trigger_kind, started_at, finished_at,
+                    snapshot_id, snapshot_captured_at, evidence_json,
+                    ai_status, verdict_json
+             FROM scans
+             ORDER BY finished_at DESC, started_at DESC, rowid DESC
+             LIMIT 1`,
+          )
+          .get() as ScanRow | null;
+        if (!row) {
+          return null;
+        }
 
-    const checkRows = this.db
-      .query(
-        `SELECT check_id, category, title, status, summary,
-                remediation, evidence_ids_json, source_coverage_json
-         FROM posture_checks
-         WHERE scan_id = ?
-         ORDER BY position ASC`,
-      )
-      .all(row.id) as PostureCheckRow[];
+        const checkRows = this.db
+          .query(
+            `SELECT check_id, category, title, status, summary,
+                    remediation, evidence_ids_json, source_coverage_json
+             FROM posture_checks
+             WHERE scan_id = ?
+             ORDER BY position ASC`,
+          )
+          .all(row.id) as PostureCheckRow[];
 
-    const checks: PostureCheck[] = checkRows.map((checkRow) => {
-      const check: PostureCheck = {
-        id: checkRow.check_id,
-        category: checkRow.category,
-        title: checkRow.title,
-        status: checkRow.status,
-        summary: checkRow.summary,
-        evidenceIds: JSON.parse(checkRow.evidence_ids_json) as string[],
-        sourceCoverage: JSON.parse(checkRow.source_coverage_json) as Record<string, Coverage>,
-      };
-      if (checkRow.remediation !== null) {
-        check.remediation = checkRow.remediation;
-      }
-      return check;
-    });
+        const checks: PostureCheck[] = checkRows.map((checkRow) => {
+          const check: PostureCheck = {
+            id: checkRow.check_id,
+            category: checkRow.category,
+            title: checkRow.title,
+            status: checkRow.status,
+            summary: checkRow.summary,
+            evidenceIds: JSON.parse(checkRow.evidence_ids_json) as string[],
+            sourceCoverage: JSON.parse(checkRow.source_coverage_json) as Record<string, Coverage>,
+          };
+          if (checkRow.remediation !== null) {
+            check.remediation = checkRow.remediation;
+          }
+          return check;
+        });
 
-    const exposureRows = this.db
-      .query(
-        `SELECT entry_id, listener_json, reachability, firewall_v4,
-                firewall_v6, publication, expected, evidence_ids_json
-         FROM exposure_entries
-         WHERE scan_id = ?
-         ORDER BY position ASC`,
-      )
-      .all(row.id) as ExposureEntryRow[];
+        const exposureRows = this.db
+          .query(
+            `SELECT entry_id, listener_json, reachability, firewall_v4,
+                    firewall_v6, publication, expected, evidence_ids_json
+             FROM exposure_entries
+             WHERE scan_id = ?
+             ORDER BY position ASC`,
+          )
+          .all(row.id) as ExposureEntryRow[];
 
-    const exposure: ExposureEntry[] = exposureRows.map((entryRow) => ({
-      id: entryRow.entry_id,
-      listener: JSON.parse(entryRow.listener_json) as Listener,
-      reachability: entryRow.reachability,
-      firewallV4: entryRow.firewall_v4,
-      firewallV6: entryRow.firewall_v6,
-      publication: entryRow.publication,
-      expected: entryRow.expected === 1,
-      evidenceIds: JSON.parse(entryRow.evidence_ids_json) as string[],
-    }));
+        const exposure: ExposureEntry[] = exposureRows.map((entryRow) => ({
+          id: entryRow.entry_id,
+          listener: JSON.parse(entryRow.listener_json) as Listener,
+          reachability: entryRow.reachability,
+          firewallV4: entryRow.firewall_v4,
+          firewallV6: entryRow.firewall_v6,
+          publication: entryRow.publication,
+          expected: entryRow.expected === 1,
+          evidenceIds: JSON.parse(entryRow.evidence_ids_json) as string[],
+        }));
 
-    const findingRows = this.db
-      .query(
-        `SELECT finding_id, source, severity, summary, evidence_ids_json
-         FROM findings
-         WHERE scan_id = ?
-         ORDER BY position ASC`,
-      )
-      .all(row.id) as FindingRow[];
+        const findingRows = this.db
+          .query(
+            `SELECT finding_id, source, severity, summary, evidence_ids_json
+             FROM findings
+             WHERE scan_id = ?
+             ORDER BY position ASC`,
+          )
+          .all(row.id) as FindingRow[];
 
-    const findings: SecurityFinding[] = findingRows.map((findingRow) => ({
-      id: findingRow.finding_id,
-      source: findingRow.source,
-      severity: findingRow.severity,
-      summary: findingRow.summary,
-      evidenceIds: JSON.parse(findingRow.evidence_ids_json) as string[],
-    }));
+        const findings: SecurityFinding[] = findingRows.map((findingRow) => ({
+          id: findingRow.finding_id,
+          source: findingRow.source,
+          severity: findingRow.severity,
+          summary: findingRow.summary,
+          evidenceIds: JSON.parse(findingRow.evidence_ids_json) as string[],
+        }));
 
-    const stepRows = this.db
-      .query(
-        `SELECT tool, reason, outcome, evidence_ids_json
-         FROM investigation_steps
-         WHERE scan_id = ?
-         ORDER BY position ASC`,
-      )
-      .all(row.id) as InvestigationStepRow[];
+        const stepRows = this.db
+          .query(
+            `SELECT tool, reason, outcome, evidence_ids_json
+             FROM investigation_steps
+             WHERE scan_id = ?
+             ORDER BY position ASC`,
+          )
+          .all(row.id) as InvestigationStepRow[];
 
-    const trail: InvestigationTrail = {
-      steps: stepRows.map((stepRow) => ({
-        tool: stepRow.tool,
-        reason: stepRow.reason,
-        outcome: stepRow.outcome,
-        evidenceIds: JSON.parse(stepRow.evidence_ids_json) as string[],
-      })),
-    };
+        const trail: InvestigationTrail = {
+          steps: stepRows.map((stepRow) => ({
+            tool: stepRow.tool,
+            reason: stepRow.reason,
+            outcome: stepRow.outcome,
+            evidenceIds: JSON.parse(stepRow.evidence_ids_json) as string[],
+          })),
+        };
 
-    const scan: SecurityScan = {
-      id: row.id,
-      trigger: row.trigger_kind,
-      startedAt: row.started_at,
-      finishedAt: row.finished_at,
-      snapshot: {
-        id: row.snapshot_id,
-        capturedAt: row.snapshot_captured_at,
-        checks,
-        evidence: JSON.parse(row.evidence_json) as Evidence[],
-      },
-      exposure,
-      findings,
-      trail,
-      aiStatus: row.ai_status,
-    };
+        const scan: SecurityScan = {
+          id: row.id,
+          trigger: row.trigger_kind,
+          startedAt: row.started_at,
+          finishedAt: row.finished_at,
+          snapshot: {
+            id: row.snapshot_id,
+            capturedAt: row.snapshot_captured_at,
+            checks,
+            evidence: JSON.parse(row.evidence_json) as Evidence[],
+          },
+          exposure,
+          findings,
+          trail,
+          aiStatus: row.ai_status,
+        };
 
-    if (row.verdict_json !== null) {
-      scan.verdict = JSON.parse(row.verdict_json) as AiVerdict;
-    }
+        if (row.verdict_json !== null) {
+          scan.verdict = JSON.parse(row.verdict_json) as AiVerdict;
+        }
 
-    return scan;
+        return scan;
+      })
+      .deferred();
   }
 
   getCursor(source: string): string | null {
@@ -780,7 +817,7 @@ export class SecurityStore implements SecurityStoreContract {
         ) VALUES ('observation', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
 
-      const findAggregate = this.db.query(
+      const findAggregates = this.db.query(
         `SELECT row_id, event_id, source, category, severity, rule, target,
                 first_at, last_at, count, is_noise, payload_json
          FROM security_events
@@ -792,14 +829,17 @@ export class SecurityStore implements SecurityStoreContract {
            AND is_noise = ?
            AND last_at > ?
            AND first_at < ?
-         ORDER BY last_at DESC, row_id DESC
-         LIMIT 1`,
+         ORDER BY first_at ASC, row_id ASC`,
       );
 
       const updateAggregate = this.db.query(
         `UPDATE security_events
          SET severity = ?, first_at = ?, last_at = ?, hour_bucket = ?, count = ?, payload_json = ?
          WHERE row_id = ?`,
+      );
+
+      const deleteAggregate = this.db.query(
+        "DELETE FROM security_events WHERE row_id = ? AND row_kind = 'aggregate'",
       );
 
       const insertAggregate = this.db.query(
@@ -837,7 +877,7 @@ export class SecurityStore implements SecurityStoreContract {
           continue;
         }
 
-        const existingAgg = findAggregate.get(
+        const matchingAggs = findAggregates.all(
           event.source,
           event.category,
           event.rule,
@@ -845,15 +885,38 @@ export class SecurityStore implements SecurityStoreContract {
           isNoiseInt,
           event.firstAt - burstWindowMs,
           event.lastAt + burstWindowMs,
-        ) as SecurityEventRow | null;
+        ) as SecurityEventRow[];
 
-        if (existingAgg) {
-          const nextFirstAt = Math.min(existingAgg.first_at, event.firstAt);
-          const nextLastAt = Math.max(existingAgg.last_at, event.lastAt);
-          const nextCount = existingAgg.count + eventCount;
-          const escalated = SEVERITY_RANK[event.severity] > SEVERITY_RANK[existingAgg.severity];
-          const nextSeverity = escalated ? event.severity : existingAgg.severity;
-          const nextPayloadJson = escalated ? payloadJson : existingAgg.payload_json;
+        if (matchingAggs.length > 0) {
+          const keeper = matchingAggs[0]!;
+          let nextFirstAt = event.firstAt;
+          let nextLastAt = event.lastAt;
+          let nextCount = eventCount;
+          let nextSeverity: Severity = event.severity;
+          let latestAt = -Infinity;
+          let latestPayloadJson = payloadJson;
+
+          for (const agg of matchingAggs) {
+            if (agg.first_at < nextFirstAt) {
+              nextFirstAt = agg.first_at;
+            }
+            if (agg.last_at > nextLastAt) {
+              nextLastAt = agg.last_at;
+            }
+            nextCount += agg.count;
+            if (SEVERITY_RANK[agg.severity] > SEVERITY_RANK[nextSeverity]) {
+              nextSeverity = agg.severity;
+            }
+            if (agg.last_at >= latestAt) {
+              latestAt = agg.last_at;
+              latestPayloadJson = agg.payload_json;
+            }
+          }
+
+          if (event.lastAt >= latestAt) {
+            latestPayloadJson = payloadJson;
+          }
+
           const nextHourBucket = Math.floor(nextLastAt / HOUR_MS) * HOUR_MS;
 
           updateAggregate.run(
@@ -862,9 +925,13 @@ export class SecurityStore implements SecurityStoreContract {
             nextLastAt,
             nextHourBucket,
             nextCount,
-            nextPayloadJson,
-            existingAgg.row_id,
+            latestPayloadJson,
+            keeper.row_id,
           );
+
+          for (let index = 1; index < matchingAggs.length; index += 1) {
+            deleteAggregate.run(matchingAggs[index]!.row_id);
+          }
         } else {
           insertAggregate.run(
             event.id,
