@@ -6,6 +6,7 @@ const TRUSTED_SEARCH_PATH =
 const MAX_OUTPUT_BYTES = 256 * 1024;
 const COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_PAGE_SETTLE_MS = 50;
+const POST_EXIT_DRAIN_MS = 50;
 const MAX_CURSOR_LENGTH = 512;
 const MAX_JOURNAL_LIMIT = 1_000;
 
@@ -582,8 +583,11 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
         resolveTerminate = resolve;
       });
 
+      let postExitTimer: ReturnType<typeof setTimeout> | undefined;
       const exitedPromise = proc.exited.then((code) => {
         processExited = true;
+        // Descendants can hold either pipe open after the direct child exits.
+        postExitTimer = setTimeout(cancelReaders, POST_EXIT_DRAIN_MS);
         return code;
       });
 
@@ -710,6 +714,7 @@ export function createCommandRunner(options: CommandRunnerOptions = {}): Command
         return { status: "failed" };
       } finally {
         clearTimeout(timeoutId);
+        clearTimeout(postExitTimer);
         if (signal) {
           signal.removeEventListener("abort", onAbort);
         }
