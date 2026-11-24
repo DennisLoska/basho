@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   createOpencode,
   type OpencodeProvider,
+  type OpencodeProviderSettings,
 } from "ai-sdk-provider-opencode-sdk";
 import OpenAI from "openai";
 import type {
@@ -12,7 +13,7 @@ import type {
   ChatCompletionMessageToolCall,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
-import { redactSecrets } from "./config";
+import { isLocalOrPrivateHost, redactSecrets } from "./config";
 import { isValidSystemdUnitName } from "./runner";
 import { criterionIds, evidenceTools } from "./types";
 import type {
@@ -175,6 +176,20 @@ export interface HarnessGenerateTextCall {
   abortSignal?: AbortSignal;
 }
 
+export interface OpencodeHarnessProviderHandle {
+  getClientManager: () => {
+    getPort: () => Promise<{
+      generate: {
+        text: (
+          input: { prompt: string; model: HarnessModelRef },
+          opts?: { signal?: AbortSignal },
+        ) => Promise<{ text: string }>;
+      };
+    }>;
+  };
+  dispose: () => Promise<void>;
+}
+
 export interface OpencodeHarnessClientOptions {
   model: string;
   serverUrl?: string;
@@ -182,6 +197,10 @@ export interface OpencodeHarnessClientOptions {
   generateText?: (call: HarnessGenerateTextCall) => Promise<{ text: string }>;
   getPort?: () => number | undefined | Promise<number | undefined>;
   timeoutMs?: number;
+  fetcher?: HttpFetcher;
+  createProvider?: (
+    options?: OpencodeProviderSettings,
+  ) => OpencodeHarnessProviderHandle;
 }
 
 export interface ProposalDraft {
@@ -501,10 +520,10 @@ function wrapProviderError(
 }
 
 function createSafeFetcher(
-  baseURL: string,
+  baseURL: string | undefined,
   fetcher?: HttpFetcher,
 ): typeof fetch {
-  const expectedOrigin = new URL(baseURL).origin;
+  const expectedOrigin = baseURL !== undefined ? new URL(baseURL).origin : undefined;
   const transport: HttpFetcher =
     fetcher ?? ((url, init) => globalThis.fetch(url, init));
 
@@ -529,10 +548,31 @@ function createSafeFetcher(
       );
     }
 
-    if (parsed.origin !== expectedOrigin) {
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
       throw new AiProviderError(
         "provider_unavailable",
-        "AI provider request origin mismatch",
+        "AI provider request protocol is invalid",
+      );
+    }
+
+    if (parsed.username !== "" || parsed.password !== "") {
+      throw new AiProviderError(
+        "provider_unavailable",
+        "AI provider request embedded credentials rejected",
+      );
+    }
+
+    if (expectedOrigin !== undefined) {
+      if (parsed.origin !== expectedOrigin) {
+        throw new AiProviderError(
+          "provider_unavailable",
+          "AI provider request origin mismatch",
+        );
+      }
+    } else if (parsed.protocol === "http:" && !isLocalOrPrivateHost(parsed.hostname)) {
+      throw new AiProviderError(
+        "provider_unavailable",
+        "AI provider request host is not local, private, or Tailscale",
       );
     }
 
@@ -546,9 +586,21 @@ function createSafeFetcher(
       );
     }
 
-    if (response.redirected && response.url) {
+    if (response.redirected) {
+      const allowedOrigin = expectedOrigin ?? parsed.origin;
+      if (!response.url) {
+        throw new AiProviderError(
+          "provider_unavailable",
+          "AI provider redirect rejected",
+        );
+      }
       try {
-        if (new URL(response.url).origin !== expectedOrigin) {
+        const finalUrl = new URL(response.url);
+        if (
+          finalUrl.origin !== allowedOrigin ||
+          finalUrl.username !== "" ||
+          finalUrl.password !== ""
+        ) {
           throw new AiProviderError(
             "provider_unavailable",
             "AI provider cross-origin redirect rejected",
@@ -567,6 +619,15 @@ function createSafeFetcher(
   };
 
   return safeFetch as unknown as typeof fetch;
+}
+
+function normalizeOpenAiCompatibleModel(rawModel: string): string {
+  const trimmed = rawModel.trim();
+  const prefix = "opencode-go/";
+  if (trimmed.startsWith(prefix) && trimmed.length > prefix.length) {
+    return trimmed.slice(prefix.length);
+  }
+  return trimmed;
 }
 
 function parseHarnessModel(rawModel: string): HarnessModelRef {
@@ -762,19 +823,32 @@ export function createOpencodeHarnessClient(
     ? { opencodeServerPassword: options.serverPassword }
     : {};
 
-  let provider: OpencodeProvider | null = null;
+  const providerFactory: (
+    opts?: OpencodeProviderSettings,
+  ) => OpencodeHarnessProviderHandle =
+    options.createProvider ?? ((opts) => createOpencode(opts) as OpencodeProvider);
+
+  let provider: OpencodeHarnessProviderHandle | null = null;
   let disposed = false;
 
-  const ensureProvider = async (): Promise<OpencodeProvider> => {
+  const resetProvider = async (
+    failedProvider: OpencodeHarnessProviderHandle,
+  ): Promise<void> => {
+    if (provider === failedProvider) {
+      provider = null;
+    }
+    try {
+      await failedProvider.dispose();
+    } catch {
+      // Ignore dispose errors so subsequent turns start fresh.
+    }
+  };
+
+  const ensureProvider = async (): Promise<OpencodeHarnessProviderHandle> => {
     if (provider) return provider;
 
-    const authHeaders = buildBasicAuthHeaders(options.serverPassword);
-    const headers: Record<string, string> = {
-      "User-Agent": USER_AGENT,
-      ...(authHeaders ?? {}),
-    };
-
-    let explicitBaseUrl = options.serverUrl?.trim() || undefined;
+    const configuredServerUrl = options.serverUrl?.trim() || undefined;
+    let explicitBaseUrl = configuredServerUrl;
     if (!explicitBaseUrl && options.getPort) {
       const port = await options.getPort();
       if (typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535) {
@@ -783,20 +857,33 @@ export function createOpencodeHarnessClient(
     }
 
     if (explicitBaseUrl) {
-      provider = createOpencode({
+      // Only attach explicit Basic auth when serverUrl is explicitly configured.
+      const authHeaders = configuredServerUrl
+        ? buildBasicAuthHeaders(options.serverPassword)
+        : undefined;
+      const headers: Record<string, string> = {
+        "User-Agent": USER_AGENT,
+        ...(authHeaders ?? {}),
+      };
+      provider = providerFactory({
         baseUrl: explicitBaseUrl,
         autoStart: false,
         clientOptions: {
           headers,
-          fetch: createSafeFetcher(explicitBaseUrl),
+          fetch: createSafeFetcher(explicitBaseUrl, options.fetcher),
         },
       });
     } else {
+      // In service-discovery mode, never attach Basic auth so OpenCode's
+      // registered service.json credentials are preserved.
       const serviceFile = resolveOpencodeServiceFile();
-      provider = createOpencode({
+      provider = providerFactory({
         autoStart: false,
         ...(serviceFile ? { service: { file: serviceFile } } : {}),
-        clientOptions: { headers },
+        clientOptions: {
+          headers: { "User-Agent": USER_AGENT },
+          fetch: createSafeFetcher(undefined, options.fetcher),
+        },
       });
     }
 
@@ -842,7 +929,20 @@ export function createOpencodeHarnessClient(
           text = typeof response?.text === "string" ? response.text : "";
         } else {
           const activeProvider = await ensureProvider();
-          const port = await activeProvider.getClientManager().getPort();
+          let port: Awaited<
+            ReturnType<
+              ReturnType<OpencodeHarnessProviderHandle["getClientManager"]>["getPort"]
+            >
+          >;
+          try {
+            port = await raceWithAbort(
+              activeProvider.getClientManager().getPort(),
+              turnAbort.signal,
+            );
+          } catch (error) {
+            await resetProvider(activeProvider);
+            throw error;
+          }
           const response = await port.generate.text(
             { prompt, model: parsedModel },
             { signal: turnAbort.signal },
@@ -891,6 +991,7 @@ export function createAiProviderClient(
       ...(secrets.opencodeServerPassword
         ? { serverPassword: secrets.opencodeServerPassword }
         : {}),
+      ...(fetcher ? { fetcher } : {}),
     });
   }
 
@@ -899,6 +1000,7 @@ export function createAiProviderClient(
     return undefined;
   }
 
+  const compatibleModel = normalizeOpenAiCompatibleModel(settings.ai.model);
   const client = new OpenAI({
     apiKey,
     baseURL: settings.ai.baseURL,
@@ -913,7 +1015,7 @@ export function createAiProviderClient(
       try {
         const response = await client.chat.completions.create(
           {
-            model: settings.ai.model,
+            model: compatibleModel,
             messages: request.messages,
             max_tokens: PROVIDER_MAX_TOKENS,
             ...(request.tools.length > 0

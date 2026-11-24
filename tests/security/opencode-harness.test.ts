@@ -85,6 +85,20 @@ interface OpencodeHarnessClientOptions {
   generateText?: (call: HarnessGenerateTextCall) => Promise<{ text: string }>;
   getPort?: () => number | undefined | Promise<number | undefined>;
   timeoutMs?: number;
+  fetcher?: (url: string, init: RequestInit) => Promise<Response>;
+  createProvider?: (options?: Record<string, unknown>) => {
+    getClientManager: () => {
+      getPort: () => Promise<{
+        generate: {
+          text: (
+            input: { prompt: string; model: { providerID: string; id: string } },
+            opts?: { signal?: AbortSignal },
+          ) => Promise<{ text: string }>;
+        };
+      }>;
+    };
+    dispose: () => Promise<void>;
+  };
 }
 
 type HarnessClient = AiProviderClient & { dispose?: () => void | Promise<void> };
@@ -327,6 +341,23 @@ describe("loadSecurityConfig: opencode harness provider selection", () => {
 
     expect(aiProviderOf(settings)).toBe("opencode-harness");
     expect(settings.ai.model).toBe("deepseek-v4.1-flash");
+  });
+
+  test("defaults to openai-compatible when ai.provider and BASHO_AI_PROVIDER are omitted and OPENCODE_API_KEY is set", () => {
+    const { settings, secrets } = loadSecurityConfig({
+      env: { OPENCODE_API_KEY: "test-api-key" },
+      fileConfig: { ai: { model: "opencode-go/deepseek-v4.1-flash" } },
+    });
+
+    expect(aiProviderOf(settings)).toBe("openai-compatible");
+    expect(secrets.aiKey).toBe("test-api-key");
+
+    // Explicit fileConfig.ai.provider still takes precedence over OPENCODE_API_KEY.
+    const explicit = loadSecurityConfig({
+      env: { OPENCODE_API_KEY: "test-api-key" },
+      fileConfig: { ai: { provider: "opencode-harness" } },
+    });
+    expect(aiProviderOf(explicit.settings)).toBe("opencode-harness");
   });
 
   test("BASHO_AI_PROVIDER=openai-compatible switches the provider", () => {
@@ -591,6 +622,169 @@ describe("createOpencodeHarnessClient", () => {
     await Promise.resolve(client.dispose?.());
     await Promise.resolve(client.dispose?.());
   });
+
+  test("races getPort() against turn timeout, disposes hung provider, and recovers on Turn 2", async () => {
+    let providerCreateCount = 0;
+    let turn1Disposed = 0;
+
+    const client = buildClient({
+      timeoutMs: 40,
+      createProvider: () => {
+        providerCreateCount += 1;
+        const instance = providerCreateCount;
+        return {
+          getClientManager: () => ({
+            getPort: () => {
+              if (instance === 1) {
+                // Simulate a hung getPort() promise that never settles.
+                return new Promise(() => {});
+              }
+              return Promise.resolve({
+                generate: {
+                  text: async () => ({
+                    text: JSON.stringify({ verdict: { kind: "healthy" } }),
+                  }),
+                },
+              });
+            },
+          }),
+          dispose: async () => {
+            if (instance === 1) {
+              turn1Disposed += 1;
+            }
+          },
+        };
+      },
+    });
+
+    const firstError = await captureError(() => client.complete(turnRequest()));
+    expect(firstError).toBeInstanceOf(AiProviderError);
+    expect((firstError as AiProviderError).reason).toBe("timeout");
+    expect(turn1Disposed).toBe(1);
+
+    const second = await client.complete(turnRequest());
+    expect(providerCreateCount).toBe(2);
+    expect(second.content).toBe(JSON.stringify({ verdict: { kind: "healthy" } }));
+    expect(second.calls).toEqual([]);
+  });
+
+  test("does not inject OPENCODE_SERVER_PASSWORD Basic auth header in service-discovery mode", async () => {
+    const capturedOptions: Record<string, unknown>[] = [];
+
+    const client = requiresClient()({
+      model: MODEL,
+      serverPassword: SERVER_PASSWORD,
+      createProvider: (opts) => {
+        capturedOptions.push(opts ?? {});
+        return {
+          getClientManager: () => ({
+            getPort: async () => ({
+              generate: {
+                text: async () => ({ text: "{}" }),
+              },
+            }),
+          }),
+          dispose: async () => {},
+        };
+      },
+    });
+
+    await client.complete(turnRequest());
+
+    expect(capturedOptions).toHaveLength(1);
+    const clientOptions = capturedOptions[0]?.clientOptions as
+      | { headers?: Record<string, string>; fetch?: typeof fetch }
+      | undefined;
+    expect(clientOptions).toBeDefined();
+    const headerKeys = Object.keys(clientOptions?.headers ?? {}).map((k) => k.toLowerCase());
+    expect(headerKeys).not.toContain("authorization");
+    expect(typeof clientOptions?.fetch).toBe("function");
+
+    // Contrast: explicit serverUrl attaches Basic auth for OPENCODE_SERVER_PASSWORD.
+    const explicitOptions: Record<string, unknown>[] = [];
+    const explicitClient = requiresClient()({
+      model: MODEL,
+      serverUrl: "http://127.0.0.1:49374",
+      serverPassword: SERVER_PASSWORD,
+      createProvider: (opts) => {
+        explicitOptions.push(opts ?? {});
+        return {
+          getClientManager: () => ({
+            getPort: async () => ({
+              generate: {
+                text: async () => ({ text: "{}" }),
+              },
+            }),
+          }),
+          dispose: async () => {},
+        };
+      },
+    });
+    await explicitClient.complete(turnRequest());
+    const explicitHeaders = (
+      explicitOptions[0]?.clientOptions as { headers?: Record<string, string> } | undefined
+    )?.headers;
+    expect(explicitHeaders?.Authorization).toBe(basicCredentials(SERVER_PASSWORD).header);
+  });
+
+  test("enforces redirect: error and origin/userinfo safety in service-discovery mode fetcher", async () => {
+    const capturedOptions: Record<string, unknown>[] = [];
+    const transportCalls: { url: string; init: RequestInit }[] = [];
+
+    const client = requiresClient()({
+      model: MODEL,
+      fetcher: async (url, init) => {
+        transportCalls.push({ url, init });
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://evil.example.test/steal" },
+        });
+      },
+      createProvider: (opts) => {
+        capturedOptions.push(opts ?? {});
+        return {
+          getClientManager: () => ({
+            getPort: async () => ({
+              generate: {
+                text: async () => ({ text: "{}" }),
+              },
+            }),
+          }),
+          dispose: async () => {},
+        };
+      },
+    });
+
+    await client.complete(turnRequest());
+
+    const clientOptions = capturedOptions[0]?.clientOptions as
+      | { fetch?: typeof fetch }
+      | undefined;
+    expect(typeof clientOptions?.fetch).toBe("function");
+    const discoveryFetch = clientOptions!.fetch!;
+
+    // 1. 3xx redirect must be rejected and outbound init must enforce redirect: "error".
+    const redirectErr = await captureError(() =>
+      discoveryFetch("http://127.0.0.1:49374/api/info", { method: "GET" }),
+    );
+    expect(redirectErr).toBeInstanceOf(AiProviderError);
+    expect(transportCalls).toHaveLength(1);
+    expect(transportCalls[0]!.init.redirect).toBe("error");
+
+    // 2. Public cleartext http origin must be rejected before calling transport.
+    const publicHttpErr = await captureError(() =>
+      discoveryFetch("http://public.example.test/api/info", { method: "GET" }),
+    );
+    expect(publicHttpErr).toBeInstanceOf(AiProviderError);
+    expect(transportCalls).toHaveLength(1);
+
+    // 3. Embedded URL userinfo must be rejected before calling transport.
+    const userinfoErr = await captureError(() =>
+      discoveryFetch("http://user:pass@127.0.0.1:49374/api/info", { method: "GET" }),
+    );
+    expect(userinfoErr).toBeInstanceOf(AiProviderError);
+    expect(transportCalls).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -740,5 +934,51 @@ describe("createLiveSecurityRuntime AI provider composition", () => {
     expect(
       aiAnalystModule.createAiProviderClient(compatible.settings, compatible.secrets),
     ).toBeUndefined();
+  });
+
+  test("strips leading opencode-go/ prefix before calling openai-compatible chat.completions.create", async () => {
+    const sentBodies: Record<string, unknown>[] = [];
+    const fetcher = async (_url: string, init: RequestInit): Promise<Response> => {
+      if (typeof init.body === "string") {
+        sentBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+      }
+      return new Response(
+        JSON.stringify({
+          id: "chatcmpl-test",
+          object: "chat.completion",
+          created: 1_700_000_000,
+          model: "deepseek-v4.1-flash",
+          choices: [
+            {
+              index: 0,
+              finish_reason: "stop",
+              message: { role: "assistant", content: "{}" },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const { settings, secrets } = loadSecurityConfig({
+      env: {
+        BASHO_AI_PROVIDER: "openai-compatible",
+        OPENCODE_API_KEY: "test-key",
+      },
+      fileConfig: {
+        ai: {
+          baseURL: "https://opencode.ai/zen/go/v1",
+          model: "opencode-go/deepseek-v4.1-flash",
+        },
+      },
+    });
+
+    const client = aiAnalystModule.createAiProviderClient(settings, secrets, fetcher);
+    expect(client).toBeDefined();
+
+    await client!.complete(turnRequest());
+
+    expect(sentBodies).toHaveLength(1);
+    expect(sentBodies[0]!.model).toBe("deepseek-v4.1-flash");
   });
 });

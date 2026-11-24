@@ -28,7 +28,7 @@ Local-first server dashboard for monitoring system resources, discovering local 
 - **Quick Telemetry Strip** — At-a-glance summary cards for CPU load, memory usage, GPU utilization/temp, and block I/O ops/s with anchor jump links
 - **Service Discovery** — Automatic TCP scanning of `localhost:1-9999` (excluding port 22) with HTML `<title>` extraction, live client-side online/offline health checks, instant search/port filtering, and LAN hostname rewriting for mobile access
 - **Security Posture & Network Exposure** — Continuous host hardening checks across 8 criteria, socket-to-firewall reachability matrix, journald/socket event triage, and SQLite audit history
-- **AI Investigation & Triage** — Bounded read-only evidence investigation defaulting to the local **OpenCode 2.x harness** (`ai` + `ai-sdk-provider-opencode-sdk`, `opencode-go/deepseek-v4.1-flash`, zero API key fees via your local OpenCode Go subscription) with optional `openai-compatible` mode via the official OpenAI SDK and graceful degradation when AI is unconfigured or offline
+- **AI Investigation & Triage** — Bounded read-only evidence investigation defaulting to the local **OpenCode 2.x harness** (`ai-sdk-provider-opencode-sdk` using `@opencode/client` against your local OpenCode 2.x service, `opencode-go/deepseek-v4.1-flash`, zero API key fees via your local OpenCode Go subscription) with optional `openai-compatible` mode via the official `openai` SDK and graceful degradation when AI is unconfigured or offline
 - **Tailscale-First Alerts & Guardrailed Containment** — Multi-channel alerting (`in-app`, `desktop`, `ntfy`, `discord`, `telegram`) and time-bounded containment (`monitor`, `approve`, `auto-lockdown`) protected by a `DeadMansSwitch` and independent rollback timers
 - **Live SSE Streaming** — Server-Sent Events push unified system telemetry every 2 seconds (plus live security status updates) with zero-dependency SVG sparkline charts (60-point rolling window)
 - **OpenCode Theme System** — High-contrast **OpenCode Dark** (`opencode`, default) and **OpenCode Light** (`opencode-light`) themes with `localStorage` persistence
@@ -45,7 +45,7 @@ Local-first server dashboard for monitoring system resources, discovering local 
 | Templates | Hono JSX |
 | Monitoring | [systeminformation](https://systeminformation.io) + `nvidia-smi` fallback |
 | Persistence | SQLite via `bun:sqlite` |
-| AI Investigation | Local [OpenCode 2.x harness](https://github.com/anomalyco/opencode) via [AI SDK](https://ai-sdk.dev) + `ai-sdk-provider-opencode-sdk` (default), or [OpenAI SDK](https://github.com/openai/openai-node) (`openai-compatible`) |
+| AI Investigation | Local [OpenCode 2.x harness](https://github.com/anomalyco/opencode) via `ai-sdk-provider-opencode-sdk` (`@opencode/client`, default), or official [OpenAI SDK](https://github.com/openai/openai-node) (`openai-compatible`) |
 | Alerting | In-app, `notify-send`, Tailscale-first `ntfy`, Discord, Telegram |
 | Containment | User-space systemd workloads + optional root-owned `ufw`/`systemd-run` helper |
 | Bundler | Bun (native) |
@@ -91,7 +91,8 @@ BASHO_DEMO_SECURITY=1 BASHO_HOST=127.0.0.1 BASHO_PORT=16969 bun run start
 ```
 
 By default (`BASHO_AI_PROVIDER=opencode-harness`), Basho connects to your local
-**OpenCode 2.x harness** (`ai` + `ai-sdk-provider-opencode-sdk`, default model
+**OpenCode 2.x harness** (`ai-sdk-provider-opencode-sdk` using `@opencode/client`
+against your local OpenCode 2.x service, default model
 `opencode-go/deepseek-v4.1-flash`) using your stored local OpenCode Go subscription
 with zero API key fees. Every turn uses the session-less, tool-less, history-less
 `generate.text` endpoint so OpenCode never executes host shell or file tools and
@@ -102,7 +103,11 @@ server instead of automatic local service discovery.
 To use an external OpenAI-compatible HTTP endpoint instead, set
 `BASHO_AI_PROVIDER=openai-compatible` and `OPENCODE_API_KEY` (using the official
 `openai` SDK against `https://opencode.ai/zen/go/v1` or `OPENCODE_BASE_URL`).
-Posture and event monitoring continue when AI is unavailable.
+**Upgrade note:** shipped `config/security.json` defaults to `opencode-harness`, so
+users who prefer the HTTP API key mode should set `BASHO_AI_PROVIDER=openai-compatible`
+alongside `OPENCODE_API_KEY` (custom configs that omit `ai.provider` automatically
+fall back to `openai-compatible` when `OPENCODE_API_KEY` is set). Posture and event
+monitoring continue when AI is unavailable.
 
 Configure `notifications.ntfyUrl` with the topic URL reachable from Basho over
 Tailscale, and `notifications.publicOrigin` with the dashboard origin reachable
@@ -113,7 +118,7 @@ for a private topic. Use Test Alert to verify delivery.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `BASHO_AI_PROVIDER` | `opencode-harness` | AI provider backend: `opencode-harness` (local OpenCode 2.x harness via `ai` + `ai-sdk-provider-opencode-sdk`, no API key required) or `openai-compatible` (official `openai` SDK) |
+| `BASHO_AI_PROVIDER` | `opencode-harness` | AI provider backend: `opencode-harness` (local OpenCode 2.x harness via `ai-sdk-provider-opencode-sdk` using `@opencode/client`, no API key required) or `openai-compatible` (official `openai` SDK) |
 | `OPENCODE_SERVER_URL` | *(auto-discovered)* | Explicit OpenCode 2.x server URL for `opencode-harness` (overrides local service discovery; `http://` restricted to local, private, or Tailscale endpoints) |
 | `OPENCODE_SERVER_PASSWORD` | *(unset)* | Optional Basic-auth password for an authenticated OpenCode 2.x server (`opencode:<password>`) |
 | `OPENCODE_API_KEY` | *(unset)* | API key for `BASHO_AI_PROVIDER=openai-compatible` via the official `openai` SDK; `openai-compatible` stays `unconfigured` when omitted |
@@ -135,7 +140,7 @@ for a private topic. Use Test Alert to verify delivery.
 
 #### AI Provider & Notification Channels
 
-- **AI provider:** Defaults to `opencode-harness` (`ai` + `ai-sdk-provider-opencode-sdk`, default model `opencode-go/deepseek-v4.1-flash`) talking to your local OpenCode 2.x service over its session-less, tool-less `generate.text` route using your local OpenCode Go subscription (no `OPENCODE_API_KEY` required; override with `OPENCODE_SERVER_URL` / `OPENCODE_SERVER_PASSWORD`). Set `BASHO_AI_PROVIDER=openai-compatible` with `OPENCODE_API_KEY` to use the official `openai` SDK against `https://opencode.ai/zen/go/v1` or any OpenAI-compatible endpoint via `OPENCODE_BASE_URL`. Investigation tools are strictly read-only and evidence-bound.
+- **AI provider:** Defaults to `opencode-harness` (`ai-sdk-provider-opencode-sdk` using `@opencode/client` against your local OpenCode 2.x service, default model `opencode-go/deepseek-v4.1-flash`) over its session-less, tool-less `generate.text` route using your local OpenCode Go subscription (no `OPENCODE_API_KEY` required; override with `OPENCODE_SERVER_URL` / `OPENCODE_SERVER_PASSWORD`). Set `BASHO_AI_PROVIDER=openai-compatible` with `OPENCODE_API_KEY` to use the official `openai` SDK against `https://opencode.ai/zen/go/v1` or any OpenAI-compatible endpoint via `OPENCODE_BASE_URL`. Investigation tools are strictly read-only and evidence-bound.
 - **Alert channels (`notifications.channels`):**
   - `in-app` (default): Live dashboard alert banner, dismiss controls, and navigation indicator dot.
   - `desktop`: Local desktop notifications via `notify-send` using a fixed argument runner.

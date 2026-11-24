@@ -102,7 +102,7 @@ function isPrivateOrLocalIpv4(octets: [number, number, number, number]): boolean
   return false;
 }
 
-function isLocalOrPrivateHost(rawHostname: string): boolean {
+export function isLocalOrPrivateHost(rawHostname: string): boolean {
   const host = rawHostname.replace(/^\[|\]$/g, "").toLowerCase();
   if (!host) return false;
   if (
@@ -476,10 +476,12 @@ export function loadSecurityConfig(
       ? validateAiProvider(fileAi.provider, "ai.provider")
       : undefined;
   const envProvider = env.BASHO_AI_PROVIDER;
+  const hasApiKey =
+    typeof env.OPENCODE_API_KEY === "string" && env.OPENCODE_API_KEY.trim() !== "";
   const provider: AiProviderKind =
     envProvider !== undefined && envProvider !== ""
       ? validateAiProvider(envProvider.trim(), "BASHO_AI_PROVIDER")
-      : (fileProvider ?? "opencode-harness");
+      : (fileProvider ?? (hasApiKey ? "openai-compatible" : "opencode-harness"));
 
   const fileServerUrl =
     fileAi.serverUrl !== undefined
