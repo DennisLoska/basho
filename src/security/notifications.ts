@@ -30,6 +30,20 @@ const DISCORD_SEVERITY_COLOR: Record<Severity, number> = {
   info: 0x2563eb,
 };
 
+const CHANNEL_PRIORITY: Record<AlertChannel, number> = {
+  "in-app": 0,
+  desktop: 1,
+  ntfy: 2,
+  discord: 2,
+  telegram: 2,
+};
+
+function prioritizeDeliveries(batch: readonly AlertDelivery[]): AlertDelivery[] {
+  return [...batch].sort(
+    (a, b) => (CHANNEL_PRIORITY[a.channel] ?? 3) - (CHANNEL_PRIORITY[b.channel] ?? 3),
+  );
+}
+
 export type NotificationStore = Pick<
   SecurityStoreContract,
   "enqueueAlert" | "claimDeliveries" | "settleDelivery" | "channelHealth"
@@ -167,17 +181,25 @@ function computeBackoffMs(attempts: number, retryAfterMs?: number): number {
 function isRedirectError(error: unknown): boolean {
   let current: unknown = error;
   const seen = new Set<unknown>();
-  while (current && typeof current === "object" && !seen.has(current)) {
+  while (current !== null && current !== undefined && !seen.has(current)) {
+    if (typeof current === "string") {
+      return /redirect/i.test(current);
+    }
+    if (typeof current !== "object") {
+      return false;
+    }
     seen.add(current);
-    if ("message" in current && typeof current.message === "string") {
-      if (/\bredirect(?:ed|s|ing)?\b/i.test(current.message)) {
-        return true;
-      }
+    if ("code" in current && current.code === "UnexpectedRedirect") {
+      return true;
+    }
+    if (
+      "message" in current &&
+      typeof current.message === "string" &&
+      /redirect/i.test(current.message)
+    ) {
+      return true;
     }
     current = "cause" in current ? current.cause : undefined;
-  }
-  if (typeof error === "string" && /\bredirect(?:ed|s|ing)?\b/i.test(error)) {
-    return true;
   }
   return false;
 }
@@ -242,6 +264,8 @@ export class NotificationDispatcher {
   private readonly runner: CommandRunner;
   private readonly fetcher: HttpFetcher;
   private readonly onInApp: (alert: SecurityAlert) => void;
+  private activeDrain: Promise<void> | null = null;
+  private drainRequested = false;
 
   constructor(options: NotificationDispatcherOptions) {
     this.store = options.store;
@@ -289,32 +313,58 @@ export class NotificationDispatcher {
   }
 
   async drain(): Promise<void> {
-    const seenInDrain = new Set<string>();
-    for (;;) {
-      const batch = this.store.claimDeliveries(
-        this.clock.now(),
-        CLAIM_BATCH_SIZE,
-        CLAIM_LEASE_MS,
-      );
-      if (batch.length === 0) {
-        return;
-      }
+    if (this.activeDrain) {
+      this.drainRequested = true;
+      return this.activeDrain;
+    }
 
-      let anyNew = false;
-      for (const delivery of batch) {
-        if (!seenInDrain.has(delivery.id)) {
-          seenInDrain.add(delivery.id);
-          anyNew = true;
+    let completed = false;
+    const run = this.runDrainLoop(() => {
+      completed = true;
+      this.activeDrain = null;
+    });
+    if (!completed) {
+      this.activeDrain = run;
+    }
+    return run;
+  }
+
+  private async runDrainLoop(onComplete: () => void): Promise<void> {
+    const seenInDrain = new Set<string>();
+    try {
+      for (;;) {
+        this.drainRequested = false;
+        const batch = this.store.claimDeliveries(
+          this.clock.now(),
+          CLAIM_BATCH_SIZE,
+          CLAIM_LEASE_MS,
+        );
+        if (batch.length === 0) {
+          if (this.drainRequested) {
+            continue;
+          }
+          return;
+        }
+
+        let anyNew = false;
+        for (const delivery of batch) {
+          if (!seenInDrain.has(delivery.id)) {
+            seenInDrain.add(delivery.id);
+            anyNew = true;
+          }
+        }
+
+        const prioritized = prioritizeDeliveries(batch);
+        await runWithConcurrency(prioritized, MAX_CONCURRENCY, async (delivery) => {
+          await this.deliverOne(delivery);
+        });
+
+        if (!anyNew && !this.drainRequested) {
+          return;
         }
       }
-
-      await runWithConcurrency(batch, MAX_CONCURRENCY, async (delivery) => {
-        await this.deliverOne(delivery);
-      });
-
-      if (!anyNew) {
-        return;
-      }
+    } finally {
+      onComplete();
     }
   }
 
@@ -421,9 +471,13 @@ export class NotificationDispatcher {
     }
   }
 
-  private deliverInApp(alert: SecurityAlert): DeliveryOutcome {
-    this.onInApp(alert);
-    return { kind: "sent" };
+  private async deliverInApp(alert: SecurityAlert): Promise<DeliveryOutcome> {
+    try {
+      await this.onInApp(alert);
+      return { kind: "sent" };
+    } catch {
+      return { kind: "permanent_failure" };
+    }
   }
 
   private async deliverNtfy(alert: SecurityAlert): Promise<DeliveryOutcome> {

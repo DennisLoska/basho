@@ -926,3 +926,329 @@ test("discord rejects query parameters and malformed webhook paths without fetch
     }
   }
 });
+
+test("Bun UnexpectedRedirect error shape fails permanently on attempt 1 without leaking secrets", async () => {
+  const errorCases: Error[] = [
+    Object.assign(
+      new Error(`UnexpectedRedirect fetching "${NTFY_URL}"`),
+      { code: "UnexpectedRedirect" },
+    ),
+    new Error("fetch failed", {
+      cause: Object.assign(new Error("blocked"), { code: "UnexpectedRedirect" }),
+    }),
+  ];
+
+  for (const [index, redirectError] of errorCases.entries()) {
+    const harness = ntfyHarness({
+      secrets: { ntfyToken: NTFY_TOKEN },
+      fetchResponse: () => {
+        throw redirectError;
+      },
+    });
+    try {
+      harness.dispatcher.publish(alertFixture(`bun-redirect-${index}`));
+      await harness.dispatcher.drain();
+
+      expect(harness.requests).toHaveLength(1);
+      expect(harness.store.channelHealth().ntfy?.status).toBe("failed");
+      expect(JSON.stringify(harness.dispatcher.health())).not.toContain(NTFY_TOKEN);
+
+      await harness.dispatcher.drain();
+      expect(harness.requests).toHaveLength(1);
+    } finally {
+      harness.store.close();
+    }
+  }
+});
+
+test("real Bun fetch with redirect:error settles 302 as permanent failure in 1 request without following", async () => {
+  let originHits = 0;
+  let targetHits = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request): Response {
+      const url = new URL(request.url);
+      if (url.pathname === "/redirected") {
+        targetHits += 1;
+        return new Response("followed", { status: 200 });
+      }
+      originHits += 1;
+      return new Response(null, {
+        status: 302,
+        headers: { Location: new URL("/redirected", url).href },
+      });
+    },
+  });
+
+  const store = new SecurityStore(":memory:");
+  try {
+    const dispatcher = new NotificationDispatcher({
+      store,
+      clock: { now: () => 1_000 },
+      config: {
+        channels: ["ntfy"],
+        cooldownMinutes: 15,
+        ntfyUrl: `http://127.0.0.1:${server.port}/basho`,
+      },
+      secrets: { ntfyToken: NTFY_TOKEN },
+      runner: { async run() { return { status: "unavailable" }; } },
+      onInApp: () => {},
+    });
+
+    dispatcher.publish(alertFixture("real-302"));
+    await dispatcher.drain();
+
+    expect(originHits).toBe(1);
+    expect(targetHits).toBe(0);
+    expect(store.channelHealth().ntfy?.status).toBe("failed");
+    expect(JSON.stringify(dispatcher.health())).not.toContain(NTFY_TOKEN);
+
+    await dispatcher.drain();
+    expect(originHits).toBe(1);
+    expect(targetHits).toBe(0);
+  } finally {
+    store.close();
+    server.stop(true);
+  }
+});
+
+test("overlapping drain calls coalesce to preserve global concurrency cap and drain mid-drain alerts", async () => {
+  let active = 0;
+  let maxActive = 0;
+  let started = 0;
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  let midDrainPromise: Promise<void> | undefined;
+  let harness!: Harness;
+
+  harness = ntfyHarness({
+    fetchResponse: async (_url, init) => {
+      started += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      const body = String(init.body);
+
+      if (started <= 4) {
+        await gate;
+      } else {
+        if (started === 9) {
+          harness.dispatcher.publish(alertFixture("mid-drain-late"));
+          midDrainPromise = harness.dispatcher.drain();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+
+      active -= 1;
+      return new Response(body, { status: 204 });
+    },
+  });
+
+  let first: Promise<void> | undefined;
+  let second: Promise<void> | undefined;
+  let third: Promise<void> | undefined;
+  try {
+    for (let index = 0; index < 10; index += 1) {
+      expect(harness.dispatcher.publish(alertFixture(`overlap-${index}`))).toBe(true);
+    }
+
+    first = harness.dispatcher.drain();
+    second = harness.dispatcher.drain();
+    third = harness.dispatcher.drain();
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(maxActive).toBeLessThanOrEqual(4);
+
+    releaseGate();
+    await Promise.all([first, second, third]);
+    if (midDrainPromise) {
+      await midDrainPromise;
+    }
+
+    expect(maxActive).toBeGreaterThan(0);
+    expect(maxActive).toBeLessThanOrEqual(4);
+    expect(harness.requests).toHaveLength(11);
+    expect(harness.requests.map((entry) => String(entry.init.body))).toContain("Alert mid-drain-late");
+  } finally {
+    releaseGate();
+    await Promise.allSettled([first, second, third, midDrainPromise].filter(Boolean));
+    harness.store.close();
+  }
+});
+
+test("throwing onInApp subscriber settles permanently as failed in 1 attempt without retrying", async () => {
+  const clock = fakeClock(1_000);
+  const store = new SecurityStore(":memory:");
+  let calls = 0;
+  const dispatcher = new NotificationDispatcher({
+    store,
+    clock,
+    config: { channels: ["in-app"], cooldownMinutes: 15 },
+    secrets: {},
+    runner: { async run() { return { status: "unavailable" }; } },
+    fetcher: async () => new Response(null, { status: 204 }),
+    onInApp: () => {
+      calls += 1;
+      throw new Error("subscriber failure");
+    },
+  });
+  try {
+    dispatcher.publish(alertFixture("in-app-throws"));
+    await dispatcher.drain();
+
+    expect(calls).toBe(1);
+    expect(store.channelHealth()["in-app"]?.status).toBe("failed");
+
+    clock.advance(HOUR_MS);
+    await dispatcher.drain();
+    expect(calls).toBe(1);
+    expect(store.channelHealth()["in-app"]?.status).toBe("failed");
+  } finally {
+    store.close();
+  }
+});
+
+test("429 honors HTTP-date Retry-After headers and caps backoff at 300 seconds", async () => {
+  const start = Date.UTC(2026, 0, 1, 0, 0, 0);
+
+  // HTTP-date Retry-After within cap (90s)
+  {
+    const clock = fakeClock(start);
+    let calls = 0;
+    const retryDate = new Date(start + 90_000).toUTCString();
+    const harness = ntfyHarness({
+      now: clock.now,
+      fetchResponse: () => {
+        calls += 1;
+        if (calls === 1) {
+          return new Response(null, { status: 429, headers: { "Retry-After": retryDate } });
+        }
+        return new Response(null, { status: 204 });
+      },
+    });
+    try {
+      harness.dispatcher.publish(alertFixture("retry-after-http-date"));
+      await harness.dispatcher.drain();
+      expect(calls).toBe(1);
+      expect(harness.store.channelHealth().ntfy?.status).toBe("retrying");
+
+      clock.advance(89_000);
+      await harness.dispatcher.drain();
+      expect(calls).toBe(1);
+
+      clock.advance(1_000);
+      await harness.dispatcher.drain();
+      expect(calls).toBe(2);
+      expect(harness.store.channelHealth().ntfy?.status).toBe("sent");
+    } finally {
+      harness.store.close();
+    }
+  }
+
+  // Numeric and HTTP-date Retry-After exceeding 300s are capped at 300s
+  for (const [label, headerValue] of [
+    ["numeric-cap", "3600"],
+    ["http-date-cap", new Date(start + HOUR_MS).toUTCString()],
+  ] as const) {
+    const clock = fakeClock(start);
+    let calls = 0;
+    const harness = ntfyHarness({
+      now: clock.now,
+      fetchResponse: () => {
+        calls += 1;
+        if (calls === 1) {
+          return new Response(null, { status: 429, headers: { "Retry-After": headerValue } });
+        }
+        return new Response(null, { status: 204 });
+      },
+    });
+    try {
+      harness.dispatcher.publish(alertFixture(`retry-after-${label}`));
+      await harness.dispatcher.drain();
+      expect(calls).toBe(1);
+
+      clock.advance(299_000);
+      await harness.dispatcher.drain();
+      expect(calls).toBe(1);
+
+      clock.advance(1_000);
+      await harness.dispatcher.drain();
+      expect(calls).toBe(2);
+      expect(harness.store.channelHealth().ntfy?.status).toBe("sent");
+    } finally {
+      harness.store.close();
+    }
+  }
+});
+
+test("local in-app and desktop deliveries complete promptly ahead of slow remote channels in the same batch", async () => {
+  let releaseRemote!: () => void;
+  const remoteGate = new Promise<void>((resolve) => {
+    releaseRemote = resolve;
+  });
+  const dispatchOrder: string[] = [];
+
+  const store = new SecurityStore(":memory:");
+  const inApp: SecurityAlert[] = [];
+  const desktopAlerts: string[] = [];
+
+  const dispatcher = new NotificationDispatcher({
+    store,
+    clock: { now: () => 1_000 },
+    config: {
+      channels: ["ntfy", "discord", "desktop", "in-app"],
+      cooldownMinutes: 15,
+      ntfyUrl: NTFY_URL,
+    },
+    secrets: { discordWebhook: DISCORD_WEBHOOK },
+    runner: {
+      async run(request) {
+        if (request.kind === "desktop") {
+          dispatchOrder.push(`desktop:${request.summary}`);
+          desktopAlerts.push(request.summary);
+        }
+        return { status: "ok", stdout: "", exitCode: 0 };
+      },
+    },
+    fetcher: async (url) => {
+      dispatchOrder.push(`remote:${url}`);
+      await remoteGate;
+      return new Response(null, { status: 204 });
+    },
+    onInApp: (alert) => {
+      dispatchOrder.push(`in-app:${alert.id}`);
+      inApp.push(alert);
+    },
+  });
+
+  let drainPromise: Promise<void> | undefined;
+  try {
+    expect(dispatcher.publish(alertFixture("local-prio-1", { severity: "breach" }))).toBe(true);
+    expect(dispatcher.publish(alertFixture("local-prio-2", { severity: "breach" }))).toBe(true);
+
+    drainPromise = dispatcher.drain();
+
+    // Yield briefly so local channels finish while remote requests remain blocked
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(inApp.map((alert) => alert.id)).toEqual(["local-prio-1", "local-prio-2"]);
+    expect(desktopAlerts).toHaveLength(2);
+    expect(dispatchOrder.slice(0, 2)).toEqual(["in-app:local-prio-1", "in-app:local-prio-2"]);
+    expect(dispatchOrder[2]?.startsWith("desktop:")).toBe(true);
+    expect(dispatchOrder[3]?.startsWith("desktop:")).toBe(true);
+
+    releaseRemote();
+    await drainPromise;
+
+    expect(store.channelHealth()["in-app"]?.status).toBe("sent");
+    expect(store.channelHealth().desktop?.status).toBe("sent");
+    expect(store.channelHealth().ntfy?.status).toBe("sent");
+    expect(store.channelHealth().discord?.status).toBe("sent");
+  } finally {
+    releaseRemote();
+    await drainPromise?.catch(() => {});
+    store.close();
+  }
+});
