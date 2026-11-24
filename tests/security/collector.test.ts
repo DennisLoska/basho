@@ -45,6 +45,7 @@ function settings(patch: Partial<SecuritySettings> = {}): SecuritySettings {
     expectedPorts: [22, 6969],
     workloads: [],
     ai: {
+      provider: "opencode-harness",
       baseURL: "https://example.test/v1",
       model: "test-model",
       sessionHeader: true,

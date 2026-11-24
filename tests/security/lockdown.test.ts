@@ -102,6 +102,7 @@ function makeSettings(overrides: Partial<SecuritySettings> = {}): SecuritySettin
     expectedPorts: [22],
     workloads: [],
     ai: {
+      provider: "opencode-harness",
       baseURL: "https://ai.example.test/v1",
       model: "fixture-model",
       sessionHeader: false,

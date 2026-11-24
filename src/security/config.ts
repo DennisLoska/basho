@@ -1,11 +1,13 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
+  aiProviderKinds,
   alertChannels,
   criterionIds,
   lockdownModes,
 } from "./types";
 import type {
+  AiProviderKind,
   AlertChannel,
   CriterionId,
   EnrolledWorkload,
@@ -21,6 +23,7 @@ const DEFAULT_CONFIG_PATH = resolve(import.meta.dir, "../../config/security.json
 
 const CRITERION_SET = new Set<string>(criterionIds);
 const MODE_SET = new Set<string>(lockdownModes);
+const AI_PROVIDER_SET = new Set<string>(aiProviderKinds);
 const CHANNEL_SET = new Set<string>(alertChannels);
 const OVERRIDE_KEYS = new Set(["mode", "scanIntervalMinutes", "criteria"]);
 
@@ -46,6 +49,15 @@ function validateMode(value: unknown): LockdownMode {
     throw new Error(`Invalid lockdown mode: ${String(value)}`);
   }
   return value as LockdownMode;
+}
+
+function validateAiProvider(value: unknown, label: string): AiProviderKind {
+  if (typeof value !== "string" || !AI_PROVIDER_SET.has(value)) {
+    throw new Error(
+      `Invalid ${label}: expected one of ${aiProviderKinds.join(", ")}`,
+    );
+  }
+  return value as AiProviderKind;
 }
 
 function validateIntRange(value: unknown, min: number, max: number, label: string): number {
@@ -90,7 +102,7 @@ function isPrivateOrLocalIpv4(octets: [number, number, number, number]): boolean
   return false;
 }
 
-function isLocalOrPrivateHost(rawHostname: string): boolean {
+export function isLocalOrPrivateHost(rawHostname: string): boolean {
   const host = rawHostname.replace(/^\[|\]$/g, "").toLowerCase();
   if (!host) return false;
   if (
@@ -324,14 +336,66 @@ function extractSecrets(env: Record<string, string | undefined>): SecuritySecret
     const val = env[key];
     return val !== undefined && val !== "" ? val : undefined;
   };
+  const opencodeServerPassword = readSecret("OPENCODE_SERVER_PASSWORD");
   return {
     aiKey: readSecret("OPENCODE_API_KEY"),
+    ...(opencodeServerPassword !== undefined ? { opencodeServerPassword } : {}),
     authToken: readSecret("BASHO_AUTH_TOKEN"),
     ntfyToken: readSecret("BASHO_NTFY_TOKEN"),
     discordWebhook: readSecret("BASHO_DISCORD_WEBHOOK"),
     telegramBotToken: readSecret("BASHO_TELEGRAM_BOT_TOKEN"),
     telegramChatId: readSecret("BASHO_TELEGRAM_CHAT_ID"),
   };
+}
+
+export function redactSecrets(text: string, secrets: SecuritySecrets): string {
+  if (!text) return text;
+  let result = text;
+
+  const secretValues = new Set<string>();
+  const rawSecrets = [
+    secrets.aiKey,
+    secrets.opencodeServerPassword,
+    secrets.authToken,
+    secrets.ntfyToken,
+    secrets.discordWebhook,
+    secrets.telegramBotToken,
+  ];
+
+  for (const raw of rawSecrets) {
+    if (typeof raw !== "string" || raw.length === 0) continue;
+    secretValues.add(raw);
+    try {
+      const encoded = encodeURIComponent(raw);
+      if (encoded !== raw) {
+        secretValues.add(encoded);
+      }
+    } catch {
+      // Ignore malformed URI encoding edge cases.
+    }
+  }
+
+  if (
+    typeof secrets.opencodeServerPassword === "string" &&
+    secrets.opencodeServerPassword.length > 0
+  ) {
+    const basicBlob = Buffer.from(
+      `opencode:${secrets.opencodeServerPassword}`,
+      "utf8",
+    ).toString("base64");
+    secretValues.add(`Basic ${basicBlob}`);
+    secretValues.add(basicBlob);
+  }
+
+  const orderedSecrets = [...secretValues].sort((a, b) => b.length - a.length);
+  for (const secret of orderedSecrets) {
+    result = result.split(secret).join("[redacted]");
+  }
+
+  result = result.replace(/\bBasic\s+[A-Za-z0-9+/=]+/gi, "[redacted]");
+  result = result.replace(/\bBearer\s+[^\s"',;]+/gi, "[redacted]");
+
+  return result;
 }
 
 function readRawFileConfig(input: LoadSecurityConfigInput): Record<string, unknown> {
@@ -407,6 +471,28 @@ export function loadSecurityConfig(
   const expectedPorts = validateExpectedPorts(withDefault(file.expectedPorts, [22, 6969]));
   const workloads = validateWorkloads(withDefault(file.workloads, []));
 
+  const fileProvider =
+    fileAi.provider !== undefined
+      ? validateAiProvider(fileAi.provider, "ai.provider")
+      : undefined;
+  const envProvider = env.BASHO_AI_PROVIDER;
+  const hasApiKey =
+    typeof env.OPENCODE_API_KEY === "string" && env.OPENCODE_API_KEY.trim() !== "";
+  const provider: AiProviderKind =
+    envProvider !== undefined && envProvider !== ""
+      ? validateAiProvider(envProvider.trim(), "BASHO_AI_PROVIDER")
+      : (fileProvider ?? (hasApiKey ? "openai-compatible" : "opencode-harness"));
+
+  const fileServerUrl =
+    fileAi.serverUrl !== undefined
+      ? validateUrl(fileAi.serverUrl, "ai.serverUrl")
+      : undefined;
+  const envServerUrl = env.OPENCODE_SERVER_URL;
+  const serverUrl =
+    envServerUrl !== undefined && envServerUrl !== ""
+      ? validateUrl(envServerUrl, "OPENCODE_SERVER_URL")
+      : fileServerUrl;
+
   const fileBaseURL =
     fileAi.baseURL !== undefined ? validateUrl(fileAi.baseURL, "ai.baseURL") : undefined;
   const envBaseURL = env.OPENCODE_BASE_URL;
@@ -415,7 +501,7 @@ export function loadSecurityConfig(
       ? validateUrl(envBaseURL, "ai.baseURL")
       : (fileBaseURL ?? "https://opencode.ai/zen/go/v1");
 
-  const model = withDefault(fileAi.model, "deepseek-v4.1-flash");
+  const model = withDefault(fileAi.model, "opencode-go/deepseek-v4.1-flash");
   if (typeof model !== "string" || model.trim() === "") {
     throw new Error("Invalid ai.model: expected non-empty string");
   }
@@ -478,6 +564,8 @@ export function loadSecurityConfig(
     expectedPorts,
     workloads,
     ai: {
+      provider,
+      ...(serverUrl !== undefined ? { serverUrl } : {}),
       baseURL,
       model: model.trim(),
       sessionHeader,

@@ -2325,6 +2325,7 @@ test("F17 & F06: createLiveSecurityRuntime primes UFW/Tailscale context on start
     s.expectedPorts = [22, 6969];
     s.workloads = [{ id: "comfy", unit: "comfy.service", name: "comfy", ports: [8199] }];
     s.process.securityDbPath = dbPath;
+    s.ai.provider = "openai-compatible";
   });
 
   const ssHeader = "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess";
