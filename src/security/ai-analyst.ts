@@ -86,6 +86,8 @@ const PROCESS_FACT_KEYS = [
   "startedAt",
   "executableBasename",
   "parentComm",
+  "unit",
+  "workloadId",
 ] as const;
 
 const UNIT_STATUS_KEYS = [
@@ -746,7 +748,7 @@ export class EvidenceBroker {
       this.issuedEvidenceIds.add(item.id);
 
       if (item.kind === "criterion") {
-        const criterionId = item.facts.criterionId;
+        const criterionId = item.facts.criterionId ?? item.facts.criterion;
         if (typeof criterionId === "string" && CRITERION_SET.has(criterionId)) {
           const list = this.criterionEvidence.get(criterionId as CriterionId) ?? [];
           list.push(item);

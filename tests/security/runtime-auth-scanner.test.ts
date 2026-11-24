@@ -2209,3 +2209,470 @@ test("breach verdict alert is still published and drained when lockdown.consider
     if (store.calls.close === 0) store.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Council round 1 regressions (F06, F09, F17, F19, F24)
+// ---------------------------------------------------------------------------
+
+test("F09: updateSettings({ mode: 'monitor' }) during in-flight AI passes live monitor mode to lockdown.consider and executes no containment", async () => {
+  const clock = fakeClock();
+  const scheduler = fakeScheduler();
+  const store = new SpyStore(":memory:");
+  const settings = settingsFixture((s) => {
+    s.mode = "auto-lockdown";
+  });
+
+  let releaseAi!: () => void;
+  const aiGate = new Promise<void>((resolve) => {
+    releaseAi = resolve;
+  });
+  let aiStarted = false;
+
+  const considerModes: SecuritySettings["mode"][] = [];
+  let appliedActions = 0;
+
+  const runtime = createSecurityRuntime({
+    store,
+    collector: {
+      async collect(scanId) {
+        return postureResult(scanId, clock.now());
+      },
+    },
+    monitor: {
+      async pollJournal() {
+        return emptyMonitorResult();
+      },
+      async pollSockets() {
+        return emptyMonitorResult();
+      },
+    },
+    analyst: {
+      async investigate(): Promise<InvestigationResult> {
+        aiStarted = true;
+        await aiGate;
+        return {
+          status: "ready",
+          verdict: { kind: "breach", confidence: 0.99, summary: "Active breach" },
+          findings: [],
+          proposals: [
+            {
+              target: { kind: "deny_peer_ip", ip: "198.51.100.42" },
+              evidenceIds: [POSTURE_EVIDENCE_ID],
+            },
+          ],
+          trail: { steps: [] },
+        };
+      },
+    },
+    lockdown: {
+      async consider(_scan, _drafts, _corr, liveSettings) {
+        considerModes.push(liveSettings.mode);
+        if (liveSettings.mode !== "monitor") {
+          appliedActions += 1;
+        }
+        return { proposals: [], actions: [], alerts: [] };
+      },
+      async approve() {
+        return true;
+      },
+      reject() {
+        return true;
+      },
+      async unlock() {
+        return true;
+      },
+      async reconcile() {},
+    },
+    dispatcher: {
+      publish() {
+        return true;
+      },
+      sendTestAlert() {
+        return "test";
+      },
+      async drain() {},
+      health() {
+        return {};
+      },
+    },
+    clock,
+    scheduler,
+    settings,
+  });
+
+  try {
+    const scanPromise = runtime.requestScan("manual");
+    await flushUntil(() => aiStarted, "AI investigation to start");
+
+    runtime.updateSettings({ mode: "monitor" });
+    releaseAi();
+
+    await scanPromise;
+    expect(considerModes).toEqual(["monitor"]);
+    expect(appliedActions).toBe(0);
+  } finally {
+    await runtime.stop();
+    if (store.calls.close === 0) store.close();
+  }
+});
+
+test("F17 & F06: createLiveSecurityRuntime primes UFW/Tailscale context on startup and merges workload ports for socket polls", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "basho-live-f17-"));
+  const dbPath = join(dir, "state", "security.db");
+  const clock = fakeClock();
+  const scheduler = fakeScheduler();
+  const settings = settingsFixture((s) => {
+    s.expectedPorts = [22, 6969];
+    s.workloads = [{ id: "comfy", unit: "comfy.service", name: "comfy", ports: [8199] }];
+    s.process.securityDbPath = dbPath;
+  });
+
+  const ssHeader = "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess";
+  const ssLoopback =
+    'tcp   LISTEN 0      128    127.0.0.1:6969   0.0.0.0:*    users:(("bun",pid=1001,fd=3))';
+  const ssDeclaredComfy =
+    'tcp   LISTEN 0      128    0.0.0.0:8199     0.0.0.0:*    users:(("comfy",pid=4242,fd=6))';
+  const ssUnexpectedComfy =
+    'tcp   LISTEN 0      128    0.0.0.0:8188     0.0.0.0:*    users:(("comfy",pid=4242,fd=7))';
+
+  let stage = 0;
+  const runner: CommandRunner = {
+    async run(request: CommandRequest): Promise<CommandResult> {
+      if (request.kind === "ufw_status") {
+        return {
+          status: "ok",
+          exitCode: 0,
+          stdout:
+            "Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n",
+        };
+      }
+      if (request.kind === "tailscale_serve" || request.kind === "tailscale_funnel") {
+        return { status: "ok", exitCode: 0, stdout: "{}" };
+      }
+      if (request.kind === "sockets") {
+        if (stage === 0) return { status: "ok", exitCode: 0, stdout: [ssHeader, ssLoopback].join("\n") };
+        if (stage === 1) {
+          return {
+            status: "ok",
+            exitCode: 0,
+            stdout: [ssHeader, ssLoopback, ssDeclaredComfy].join("\n"),
+          };
+        }
+        return {
+          status: "ok",
+          exitCode: 0,
+          stdout: [ssHeader, ssLoopback, ssDeclaredComfy, ssUnexpectedComfy].join("\n"),
+        };
+      }
+      if (request.kind === "processes") {
+        return {
+          status: "ok",
+          exitCode: 0,
+          stdout: "  4242     1  1000   120 user@1000.service comfy.service comfy\n",
+        };
+      }
+      return { status: "unavailable" };
+    },
+  };
+
+  const files: PostureFiles = {
+    async read(source) {
+      if (source === "ufw-v4") {
+        return [
+          "-A ufw-user-input -p tcp --dport 8199 -j ACCEPT",
+          "-A ufw-user-input -p tcp --dport 8188 -j ACCEPT",
+        ].join("\n");
+      }
+      if (source === "ufw-v6") return "-A ufw6-user-input -j RETURN";
+      if (source === "ufw-default") return 'IPV6=yes\nDEFAULT_INPUT_POLICY="DROP"';
+      return null;
+    },
+    async sshDropIns() {
+      return [];
+    },
+  };
+
+  const runtime = createLiveSecurityRuntime({
+    settings,
+    secrets: {},
+    clock,
+    scheduler,
+    runner,
+    files,
+  } as Parameters<typeof createLiveSecurityRuntime>[0] & {
+    runner?: CommandRunner;
+    files?: PostureFiles;
+  });
+
+  try {
+    // Notice: NO manual or scheduled scan has run yet!
+    runtime.start();
+    await flushMicrotasks();
+
+    const socketTick = scheduler.ticks.find((tick) => tick.ms === 30_000);
+    expect(socketTick).toBeDefined();
+
+    // Baseline poll (loopback only).
+    socketTick!.run();
+    await flushMicrotasks();
+
+    // Poll 2: declared workload port 8199 opens -> expected (no critical alert).
+    clock.advance(30_000);
+    stage = 1;
+    socketTick!.run();
+    await flushMicrotasks();
+    expect(runtime.view().alerts).toHaveLength(0);
+
+    // Poll 3: undeclared port 8188 opens before any 60m scan -> classified exposed_lan (NOT unknown), raises critical event + alert!
+    clock.advance(30_000);
+    stage = 2;
+    socketTick!.run();
+    await flushUntil(
+      () => runtime.view().alerts.some((a) => a.fingerprint.includes("unexpected_workload:comfy")),
+      "critical unexpected_workload alert before first scheduled scan",
+    );
+
+    const view = runtime.view();
+    const openedEvent = view.events.find(
+      (ev) => ev.rule === "listener_opened" && ev.target === "tcp:0.0.0.0:8188",
+    );
+    expect(openedEvent).toBeDefined();
+    expect(openedEvent?.severity).toBe("critical");
+  } finally {
+    await runtime.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("F19: cooldown-skipped event scan carries forward previous AI verdict, AI findings, and investigation trail", async () => {
+  const clock = fakeClock();
+  const scheduler = fakeScheduler();
+  const store = new SpyStore(":memory:");
+  const settings = settingsFixture((s) => {
+    s.ai.triageCooldownMinutes = 10;
+  });
+
+  let analystCalls = 0;
+  const runtime = createSecurityRuntime({
+    store,
+    collector: {
+      async collect(scanId) {
+        return postureResult(scanId, clock.now());
+      },
+    },
+    monitor: {
+      async pollJournal() {
+        return emptyMonitorResult();
+      },
+      async pollSockets() {
+        return emptyMonitorResult();
+      },
+    },
+    analyst: {
+      async investigate(): Promise<InvestigationResult> {
+        analystCalls += 1;
+        return {
+          status: "ready",
+          verdict: { kind: "breach", confidence: 0.95, summary: "Ongoing intrusion" },
+          findings: [
+            {
+              id: "ai-finding-1",
+              source: "ai",
+              severity: "breach",
+              summary: "Unauthorized workload exposure confirmed",
+              evidenceIds: [POSTURE_EVIDENCE_ID],
+            },
+          ],
+          proposals: [],
+          trail: {
+            steps: [
+              {
+                tool: "read_posture_detail",
+                reason: "Inspect network exposure",
+                outcome: "ok",
+                evidenceIds: [POSTURE_EVIDENCE_ID],
+              },
+            ],
+          },
+        };
+      },
+    },
+    lockdown: {
+      async consider() {
+        return { proposals: [], actions: [], alerts: [] };
+      },
+      async approve() {
+        return true;
+      },
+      reject() {
+        return true;
+      },
+      async unlock() {
+        return true;
+      },
+      async reconcile() {},
+    },
+    dispatcher: {
+      publish() {
+        return true;
+      },
+      sendTestAlert() {
+        return "test";
+      },
+      async drain() {},
+      health() {
+        return {};
+      },
+    },
+    clock,
+    scheduler,
+    settings,
+  });
+
+  try {
+    // First event scan runs AI and records breach verdict + AI finding + trail.
+    await runtime.requestScan("event");
+    expect(analystCalls).toBe(1);
+
+    // Second event scan within 10m cooldown skips AI but MUST preserve verdict, AI findings, and trail.
+    clock.advance(60_000);
+    await runtime.requestScan("event");
+    expect(analystCalls).toBe(1);
+
+    const latest = runtime.view().latestScan;
+    expect(latest).not.toBeNull();
+    expect(latest!.aiStatus).toBe("ready");
+    expect(latest!.verdict).toEqual({
+      kind: "breach",
+      confidence: 0.95,
+      summary: "Ongoing intrusion",
+    });
+    expect(latest!.findings.some((f) => f.source === "ai" && f.id === "ai-finding-1")).toBe(true);
+    expect(latest!.trail.steps).toHaveLength(1);
+    expect(latest!.trail.steps[0]?.tool).toBe("read_posture_detail");
+  } finally {
+    await runtime.stop();
+    if (store.calls.close === 0) store.close();
+  }
+});
+
+test("F24: reconcileSchedule, approve, and unlock emit containment updates whenever persisted containment state changes", async () => {
+  const clock = fakeClock();
+  const scheduler = fakeScheduler();
+  const store = new SpyStore(":memory:");
+  const settings = settingsFixture();
+
+  const proposalId = "prop-f24";
+  store.insertProposal({
+    id: proposalId,
+    scanId: "scan-f24",
+    revision: 1,
+    status: "pending",
+    target: { kind: "deny_peer_ip", ip: "198.51.100.42" },
+    evidenceIds: [POSTURE_EVIDENCE_ID],
+    createdAt: clock.now(),
+    expiresAt: clock.now() + 60_000,
+    leaseSeconds: 60,
+    rollbackDescription: "Remove deny rule",
+  });
+
+  const updates: string[] = [];
+  const runtime = createSecurityRuntime({
+    store,
+    collector: {
+      async collect(scanId) {
+        return postureResult(scanId, clock.now());
+      },
+    },
+    monitor: {
+      async pollJournal() {
+        return emptyMonitorResult();
+      },
+      async pollSockets() {
+        return emptyMonitorResult();
+      },
+    },
+    analyst: {
+      async investigate() {
+        return unconfiguredInvestigation();
+      },
+    },
+    lockdown: {
+      async consider() {
+        return { proposals: [], actions: [], alerts: [] };
+      },
+      async approve(id, rev) {
+        // Simulates claiming (creating a pending action) then failing apply -> returns false.
+        store.claimProposal(id, rev, clock.now());
+        return false;
+      },
+      reject() {
+        return false;
+      },
+      async unlock(actionId) {
+        // Simulates transitioning to rolling_back then adapter returning unknown -> returns false.
+        store.transitionAction(actionId, "pending", "rolling_back", clock.now());
+        return false;
+      },
+      async reconcile() {
+        // Simulates settling rolling_back -> rolled_back and expiring proposals.
+        store.expireProposals(clock.now());
+        for (const action of store.listActions()) {
+          if (action.state === "rolling_back") {
+            store.transitionAction(action.id, "rolling_back", "rolled_back", clock.now());
+          }
+        }
+      },
+    },
+    dispatcher: {
+      publish() {
+        return true;
+      },
+      sendTestAlert() {
+        return "test";
+      },
+      async drain() {},
+      health() {
+        return {};
+      },
+    },
+    clock,
+    scheduler,
+    settings,
+  });
+
+  const unsub = runtime.subscribe((u) => updates.push(u.kind));
+  try {
+    runtime.start();
+    await flushMicrotasks();
+    updates.length = 0;
+
+    // approve() returns false after persisting a pending action -> MUST still emit containment!
+    expect(await runtime.approve(proposalId, 1)).toBe(false);
+    expect(updates).toContain("containment");
+    const actionId = store.listActions()[0]!.id;
+
+    // unlock() returns false after persisting rolling_back -> MUST still emit containment!
+    updates.length = 0;
+    expect(await runtime.unlock(actionId)).toBe(false);
+    expect(updates).toContain("containment");
+
+    // reconcileSchedule transitions rolling_back -> rolled_back -> MUST emit containment!
+    updates.length = 0;
+    const reconcileTick = scheduler.ticks.find((tick) => tick.ms === 15_000);
+    expect(reconcileTick).toBeDefined();
+    reconcileTick!.run();
+    await flushMicrotasks();
+    expect(updates).toContain("containment");
+
+    // A no-op reconcile tick MUST NOT emit spurious containment updates.
+    updates.length = 0;
+    reconcileTick!.run();
+    await flushMicrotasks();
+    expect(updates).not.toContain("containment");
+  } finally {
+    unsub();
+    await runtime.stop();
+    if (store.calls.close === 0) store.close();
+  }
+});

@@ -1107,7 +1107,13 @@ test("two connections racing one proposal produce a single winner", () => {
   const second = new SecurityStore(dbPath);
   try {
     first.insertProposal(proposalFixture({ id: "race-a", expiresAt: 60_000 }));
-    first.insertProposal(proposalFixture({ id: "race-b", expiresAt: 60_000 }));
+    first.insertProposal(
+      proposalFixture({
+        id: "race-b",
+        target: { kind: "deny_peer_ip", ip: "198.51.100.43" },
+        expiresAt: 60_000,
+      }),
+    );
 
     const contestA = [first.claimProposal("race-a", 1, 500), second.claimProposal("race-a", 1, 500)];
     expect(contestA.filter((action) => action !== null)).toHaveLength(1);
@@ -1459,7 +1465,13 @@ test("two connections observe pruned scans, events, and terminal actions while r
     const unresolvedActive = writer.claimProposal("prop-active", 1, start)!;
     expect(writer.transitionAction(unresolvedActive.id, "pending", "active", start + 1_000)).toBe(true);
 
-    writer.insertProposal(proposalFixture({ id: "prop-pending", expiresAt: start + 600_000 }));
+    writer.insertProposal(
+      proposalFixture({
+        id: "prop-pending",
+        target: { kind: "deny_peer_ip", ip: "198.51.100.43" },
+        expiresAt: start + 600_000,
+      }),
+    );
     const unresolvedPending = writer.claimProposal("prop-pending", 1, start)!;
 
     writer.prune(now);
@@ -1974,8 +1986,20 @@ test("two-connection write-transaction contention on claimProposal is atomic and
     expect(store.listActions().filter((a) => a.proposalId === "contend-busy")).toHaveLength(1);
 
     // Part 2: real concurrent child-process contention while parent holds BEGIN IMMEDIATE.
-    store.insertProposal(proposalFixture({ id: "contend-proc-commit", expiresAt: 60_000 }));
-    store.insertProposal(proposalFixture({ id: "contend-proc-rollback", expiresAt: 60_000 }));
+    store.insertProposal(
+      proposalFixture({
+        id: "contend-proc-commit",
+        target: { kind: "deny_peer_ip", ip: "198.51.100.43" },
+        expiresAt: 60_000,
+      }),
+    );
+    store.insertProposal(
+      proposalFixture({
+        id: "contend-proc-rollback",
+        target: { kind: "deny_peer_ip", ip: "198.51.100.44" },
+        expiresAt: 60_000,
+      }),
+    );
 
     const runChildClaim = async (
       proposalId: string,
@@ -2606,6 +2630,68 @@ test("recentObservations queries exact observation rows by rule, target, and tim
       base,
     );
     expect(bounded.map((e) => e.id).sort()).toEqual(["obs-in-1", "obs-in-2"]);
+  } finally {
+    store.close();
+  }
+});
+
+test("F12: claimProposal enforces per-target exclusivity across live actions and allows claim after terminal state", () => {
+  const store = memoryStore();
+  try {
+    const workloadA: LockdownProposal = proposalFixture({
+      id: "prop-wl-1",
+      target: { kind: "pause_workload", workloadId: "comfy", pid: 4242, startedAt: 1_000 },
+      expiresAt: 60_000,
+    });
+    const workloadB: LockdownProposal = proposalFixture({
+      id: "prop-wl-2",
+      target: { kind: "pause_workload", workloadId: "comfy", pid: 4243, startedAt: 2_000 },
+      expiresAt: 60_000,
+    });
+    store.insertProposal(workloadA);
+    store.insertProposal(workloadB);
+
+    const firstAction = store.claimProposal("prop-wl-1", 1, 500);
+    expect(firstAction).not.toBeNull();
+
+    // While first action is pending, second proposal for the same workloadId is refused.
+    expect(store.claimProposal("prop-wl-2", 1, 600)).toBeNull();
+    expect(store.listProposals().find((p) => p.id === "prop-wl-2")?.status).toBe("pending");
+
+    // While active, still refused.
+    expect(store.transitionAction(firstAction!.id, "pending", "active", 700)).toBe(true);
+    expect(store.claimProposal("prop-wl-2", 1, 800)).toBeNull();
+
+    // While rolling_back, still refused.
+    expect(store.transitionAction(firstAction!.id, "active", "rolling_back", 900)).toBe(true);
+    expect(store.claimProposal("prop-wl-2", 1, 1_000)).toBeNull();
+
+    // Once rolled_back (terminal), second proposal can be claimed.
+    expect(store.transitionAction(firstAction!.id, "rolling_back", "rolled_back", 1_100)).toBe(true);
+    const secondAction = store.claimProposal("prop-wl-2", 1, 1_200);
+    expect(secondAction).not.toBeNull();
+    expect(secondAction!.proposalId).toBe("prop-wl-2");
+
+    // Once failed (terminal), a third proposal for the same IP target succeeds.
+    store.insertProposal(
+      proposalFixture({
+        id: "prop-ip-1",
+        target: { kind: "deny_peer_ip", ip: "198.51.100.77" },
+        expiresAt: 60_000,
+      }),
+    );
+    store.insertProposal(
+      proposalFixture({
+        id: "prop-ip-2",
+        target: { kind: "deny_peer_ip", ip: "198.51.100.77" },
+        expiresAt: 60_000,
+      }),
+    );
+    const ipAction1 = store.claimProposal("prop-ip-1", 1, 1_300)!;
+    expect(ipAction1).not.toBeNull();
+    expect(store.claimProposal("prop-ip-2", 1, 1_400)).toBeNull();
+    expect(store.transitionAction(ipAction1.id, "pending", "failed", 1_500)).toBe(true);
+    expect(store.claimProposal("prop-ip-2", 1, 1_600)).not.toBeNull();
   } finally {
     store.close();
   }

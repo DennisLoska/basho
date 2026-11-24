@@ -128,6 +128,7 @@ export interface LockdownEngineOptions {
   adapter: LockdownAdapter;
   resolveProcess?: ResolveProcess;
   currentUid?: number;
+  getMode?: () => LockdownMode;
 }
 
 export interface SubprocessExecResult {
@@ -602,7 +603,9 @@ function corroborationMatchesTarget(
       return (
         entry.target.workloadId === target.workloadId &&
         entry.target.pid === target.pid &&
-        entry.target.startedAt === target.startedAt
+        Number.isFinite(entry.target.startedAt) &&
+        Number.isFinite(target.startedAt) &&
+        Math.abs(entry.target.startedAt - target.startedAt) <= PROCESS_START_TIME_TOLERANCE_MS
       );
     }
 
@@ -687,6 +690,7 @@ export class LockdownEngine {
   private readonly adapter: LockdownAdapter;
   private readonly resolveProcess: ResolveProcess;
   private readonly currentUid: number;
+  private readonly getMode?: () => LockdownMode;
   private readonly observedWorkloads = new Map<string, ProcessIdentity>();
   private readonly inFlightActions = new Set<string>();
 
@@ -697,6 +701,16 @@ export class LockdownEngine {
     this.adapter = options.adapter;
     this.resolveProcess = options.resolveProcess ?? createProcProcessResolver();
     this.currentUid = options.currentUid ?? defaultUid();
+    this.getMode = options.getMode;
+  }
+
+  private resolveLiveMode(settings: SecuritySettings): LockdownMode {
+    if (!this.getMode) return settings.mode;
+    try {
+      return this.getMode();
+    } catch {
+      return settings.mode;
+    }
   }
 
   private async safePreflight(
@@ -778,11 +792,14 @@ export class LockdownEngine {
     const actions: LockdownAction[] = [];
     const alerts: SecurityAlert[] = [];
 
-    if (settings.mode === "monitor") {
+    if (this.resolveLiveMode(settings) === "monitor") {
       return { proposals, actions, alerts };
     }
 
     for (const draft of drafts) {
+      if (this.resolveLiveMode(settings) === "monitor") {
+        break;
+      }
       const target = normalizeTarget(draft.target);
       const now = this.clock.now();
 
@@ -814,8 +831,9 @@ export class LockdownEngine {
         }
       }
 
+      const liveMode = this.resolveLiveMode(settings);
       const decision = decideContainment({
-        mode: settings.mode,
+        mode: liveMode,
         target,
         now,
         threshold: settings.ai.confidenceThreshold,
@@ -848,7 +866,7 @@ export class LockdownEngine {
       }
       proposals.push(proposal);
 
-      if (decision === "execute") {
+      if (decision === "execute" && this.resolveLiveMode(settings) === "auto-lockdown") {
         const claimed = this.store.claimProposal(
           proposal.id,
           proposal.revision,
@@ -864,10 +882,10 @@ export class LockdownEngine {
 
       // If auto-lockdown fell back to queue solely because rollback readiness was not met,
       // emit an urgent operator alert linked to the queued proposal.
-      if (settings.mode === "auto-lockdown" && !preflight.rollbackReady) {
+      if (liveMode === "auto-lockdown" && !preflight.rollbackReady) {
         const wouldExecuteIfReady =
           decideContainment({
-            mode: settings.mode,
+            mode: liveMode,
             target,
             now,
             threshold: settings.ai.confidenceThreshold,
@@ -906,7 +924,7 @@ export class LockdownEngine {
     revision: number,
     settings: SecuritySettings,
   ): Promise<boolean> {
-    if (settings.mode === "monitor") {
+    if (this.resolveLiveMode(settings) === "monitor") {
       return false;
     }
 
@@ -946,6 +964,10 @@ export class LockdownEngine {
       lanPolicyReady: preflight.lanPolicyReady,
     });
     if (!safe) {
+      return false;
+    }
+
+    if (this.resolveLiveMode(settings) === "monitor") {
       return false;
     }
 
@@ -1038,16 +1060,21 @@ export class LockdownEngine {
     }
   }
 
-  async reconcile(): Promise<void> {
+  async reconcile(): Promise<boolean> {
+    let changed = false;
     const now = this.clock.now();
+    const pendingBeforeCount = this.store
+      .listProposals()
+      .filter((proposal) => proposal.status === "pending").length;
     this.store.expireProposals(now);
 
-    const pendingIds = new Set(
-      this.store
-        .listProposals()
-        .filter((proposal) => proposal.status === "pending")
-        .map((proposal) => proposal.id),
-    );
+    const pendingProposals = this.store
+      .listProposals()
+      .filter((proposal) => proposal.status === "pending");
+    if (pendingProposals.length !== pendingBeforeCount) {
+      changed = true;
+    }
+    const pendingIds = new Set(pendingProposals.map((proposal) => proposal.id));
     for (const id of this.observedWorkloads.keys()) {
       if (!pendingIds.has(id)) {
         this.observedWorkloads.delete(id);
@@ -1081,6 +1108,9 @@ export class LockdownEngine {
             updatedAt,
             inspected.handle,
           );
+          if (transitioned) {
+            changed = true;
+          }
           if (transitioned && action.expiresAt <= updatedAt) {
             const moved = this.store.transitionAction(
               action.id,
@@ -1089,20 +1119,29 @@ export class LockdownEngine {
               this.clock.now(),
             );
             if (moved) {
-              await this.attemptRollback({
-                ...action,
-                state: "rolling_back",
-                rollbackHandle: inspected.handle ?? action.rollbackHandle,
-              });
+              changed = true;
+              if (
+                await this.attemptRollback({
+                  ...action,
+                  state: "rolling_back",
+                  rollbackHandle: inspected.handle ?? action.rollbackHandle,
+                })
+              ) {
+                changed = true;
+              }
             }
           }
         } else if (inspected.state === "absent") {
-          this.store.transitionAction(
-            action.id,
-            "pending",
-            "failed",
-            this.clock.now(),
-          );
+          if (
+            this.store.transitionAction(
+              action.id,
+              "pending",
+              "failed",
+              this.clock.now(),
+            )
+          ) {
+            changed = true;
+          }
         } else if (action.expiresAt <= this.clock.now()) {
           const moved = this.store.transitionAction(
             action.id,
@@ -1111,14 +1150,19 @@ export class LockdownEngine {
             this.clock.now(),
           );
           if (moved) {
-            await this.attemptRollback({ ...action, state: "rolling_back" });
+            changed = true;
+            if (await this.attemptRollback({ ...action, state: "rolling_back" })) {
+              changed = true;
+            }
           }
         }
         continue;
       }
 
       if (action.state === "rolling_back") {
-        await this.attemptRollback(action);
+        if (await this.attemptRollback(action)) {
+          changed = true;
+        }
         continue;
       }
 
@@ -1130,10 +1174,15 @@ export class LockdownEngine {
           this.clock.now(),
         );
         if (moved) {
-          await this.attemptRollback({ ...action, state: "rolling_back" });
+          changed = true;
+          if (await this.attemptRollback({ ...action, state: "rolling_back" })) {
+            changed = true;
+          }
         }
       }
     }
+
+    return changed;
   }
 
   async helperReady(): Promise<boolean> {
@@ -1573,14 +1622,25 @@ export function createUserWorkloadLockdownAdapter(
       const thawRes = await exec([systemctlPath, "--user", "thaw", unit], {
         timeoutMs,
       });
+      if (thawRes.exitCode !== 0) {
+        return { state: "unknown" };
+      }
+
+      const stateRes = await exec(
+        [systemctlPath, "--user", "show", "-p", "FreezerState", "--value", unit],
+        { timeoutMs },
+      );
+      const freezerState =
+        stateRes.exitCode === 0 ? stateRes.stdout.trim().toLowerCase() : "";
+      if (freezerState !== "running") {
+        return { state: "unknown" };
+      }
+
       await exec([systemctlPath, "--user", "stop", `${timerUnit}.timer`], {
         timeoutMs,
       }).catch(() => {});
 
-      if (thawRes.exitCode === 0) {
-        return { state: "absent" };
-      }
-      return { state: "unknown" };
+      return { state: "absent" };
     },
   };
 }

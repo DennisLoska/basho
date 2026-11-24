@@ -11,6 +11,7 @@ import {
   type CommandRunner,
   type Coverage,
   type CriterionId,
+  type EnrolledWorkload,
   type Evidence,
   type ExposureEntry,
   type Facts,
@@ -23,6 +24,7 @@ import {
 } from "./types";
 
 export type PostureFileSource =
+  | "ufw-conf"
   | "ufw-v4"
   | "ufw-v6"
   | "ufw-default"
@@ -40,6 +42,7 @@ export interface PostureFiles {
 }
 
 export interface PostureFilePaths {
+  "ufw-conf": string;
   "ufw-v4": string;
   "ufw-v6": string;
   "ufw-default": string;
@@ -103,6 +106,7 @@ const STALE_UPGRADE_DAYS = 14;
 const DAY_MS = 86_400_000;
 
 const DEFAULT_FILE_PATHS: PostureFilePaths = {
+  "ufw-conf": "/etc/ufw/ufw.conf",
   "ufw-v4": "/etc/ufw/user.rules",
   "ufw-v6": "/etc/ufw/user6.rules",
   "ufw-default": "/etc/default/ufw",
@@ -926,11 +930,24 @@ export function evaluateFirewall(
       continue;
     }
 
+    // Narrow source-scoped DROP/REJECT rules (e.g. `ufw prepend deny from <ip> to any`)
+    // only block that specific peer/subnet and do not affect general reachability for all other peers.
+    if (
+      rule.source !== undefined &&
+      !isAllSourcesCidr(rule.source, family) &&
+      !rule.indeterminate &&
+      (rule.jump === "DROP" || rule.jump === "REJECT")
+    ) {
+      continue;
+    }
+
     // Interface-scoped rules:
     // - If the listener has an explicit interfaceName, match/mismatch normally.
     // - Loopback listeners only match lo.
-    // - Any non-loopback listener without interfaceName (wildcard or specific IP) cannot prove
-    //   which interface owns its address, so a matching interface-scoped rule is indeterminate.
+    // - A tailscale*-scoped allow rule only admits Tailnet ingress, so for wildcard or
+    //   non-Tailnet listeners without interfaceName, skip it and keep evaluating general LAN rules.
+    // - Any other non-loopback listener without interfaceName cannot prove which interface owns
+    //   its address, so a matching interface-scoped rule is indeterminate.
     let interfaceIndeterminate = false;
     if (rule.inInterface !== undefined) {
       if (listener.interfaceName !== undefined) {
@@ -941,6 +958,14 @@ export function evaluateFirewall(
         if (!interfaceMatches(rule.inInterface, "lo")) {
           continue;
         }
+      } else if (
+        /^tailscale/i.test(rule.inInterface) &&
+        !isTailnetListener(listener) &&
+        !rule.indeterminate &&
+        (rule.jump === "ACCEPT" ||
+          (rule.jump !== undefined && UFW_RATE_LIMIT_ALLOW_JUMPS.has(rule.jump)))
+      ) {
+        continue;
       } else {
         interfaceIndeterminate = true;
       }
@@ -1065,6 +1090,19 @@ export function parseUfwDefault(text: string): ParsedUfwDefault {
   }
 
   return { defaultInput, ipv6Enabled };
+}
+
+export function parseUfwConf(text: string): { active: boolean | null } {
+  let active: boolean | null = null;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = /^ENABLED\s*=\s*["']?(yes|no)["']?(?:\s*(?:#.*)?)?$/i.exec(line);
+    if (match) {
+      active = match[1]!.toLowerCase() === "yes";
+    }
+  }
+  return { active };
 }
 
 function listenerMatchesAllowRule(
@@ -1901,9 +1939,12 @@ function parseSshdConfig(
         continue;
       }
 
-      // OpenSSH first-value-wins semantics.
-      if (!globals.has(key)) {
-        globals.set(key, lowerVal);
+      // OpenSSH first-value-wins semantics. Normalize ChallengeResponseAuthentication
+      // to KbdInteractiveAuthentication before checking globals so the earlier directive wins.
+      const effectiveKey =
+        key === "challengeresponseauthentication" ? "kbdinteractiveauthentication" : key;
+      if (!globals.has(effectiveKey)) {
+        globals.set(effectiveKey, lowerVal);
       }
     }
   };
@@ -1913,10 +1954,7 @@ function parseSshdConfig(
   return {
     permitRootLogin: globals.get("permitrootlogin") ?? null,
     passwordAuthentication: globals.get("passwordauthentication") ?? null,
-    kbdInteractiveAuthentication:
-      globals.get("kbdinteractiveauthentication") ??
-      globals.get("challengeresponseauthentication") ??
-      null,
+    kbdInteractiveAuthentication: globals.get("kbdinteractiveauthentication") ?? null,
     ports: ports.length > 0 ? ports : [22],
     hasMatchLoosening,
     includeReferenced,
@@ -2228,6 +2266,9 @@ interface ParsedProcess {
   uid: number;
   startedAt: number;
   comm: string;
+  hasUnitMetadata: boolean;
+  unit?: string;
+  uunit?: string;
 }
 
 function parseProcesses(stdout: string, nowMs: number): Map<number, ParsedProcess> {
@@ -2242,6 +2283,9 @@ function parseProcesses(stdout: string, nowMs: number): Map<number, ParsedProces
     const uid = Number(match[3]);
     const etimes = Number(match[4]);
     const rest = match[5]!.trim();
+    let hasUnitMetadata = false;
+    let unit: string | undefined;
+    let uunit: string | undefined;
     let commRaw = rest;
     const isUnitToken = (tok: string): boolean => tok === "-" || isValidSystemdUnitName(tok);
     const firstSpace = rest.search(/\s/);
@@ -2249,12 +2293,15 @@ function parseProcesses(stdout: string, nowMs: number): Map<number, ParsedProces
       const firstTok = rest.slice(0, firstSpace);
       const afterFirst = rest.slice(firstSpace).trim();
       if (afterFirst.length > 0 && isUnitToken(firstTok)) {
+        hasUnitMetadata = true;
+        unit = firstTok === "-" ? undefined : firstTok;
         commRaw = afterFirst;
         const secondSpace = afterFirst.search(/\s/);
         if (secondSpace !== -1) {
           const secondTok = afterFirst.slice(0, secondSpace);
           const afterSecond = afterFirst.slice(secondSpace).trim();
           if (afterSecond.length > 0 && isUnitToken(secondTok)) {
+            uunit = secondTok === "-" ? undefined : secondTok;
             commRaw = afterSecond;
           }
         }
@@ -2268,9 +2315,92 @@ function parseProcesses(stdout: string, nowMs: number): Map<number, ParsedProces
       uid,
       startedAt: nowMs - etimes * 1000,
       comm,
+      hasUnitMetadata,
+      ...(unit !== undefined ? { unit } : {}),
+      ...(uunit !== undefined ? { uunit } : {}),
     });
   }
   return map;
+}
+
+const COLLECTOR_UNIT_SUFFIXES = [
+  ".service",
+  ".scope",
+  ".slice",
+  ".socket",
+  ".timer",
+  ".mount",
+  ".target",
+  ".path",
+  ".device",
+  ".swap",
+  ".automount",
+] as const;
+
+function collectorUnitStem(unit: string): string {
+  let base = unit.trim();
+  for (const suffix of COLLECTOR_UNIT_SUFFIXES) {
+    if (base.endsWith(suffix)) {
+      base = base.slice(0, -suffix.length);
+      break;
+    }
+  }
+  const atIdx = base.indexOf("@");
+  if (atIdx > 0) {
+    base = base.slice(0, atIdx);
+  }
+  return base.toLowerCase();
+}
+
+function matchEnrolledWorkloadForCollector(
+  listener: Listener,
+  proc: ParsedProcess | undefined,
+  workloads: readonly EnrolledWorkload[],
+): EnrolledWorkload | null {
+  if (workloads.length === 0) {
+    return null;
+  }
+
+  if (proc?.hasUnitMetadata) {
+    const unitMatches = workloads.filter((workload) => {
+      const expectedUnit = workload.unit.trim();
+      return proc.uunit === expectedUnit || proc.unit === expectedUnit;
+    });
+    if (unitMatches.length === 1) {
+      return unitMatches[0]!;
+    }
+    return null;
+  }
+
+  const rawName = (proc?.comm ?? listener.process)?.trim().toLowerCase();
+  if (!rawName) return null;
+
+  const matches: EnrolledWorkload[] = [];
+  for (const workload of workloads) {
+    const names = new Set<string>();
+    const idNorm = workload.id.trim().toLowerCase();
+    if (idNorm) names.add(idNorm);
+    const nameNorm = workload.name?.trim().toLowerCase();
+    if (nameNorm) names.add(nameNorm);
+    const stem = collectorUnitStem(workload.unit);
+    if (stem) names.add(stem);
+    if (names.has(rawName)) {
+      matches.push(workload);
+    }
+  }
+
+  if (matches.length === 1) {
+    return matches[0]!;
+  }
+  if (matches.length > 1) {
+    const portMatches = matches.filter(
+      (workload) => workload.ports !== undefined && workload.ports.includes(listener.port),
+    );
+    if (portMatches.length === 1) {
+      return portMatches[0]!;
+    }
+  }
+  return null;
 }
 
 interface ParsedTimer {
@@ -2361,6 +2491,9 @@ interface EvaluationContext {
   sshDropInsResult: readonly SshDropIn[] | null;
   socketsAvailable: boolean;
   listeners: readonly Listener[];
+  processMap: ReadonlyMap<number, ParsedProcess> | null;
+  workloads: readonly EnrolledWorkload[];
+  emittedProcessPids: Set<number>;
   ufwStatusRes: CommandResult | undefined;
   ufwStatusParsed: ParsedUfwStatus | null;
   ufwDefaultParsed: ParsedUfwDefault | null;
@@ -2423,10 +2556,7 @@ function evaluateFirewallUfw(ctx: EvaluationContext): PostureCheck {
     indeterminateAllowRuleCount === 0;
 
   const sourceCoverage: Record<string, Coverage> = {
-    ufw_status:
-      ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
-        ? "complete"
-        : "unavailable",
+    ufw_status: firewallInputs.active !== null ? "complete" : "unavailable",
     ufw_default: ufwDefaultCoverage,
     ufw_v4: !v4RulesComplete
       ? "unavailable"
@@ -2449,6 +2579,7 @@ function evaluateFirewallUfw(ctx: EvaluationContext): PostureCheck {
   const unusedAllowRuleCount = (v4Stats?.unusedCount ?? 0) + (v6Stats?.unusedCount ?? 0);
 
   const evId = addEvidence("criterion", "firewall_ufw", {
+    criterionId: "firewall_ufw",
     criterion: "firewall_ufw",
     active: firewallInputs.active,
     defaultInput: effectiveDefaultInput,
@@ -2511,11 +2642,10 @@ function evaluateNetworkExposure(ctx: EvaluationContext): PostureCheck {
   const meta = CRITERION_META[id];
   const {
     socketsAvailable,
-    ufwStatusRes,
-    ufwStatusParsed,
     ufwDefaultCoverage,
     ufwV4Text,
     ufwV6Text,
+    firewallInputs,
     publications,
     exposure,
     addEvidence,
@@ -2524,10 +2654,7 @@ function evaluateNetworkExposure(ctx: EvaluationContext): PostureCheck {
 
   const sourceCoverage: Record<string, Coverage> = {
     sockets: socketsAvailable ? "complete" : "unavailable",
-    ufw_status:
-      ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
-        ? "complete"
-        : "unavailable",
+    ufw_status: firewallInputs.active !== null ? "complete" : "unavailable",
     ufw_default: ufwDefaultCoverage,
     ufw_v4: ufwV4Text !== null && ufwV4Text.trim().length > 0 ? "complete" : "unavailable",
     ufw_v6: ufwV6Text !== null && ufwV6Text.trim().length > 0 ? "complete" : "unavailable",
@@ -2537,6 +2664,7 @@ function evaluateNetworkExposure(ctx: EvaluationContext): PostureCheck {
 
   if (!socketsAvailable) {
     const evId = addEvidence("criterion", "network_exposure", {
+      criterionId: "network_exposure",
       criterion: "network_exposure",
       listenerCount: null,
       exposedCount: null,
@@ -2567,6 +2695,7 @@ function evaluateNetworkExposure(ctx: EvaluationContext): PostureCheck {
   ).length;
 
   const evId = addEvidence("criterion", "network_exposure", {
+    criterionId: "network_exposure",
     criterion: "network_exposure",
     listenerCount: exposure.length,
     exposedCount,
@@ -2627,11 +2756,10 @@ function evaluateSshHardening(ctx: EvaluationContext): PostureCheck {
     fileResults,
     sshDropInsResult,
     socketsAvailable,
-    ufwStatusRes,
-    ufwStatusParsed,
     ufwDefaultCoverage,
     ufwV4Text,
     ufwV6Text,
+    firewallInputs,
     publications,
     exposure,
     addEvidence,
@@ -2643,10 +2771,7 @@ function evaluateSshHardening(ctx: EvaluationContext): PostureCheck {
     sshd_main: sshdMainText !== null ? "complete" : "unavailable",
     sshd_dropins: sshDropInsResult !== null ? "complete" : "unavailable",
     sockets: socketsAvailable ? "complete" : "unavailable",
-    ufw_status:
-      ufwStatusRes?.status === "ok" && ufwStatusParsed?.active !== null
-        ? "complete"
-        : "unavailable",
+    ufw_status: firewallInputs.active !== null ? "complete" : "unavailable",
     ufw_default: ufwDefaultCoverage,
     ufw_v4: ufwV4Text !== null && ufwV4Text.trim().length > 0 ? "complete" : "unavailable",
     ufw_v6: ufwV6Text !== null && ufwV6Text.trim().length > 0 ? "complete" : "unavailable",
@@ -2656,6 +2781,7 @@ function evaluateSshHardening(ctx: EvaluationContext): PostureCheck {
 
   if (sshdMainText === null) {
     const evId = addEvidence("criterion", "ssh_hardening", {
+      criterionId: "ssh_hardening",
       criterion: "ssh_hardening",
       readable: false,
     });
@@ -2710,6 +2836,7 @@ function evaluateSshHardening(ctx: EvaluationContext): PostureCheck {
     (parsed.kbdInteractiveAuthentication === null && !includeCouldHideDirectives);
 
   const evId = addEvidence("criterion", "ssh_hardening", {
+    criterionId: "ssh_hardening",
     criterion: "ssh_hardening",
     permitRootLogin: parsed.permitRootLogin,
     passwordAuthentication: parsed.passwordAuthentication,
@@ -2835,6 +2962,7 @@ function evaluatePackageUpdates(ctx: EvaluationContext): PostureCheck {
   };
 
   const evId = addEvidence("criterion", "package_updates", {
+    criterionId: "package_updates",
     criterion: "package_updates",
     pendingCount: parsedUpdates?.totalCount ?? null,
     kernelUpdateCount: parsedUpdates?.kernelCount ?? null,
@@ -2940,6 +3068,7 @@ function evaluateDiskAndBoot(ctx: EvaluationContext): PostureCheck {
   };
 
   const evId = addEvidence("criterion", "disk_and_boot", {
+    criterionId: "disk_and_boot",
     criterion: "disk_and_boot",
     rootEncrypted: blockParsed?.rootEncrypted ?? null,
     unencryptedSecondaryCount: blockParsed?.unencryptedSecondaryCount ?? null,
@@ -3047,6 +3176,7 @@ function evaluateKernelSysctl(ctx: EvaluationContext): PostureCheck {
   const sourceCoverage: Record<string, Coverage> = { sysctl: coverage };
 
   const facts: Record<string, string | number | boolean | null> = {
+    criterionId: "kernel_sysctl",
     criterion: "kernel_sysctl",
     observedCount: parsed?.observed.size ?? 0,
     missingCount: parsed?.missingKeys.length ?? SYSCTL_POLICIES.length,
@@ -3130,6 +3260,7 @@ function evaluateSystemdHealth(ctx: EvaluationContext): PostureCheck {
       : [];
 
   const evId = addEvidence("criterion", "systemd_health", {
+    criterionId: "systemd_health",
     criterion: "systemd_health",
     systemFailedCount: sysFailedRes?.status === "ok" ? systemFailed.length : null,
     userFailedCount: userFailedRes?.status === "ok" ? userFailed.length : null,
@@ -3216,10 +3347,12 @@ function evaluateProcessAndTimers(ctx: EvaluationContext): PostureCheck {
   const id: CriterionId = "process_and_timers";
   const meta = CRITERION_META[id];
   const {
-    capturedAt,
     commandResults,
     socketsAvailable,
     listeners,
+    processMap,
+    workloads,
+    emittedProcessPids,
     expectedPortSet,
     addEvidence,
     addFinding,
@@ -3234,7 +3367,6 @@ function evaluateProcessAndTimers(ctx: EvaluationContext): PostureCheck {
     sockets: socketsAvailable ? "complete" : "unavailable",
   };
 
-  const processMap = procRes?.status === "ok" ? parseProcesses(procRes.stdout, capturedAt) : null;
   const userTimers = timersRes?.status === "ok" ? parseUserTimers(timersRes.stdout) : null;
 
   const unexpectedListeners: Listener[] = [];
@@ -3251,6 +3383,7 @@ function evaluateProcessAndTimers(ctx: EvaluationContext): PostureCheck {
   }
 
   const evId = addEvidence("criterion", "process_and_timers", {
+    criterionId: "process_and_timers",
     criterion: "process_and_timers",
     processCount: processMap?.size ?? null,
     userTimerCount: userTimers?.length ?? null,
@@ -3277,16 +3410,23 @@ function evaluateProcessAndTimers(ctx: EvaluationContext): PostureCheck {
     const proc = listener.pid !== undefined ? processMap?.get(listener.pid) : undefined;
     const parent = proc !== undefined ? processMap?.get(proc.ppid) : undefined;
     const comm = proc?.comm ?? listener.process ?? null;
+    const workload = matchEnrolledWorkloadForCollector(listener, proc, workloads);
+    const resolvedPid = proc?.pid ?? listener.pid ?? null;
 
     const procEvId = addEvidence("process", `unexpected:${listener.port}:${i}`, {
       comm,
-      pid: proc?.pid ?? listener.pid ?? null,
+      pid: resolvedPid,
       uid: proc?.uid ?? null,
       startedAt: proc?.startedAt ?? null,
       parentComm: parent?.comm ?? null,
       protocol: listener.protocol,
       port: listener.port,
+      workloadId: workload?.id ?? null,
+      unit: proc?.uunit ?? proc?.unit ?? workload?.unit ?? null,
     });
+    if (resolvedPid !== null) {
+      emittedProcessPids.add(resolvedPid);
+    }
     flaggedProcessEvIds.push(procEvId);
     checkEvidenceIds.push(procEvId);
   }
@@ -3347,6 +3487,71 @@ export class PostureCollector {
     this.concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
   }
 
+  async primeNetworkContext(signal?: AbortSignal): Promise<void> {
+    const commandKinds: SimpleCommandKind[] = [
+      "ufw_status",
+      "tailscale_serve",
+      "tailscale_funnel",
+    ];
+    const fileSources: PostureFileSource[] = [
+      "ufw-conf",
+      "ufw-default",
+      "ufw-v4",
+      "ufw-v6",
+    ];
+    const commandResults = new Map<SimpleCommandKind, CommandResult>();
+    const fileResults = new Map<PostureFileSource, string | null>();
+    const tasks: (() => Promise<void>)[] = [];
+
+    for (const kind of commandKinds) {
+      tasks.push(async () => {
+        commandResults.set(kind, await this.runner.run({ kind }, signal));
+      });
+    }
+    for (const source of fileSources) {
+      tasks.push(async () => {
+        fileResults.set(source, await this.files.read(source));
+      });
+    }
+
+    await runWithConcurrency(tasks, this.concurrency);
+
+    if (signal?.aborted) {
+      return;
+    }
+
+    const ufwStatusRes = commandResults.get("ufw_status");
+    const ufwStatusParsed =
+      ufwStatusRes?.status === "ok" ? parseUfwStatus(ufwStatusRes.stdout) : null;
+    const ufwConfText = fileResults.get("ufw-conf") ?? null;
+    const ufwConfParsed = ufwConfText !== null ? parseUfwConf(ufwConfText) : null;
+    const ufwDefaultText = fileResults.get("ufw-default") ?? null;
+    const ufwDefaultParsed = ufwDefaultText !== null ? parseUfwDefault(ufwDefaultText) : null;
+    const ufwV4Text = fileResults.get("ufw-v4") ?? null;
+    const ufwV6Text = fileResults.get("ufw-v6") ?? null;
+
+    const effectiveUfwActive: boolean | null =
+      ufwStatusParsed && ufwStatusParsed.active !== null
+        ? ufwStatusParsed.active
+        : (ufwConfParsed?.active ?? null);
+    const effectiveDefaultInput: "allow" | "deny" | "unknown" =
+      ufwStatusParsed && ufwStatusParsed.defaultInput !== "unknown"
+        ? ufwStatusParsed.defaultInput
+        : ufwDefaultParsed?.defaultInput ?? "unknown";
+
+    this.latestFirewall = {
+      active: effectiveUfwActive,
+      ipv6Enabled: ufwDefaultParsed ? ufwDefaultParsed.ipv6Enabled : null,
+      v4: ufwV4Text,
+      v6: ufwV6Text,
+      defaultInput: effectiveDefaultInput,
+    };
+    this.latestPublications = parseTailscalePublications(
+      commandResults.get("tailscale_serve"),
+      commandResults.get("tailscale_funnel"),
+    );
+  }
+
   classifySockets(
     listeners: readonly Listener[],
     expectedPorts: ReadonlySet<number> | readonly number[],
@@ -3388,6 +3593,7 @@ export class PostureCollector {
 
     const addFirewallDeps = () => {
       neededCommands.add("ufw_status");
+      neededFiles.add("ufw-conf");
       neededFiles.add("ufw-default");
       neededFiles.add("ufw-v4");
       neededFiles.add("ufw-v6");
@@ -3433,6 +3639,9 @@ export class PostureCollector {
       neededCommands.add("processes");
       neededCommands.add("user_timers");
       neededCommands.add("sockets");
+    }
+    if (settings.workloads.length > 0 && neededCommands.has("sockets")) {
+      neededCommands.add("processes");
     }
 
     const commandResults = new Map<SimpleCommandKind, CommandResult>();
@@ -3502,18 +3711,27 @@ export class PostureCollector {
       });
     };
 
-    // Shared parsed state for sockets, firewall, and exposure
+    // Shared parsed state for sockets, processes, firewall, and exposure
     const socketsRes = commandResults.get("sockets");
     const socketsAvailable = socketsRes?.status === "ok";
     const listeners = socketsAvailable ? parseListeners(socketsRes.stdout) : [];
+    const procRes = commandResults.get("processes");
+    const processMap = procRes?.status === "ok" ? parseProcesses(procRes.stdout, capturedAt) : null;
 
     const ufwStatusRes = commandResults.get("ufw_status");
     const ufwStatusParsed =
       ufwStatusRes?.status === "ok" ? parseUfwStatus(ufwStatusRes.stdout) : null;
+    const ufwConfText = fileResults.get("ufw-conf") ?? null;
+    const ufwConfParsed = ufwConfText !== null ? parseUfwConf(ufwConfText) : null;
     const ufwDefaultText = fileResults.get("ufw-default") ?? null;
     const ufwDefaultParsed = ufwDefaultText !== null ? parseUfwDefault(ufwDefaultText) : null;
     const ufwV4Text = fileResults.get("ufw-v4") ?? null;
     const ufwV6Text = fileResults.get("ufw-v6") ?? null;
+
+    const effectiveUfwActive: boolean | null =
+      ufwStatusParsed && ufwStatusParsed.active !== null
+        ? ufwStatusParsed.active
+        : (ufwConfParsed?.active ?? null);
 
     const effectiveDefaultInput: "allow" | "deny" | "unknown" =
       ufwStatusParsed && ufwStatusParsed.defaultInput !== "unknown"
@@ -3530,7 +3748,7 @@ export class PostureCollector {
           : "partial";
 
     const firewallInputs: FirewallInputs = {
-      active: ufwStatusParsed ? ufwStatusParsed.active : null,
+      active: effectiveUfwActive,
       ipv6Enabled: ufwDefaultParsed ? ufwDefaultParsed.ipv6Enabled : null,
       v4: ufwV4Text,
       v6: ufwV6Text,
@@ -3576,6 +3794,8 @@ export class PostureCollector {
 
       exposure = preClassified.map((entry, index) => {
         const listener = entry.listener;
+        const proc = listener.pid !== undefined ? processMap?.get(listener.pid) : undefined;
+        const workload = matchEnrolledWorkloadForCollector(listener, proc, settings.workloads);
         const evId = addEvidence("listener", String(index), {
           protocol: listener.protocol,
           family: String(listener.family),
@@ -3584,6 +3804,10 @@ export class PostureCollector {
           interfaceName: listener.interfaceName ?? null,
           pid: listener.pid ?? null,
           process: listener.process ?? null,
+          ...(workload ? { workloadId: workload.id } : {}),
+          ...(proc?.uunit ?? proc?.unit ?? workload?.unit
+            ? { unit: proc?.uunit ?? proc?.unit ?? workload?.unit ?? null }
+            : {}),
           reachability: entry.reachability,
           firewallV4: entry.firewallV4,
           firewallV6: entry.firewallV6,
@@ -3597,6 +3821,8 @@ export class PostureCollector {
       });
     }
 
+    const emittedProcessPids = new Set<number>();
+
     const ctx: EvaluationContext = {
       capturedAt,
       commandResults,
@@ -3604,6 +3830,9 @@ export class PostureCollector {
       sshDropInsResult,
       socketsAvailable,
       listeners,
+      processMap,
+      workloads: settings.workloads,
+      emittedProcessPids,
       ufwStatusRes,
       ufwStatusParsed,
       ufwDefaultParsed,
@@ -3635,6 +3864,37 @@ export class PostureCollector {
       }
       return CRITERION_EVALUATORS[id](ctx);
     });
+
+    // Ensure enrolled workload listeners always have corresponding process evidence
+    // with pid, startedAt, comm, and workloadId for AI pause_workload proposals.
+    if (socketsAvailable && settings.workloads.length > 0) {
+      for (let i = 0; i < listeners.length; i++) {
+        const listener = listeners[i]!;
+        const proc = listener.pid !== undefined ? processMap?.get(listener.pid) : undefined;
+        const workload = matchEnrolledWorkloadForCollector(listener, proc, settings.workloads);
+        if (!workload) continue;
+        const resolvedPid = proc?.pid ?? listener.pid ?? null;
+        if (resolvedPid !== null && emittedProcessPids.has(resolvedPid)) {
+          continue;
+        }
+        const parent = proc !== undefined ? processMap?.get(proc.ppid) : undefined;
+        const comm = proc?.comm ?? listener.process ?? null;
+        addEvidence("process", `workload:${workload.id}:${resolvedPid ?? i}`, {
+          comm,
+          pid: resolvedPid,
+          uid: proc?.uid ?? null,
+          startedAt: proc?.startedAt ?? null,
+          parentComm: parent?.comm ?? null,
+          protocol: listener.protocol,
+          port: listener.port,
+          workloadId: workload.id,
+          unit: proc?.uunit ?? proc?.unit ?? workload.unit,
+        });
+        if (resolvedPid !== null) {
+          emittedProcessPids.add(resolvedPid);
+        }
+      }
+    }
 
     return {
       snapshot: {

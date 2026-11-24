@@ -1981,4 +1981,68 @@ describe("EventMonitor edge cases", () => {
       store.close();
     }
   });
+
+  test("F06: enrolled workload opening an undeclared exposed port still matches and emits unexpected_workload corroboration", async () => {
+    const store = memoryStore();
+    const workloads: EnrolledWorkload[] = [
+      { id: "comfy", unit: "comfy.service", name: "comfy", ports: [8188] },
+    ];
+    const ssUndeclaredPort =
+      'tcp   LISTEN 0      128    0.0.0.0:9999     0.0.0.0:*    users:(("comfy",pid=4242,fd=8))';
+    let socketPoll = 0;
+    const runner = runnerStub((request) => {
+      if (request.kind === "processes") {
+        return ok("  4242     1  1000   120 user@1000.service comfy.service comfy\n");
+      }
+      socketPoll += 1;
+      if (socketPoll === 1) return ssOutput(SS_LOOPBACK);
+      if (socketPoll === 2) return ssOutput(SS_LOOPBACK, SS_WORKLOAD);
+      return ssOutput(SS_LOOPBACK, SS_WORKLOAD, ssUndeclaredPort);
+    });
+    const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW), workloads });
+
+    const classifyWithDeclaredPorts = (listeners: Listener[]): ExposureEntry[] => {
+      const expected = new Set<number>([22, 6969, ...workloads.flatMap((w) => w.ports ?? [])]);
+      return listeners.map((listener) => ({
+        id: `exp:${listener.id}`,
+        listener,
+        reachability:
+          listener.address === "127.0.0.1" ? "local_only" : "exposed_lan",
+        firewallV4: listener.address === "127.0.0.1" ? "na" : "allow",
+        firewallV6: "na",
+        publication: "none",
+        expected: expected.has(listener.port),
+        evidenceIds: [`ev:${listener.id}`],
+      }));
+    };
+
+    try {
+      await monitor.pollSockets(classifyWithDeclaredPorts);
+
+      // (a) Enrolled workload on its declared port (8188) is expected -> no false alert/corroboration.
+      const declaredResult = await monitor.pollSockets(classifyWithDeclaredPorts);
+      expect(declaredResult.alerts).toEqual([]);
+      expect(declaredResult.corroboration).toEqual([]);
+
+      // (b) Same enrolled workload opens an undeclared exposed port (9999) -> emits unexpected_workload!
+      const undeclaredResult = await monitor.pollSockets(classifyWithDeclaredPorts);
+      const corr = undeclaredResult.corroboration.find(
+        (entry) => entry.rule === "unexpected_workload",
+      );
+      expect(corr).toBeDefined();
+      expect(corr?.target).toEqual({
+        kind: "pause_workload",
+        workloadId: "comfy",
+        pid: 4242,
+        startedAt: NOW - 120 * 1000,
+      });
+      expect(
+        undeclaredResult.alerts.some((alert) =>
+          alert.fingerprint.includes("unexpected_workload:comfy"),
+        ),
+      ).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
 });

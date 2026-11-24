@@ -10,6 +10,7 @@ import {
   type Stats,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { canonicalizeIp } from "./lockdown";
 import type {
   AiVerdict,
   AlertChannel,
@@ -58,6 +59,19 @@ const SEVERITY_RANK: Record<Severity, number> = {
   critical: 2,
   breach: 3,
 };
+
+function canonicalContainmentTargetKey(target: ContainmentTarget): string {
+  switch (target.kind) {
+    case "pause_workload":
+      return `pause_workload:${target.workloadId.trim()}`;
+    case "deny_peer_ip": {
+      const canonical = canonicalizeIp(target.ip) ?? target.ip.trim().toLowerCase();
+      return `deny_peer_ip:${canonical}`;
+    }
+    case "isolate_lan_ingress":
+      return "isolate_lan_ingress";
+  }
+}
 
 function validateNonEmptyString(value: unknown, field: string): void {
   if (typeof value !== "string" || value.trim().length === 0) {
@@ -1369,6 +1383,39 @@ export class SecurityStore implements SecurityStoreContract {
 
   claimProposal(id: string, revision: number, now: number): LockdownAction | null {
     return this.inImmediateTransaction(() => {
+      const candidate = this.db
+        .query(
+          `SELECT id, target_json, lease_seconds
+           FROM lockdown_proposals
+           WHERE id = ? AND revision = ? AND status = 'pending' AND expires_at > ?`,
+        )
+        .get(id, revision, now) as {
+        id: string;
+        target_json: string;
+        lease_seconds: number;
+      } | null;
+
+      if (!candidate) {
+        return null;
+      }
+
+      const candidateTarget = JSON.parse(candidate.target_json) as ContainmentTarget;
+      const candidateKey = canonicalContainmentTargetKey(candidateTarget);
+      const liveRows = this.db
+        .query(
+          `SELECT target_json
+           FROM lockdown_actions
+           WHERE state IN ('pending', 'active', 'rolling_back')`,
+        )
+        .all() as { target_json: string }[];
+
+      for (const row of liveRows) {
+        const liveTarget = JSON.parse(row.target_json) as ContainmentTarget;
+        if (canonicalContainmentTargetKey(liveTarget) === candidateKey) {
+          return null;
+        }
+      }
+
       const claimed = this.db
         .query(
           `UPDATE lockdown_proposals
@@ -1390,7 +1437,7 @@ export class SecurityStore implements SecurityStoreContract {
         id: crypto.randomUUID(),
         proposalId: claimed.id,
         idempotencyKey: `${claimed.id}:${revision}`,
-        target: JSON.parse(claimed.target_json) as ContainmentTarget,
+        target: candidateTarget,
         state: "pending",
         createdAt: now,
         expiresAt: now + claimed.lease_seconds * 1_000,

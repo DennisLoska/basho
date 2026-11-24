@@ -481,7 +481,7 @@ describe("decideContainment", () => {
     const mismatches: Partial<Corroboration>[] = [
       { target: { ...WORKLOAD_TARGET, workloadId: "other" } as ContainmentTarget },
       { target: { ...WORKLOAD_TARGET, pid: ENROLLED_PID + 1 } as ContainmentTarget },
-      { target: { ...WORKLOAD_TARGET, startedAt: ENROLLED_STARTED_AT + 1 } as ContainmentTarget },
+      { target: { ...WORKLOAD_TARGET, startedAt: ENROLLED_STARTED_AT + 2_001 } as ContainmentTarget },
       { rule: "ssh_burst" },
     ];
     for (const mismatch of mismatches) {
@@ -1541,6 +1541,7 @@ describe("DeadMansSwitch user-unit scope and production adapters", () => {
 
   test("composite adapter routes network actions to sudo helper and workloads to user systemd", async () => {
     const calls: string[][] = [];
+    let freezerState = "frozen";
     const exec = async (argv: readonly string[]) => {
       calls.push([...argv]);
       if (argv.includes("status")) {
@@ -1549,8 +1550,12 @@ describe("DeadMansSwitch user-unit scope and production adapters", () => {
       if (argv.includes("inspect")) {
         return { exitCode: 0, stdout: "active\n", stderr: "" };
       }
+      if (argv[0] === "/usr/bin/systemctl" && argv.includes("thaw")) {
+        freezerState = "running";
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
       if (argv.includes("FreezerState")) {
-        return { exitCode: 0, stdout: "frozen\n", stderr: "" };
+        return { exitCode: 0, stdout: `${freezerState}\n`, stderr: "" };
       }
       return { exitCode: 0, stdout: "", stderr: "" };
     };
@@ -2376,5 +2381,136 @@ esac
 
     const deny = runHelper(fixture, ["deny-ip", PEER, "600", "op-locale"], nonEnglishLocale);
     expect(deny.code).toBe(0);
+  });
+});
+
+describe("Council round 1 regressions (F01, F10)", () => {
+  test("F01: corroborationMatchesTarget accepts pause_workload startedAt within <= 2000ms and rejects > 2000ms", () => {
+    const baseCorroboration: Corroboration = {
+      rule: "unexpected_workload",
+      eventIds: ["ev-sock-1"],
+      expiresAt: NOW + 5 * MINUTE,
+      target: {
+        kind: "pause_workload",
+        workloadId: ENROLLED_ID,
+        pid: ENROLLED_PID,
+        startedAt: ENROLLED_STARTED_AT,
+      },
+    };
+
+    const evaluate = (startedAt: number) =>
+      decideContainment({
+        mode: "auto-lockdown",
+        target: {
+          kind: "pause_workload",
+          workloadId: ENROLLED_ID,
+          pid: ENROLLED_PID,
+          startedAt,
+        },
+        now: NOW,
+        threshold: 0.85,
+        verdict: { kind: "breach", confidence: 0.95, summary: "Unauthorized workload" },
+        corroboration: [baseCorroboration],
+        safe: true,
+        rollbackReady: true,
+      });
+
+    expect(evaluate(ENROLLED_STARTED_AT)).toBe("execute");
+    expect(evaluate(ENROLLED_STARTED_AT + 1_500)).toBe("execute");
+    expect(evaluate(ENROLLED_STARTED_AT - 2_000)).toBe("execute");
+    expect(evaluate(ENROLLED_STARTED_AT + 2_000)).toBe("execute");
+    expect(evaluate(ENROLLED_STARTED_AT + 2_001)).toBe("queue");
+    expect(evaluate(ENROLLED_STARTED_AT - 2_001)).toBe("queue");
+  });
+
+  test("F10: user workload rollback keeps thaw timer intact on thaw failure/timeout or non-running FreezerState", async () => {
+    const makeActiveAction = (id: string): LockdownAction => ({
+      id,
+      proposalId: `prop-${id}`,
+      idempotencyKey: `prop-${id}:1`,
+      target: WORKLOAD_TARGET,
+      state: "rolling_back",
+      createdAt: NOW,
+      expiresAt: NOW + 120 * SECOND,
+      updatedAt: NOW,
+      rollbackHandle: `user-unit:${ENROLLED_UNIT}:basho-thaw-${id}`,
+    });
+
+    // Case 1: thaw fails (exit 1) -> timer must NOT be stopped and rollback returns unknown.
+    const failCalls: string[][] = [];
+    const failAdapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => [ENROLLED_WORKLOAD],
+      clock: createClock().clock,
+      exec: async (argv) => {
+        failCalls.push([...argv]);
+        if (argv.includes("thaw")) {
+          return { exitCode: 1, stdout: "", stderr: "dbus error" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(await failAdapter.rollback(makeActiveAction("act-thaw-fail"))).toEqual({
+      state: "unknown",
+    });
+    expect(failCalls.some((argv) => argv.includes("stop"))).toBe(false);
+
+    // Case 2: thaw times out (exit 124) -> timer must NOT be stopped and rollback returns unknown.
+    const timeoutCalls: string[][] = [];
+    const timeoutAdapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => [ENROLLED_WORKLOAD],
+      clock: createClock().clock,
+      exec: async (argv) => {
+        timeoutCalls.push([...argv]);
+        if (argv.includes("thaw")) {
+          return { exitCode: 124, stdout: "", stderr: "timed out" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(await timeoutAdapter.rollback(makeActiveAction("act-thaw-timeout"))).toEqual({
+      state: "unknown",
+    });
+    expect(timeoutCalls.some((argv) => argv.includes("stop"))).toBe(false);
+
+    // Case 3: thaw returns 0 but FreezerState is still frozen -> timer must NOT be stopped.
+    const stillFrozenCalls: string[][] = [];
+    const stillFrozenAdapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => [ENROLLED_WORKLOAD],
+      clock: createClock().clock,
+      exec: async (argv) => {
+        stillFrozenCalls.push([...argv]);
+        if (argv.includes("FreezerState")) {
+          return { exitCode: 0, stdout: "frozen\n", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(await stillFrozenAdapter.rollback(makeActiveAction("act-still-frozen"))).toEqual({
+      state: "unknown",
+    });
+    expect(stillFrozenCalls.some((argv) => argv.includes("stop"))).toBe(false);
+
+    // Case 4: thaw returns 0 and FreezerState confirms running -> stops timer AFTER check and returns absent.
+    const okCalls: string[][] = [];
+    const okAdapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => [ENROLLED_WORKLOAD],
+      clock: createClock().clock,
+      exec: async (argv) => {
+        okCalls.push([...argv]);
+        if (argv.includes("FreezerState")) {
+          return { exitCode: 0, stdout: "running\n", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(await okAdapter.rollback(makeActiveAction("act-thaw-ok"))).toEqual({
+      state: "absent",
+    });
+    const thawIdx = okCalls.findIndex((argv) => argv.includes("thaw"));
+    const checkIdx = okCalls.findIndex((argv) => argv.includes("FreezerState"));
+    const stopIdx = okCalls.findIndex((argv) => argv.includes("stop"));
+    expect(thawIdx).toBeGreaterThanOrEqual(0);
+    expect(checkIdx).toBeGreaterThan(thawIdx);
+    expect(stopIdx).toBeGreaterThan(checkIdx);
   });
 });

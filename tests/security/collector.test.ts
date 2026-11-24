@@ -23,7 +23,7 @@ const DAY_MS = 86_400_000;
 const COVERAGE_VALUES: readonly Coverage[] = ["complete", "partial", "unavailable"];
 const SEVERITIES: readonly string[] = ["info", "warning", "critical", "breach"];
 
-type FileSource = "ufw-v4" | "ufw-v6" | "ufw-default" | "sshd-main" | "pacman-log";
+type FileSource = "ufw-conf" | "ufw-v4" | "ufw-v6" | "ufw-default" | "sshd-main" | "pacman-log";
 type CollectResult = Awaited<ReturnType<PostureCollector["collect"]>>;
 
 const okResult = (stdout: string, exitCode = 0): CommandResult => ({
@@ -144,6 +144,7 @@ const SYSCTL_SAFE = [
 ].join("\n");
 
 const DEFAULT_FILES: Record<FileSource, string | null> = {
+  "ufw-conf": null,
   "ufw-v4": "-A ufw-user-input -p tcp --dport 6969 -j ACCEPT",
   "ufw-v6": "-A ufw6-user-input -j RETURN",
   "ufw-default": UFW_DEFAULT_DROP,
@@ -176,6 +177,7 @@ const ALL_COMMANDS_UNAVAILABLE: Record<string, CommandResult> = Object.fromEntri
 );
 
 const ALL_FILES_UNAVAILABLE: Record<FileSource, null> = {
+  "ufw-conf": null,
   "ufw-v4": null,
   "ufw-v6": null,
   "ufw-default": null,
@@ -438,10 +440,23 @@ describe("evaluateFirewall", () => {
       ),
     ).toBe("deny");
 
+    // Tailscale-only allow rules do not force wildcard general exposure to unknown.
     expect(
       evaluateFirewall(
         { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0" },
         { active: true, v4: rules, defaultInput: "deny" },
+      ),
+    ).toBe("deny");
+
+    // Non-tailscale interface-scoped rules remain unknown for wildcard listeners without interfaceName.
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0" },
+        {
+          active: true,
+          v4: "-A ufw-user-input -i eth0 -p tcp --dport 22 -j ACCEPT",
+          defaultInput: "deny",
+        },
       ),
     ).toBe("unknown");
   });
@@ -1701,8 +1716,8 @@ describe("PostureCollector spec hardening regressions", () => {
 
 describe("PostureCollector spec re-review regressions (findings 1-6)", () => {
   test("re-review finding 1: wildcard listeners without interfaceName are indeterminate on matching interface-scoped rules", () => {
-    const v4Rule = "-A ufw-user-input -i tailscale0 -p tcp --dport 22 -j ACCEPT";
-    const v6Rule = "-A ufw6-user-input -i tailscale0 -p tcp --dport 22 -j ACCEPT";
+    const v4Rule = "-A ufw-user-input -i eth0 -p tcp --dport 22 -j ACCEPT";
+    const v6Rule = "-A ufw6-user-input -i eth0 -p tcp --dport 22 -j ACCEPT";
 
     // Wildcard without interfaceName is indeterminate on matching interface-scoped rule
     expect(
@@ -1721,19 +1736,19 @@ describe("PostureCollector spec re-review regressions (findings 1-6)", () => {
     // Wildcard WITH a specific interfaceName matches or mismatches normally
     expect(
       evaluateFirewall(
-        { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0", interfaceName: "tailscale0" },
+        { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0", interfaceName: "eth0" },
         { active: true, v4: v4Rule, defaultInput: "deny" },
       ),
     ).toBe("allow");
     expect(
       evaluateFirewall(
-        { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0", interfaceName: "eth0" },
+        { family: 4, protocol: "tcp", port: 22, address: "0.0.0.0", interfaceName: "wlan0" },
         { active: true, v4: v4Rule, defaultInput: "deny" },
       ),
     ).toBe("deny");
     expect(
       evaluateFirewall(
-        { family: 6, protocol: "tcp", port: 22, address: "::", interfaceName: "eth0" },
+        { family: 6, protocol: "tcp", port: 22, address: "::", interfaceName: "wlan0" },
         { active: true, ipv6Enabled: true, v6: v6Rule, defaultInput: "deny" },
       ),
     ).toBe("deny");
@@ -2600,5 +2615,165 @@ describe("PostureCollector Stage 2 code quality regressions", () => {
     expect(after8188?.expected).toBe(false);
     expect(after22?.expected).toBe(true);
     expect(after22?.reachability).toBe("blocked_by_ufw");
+  });
+});
+
+describe("Council round 1 regressions (F01, F07, F13, F18)", () => {
+  test("F01: PostureCollector emits workloadId on listener evidence and process evidence for enrolled workload listeners", async () => {
+    const result = await harness({
+      commands: {
+        sockets: okResult(
+          ss(
+            'tcp   LISTEN 0      128    0.0.0.0:8188    0.0.0.0:*    users:(("comfy",pid=4242,fd=7))',
+            'tcp   LISTEN 0      128    127.0.0.1:6969  0.0.0.0:*    users:(("bun",pid=1001,fd=3))',
+          ),
+        ),
+        processes: okResult(
+          [
+            "  4242     1  1000   120 user@1000.service comfy.service comfy",
+            "  1001     1  1000   900 -                 -             bun",
+          ].join("\n"),
+        ),
+      },
+      files: {
+        "ufw-v4": "-A ufw-user-input -p tcp --dport 8188 -j ACCEPT",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect(
+      "scan-f01-workload",
+      settings({
+        expectedPorts: [22, 6969],
+        workloads: [{ id: "comfy", unit: "comfy.service", name: "comfy", ports: [8188] }],
+      }),
+    );
+
+    const listenerEv = result.snapshot.evidence.find(
+      (ev) => ev.kind === "listener" && ev.facts.port === 8188,
+    );
+    expect(listenerEv).toBeDefined();
+    expect(listenerEv?.facts.workloadId).toBe("comfy");
+    expect(listenerEv?.facts.pid).toBe(4242);
+
+    const procEv = result.snapshot.evidence.find(
+      (ev) => ev.kind === "process" && ev.facts.pid === 4242,
+    );
+    expect(procEv).toBeDefined();
+    expect(procEv?.facts.workloadId).toBe("comfy");
+    expect(procEv?.facts.comm).toBe("comfy");
+    expect(procEv?.facts.startedAt).toBe(NOW - 120 * 1000);
+  });
+
+  test("F07: narrow source-scoped DROP/REJECT rules and tailscale* allow rules do not collapse general exposure to unknown", async () => {
+    const denyThenAllowRules = [
+      "-A ufw-user-input -s 198.51.100.42 -j DROP -m comment --comment 'basho-op-1'",
+      "-A ufw-user-input -p tcp --dport 8188 -j ACCEPT",
+    ].join("\n");
+
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 8188, address: "0.0.0.0" },
+        { active: true, v4: denyThenAllowRules, defaultInput: "deny" },
+      ),
+    ).toBe("allow");
+
+    const denyLeaseResult = await harness({
+      commands: {
+        sockets: okResult(ss("tcp   LISTEN 0      128    0.0.0.0:8188    0.0.0.0:*")),
+      },
+      files: {
+        "ufw-v4": denyThenAllowRules,
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect("scan-f07-deny-lease", settings());
+    const leaseEntry = entryByPort(denyLeaseResult, 8188);
+    expect(leaseEntry.firewallV4).toBe("allow");
+    expect(leaseEntry.reachability).toBe("exposed_lan");
+
+    // A tailscale0-scoped allow rule must NOT force wildcard 0.0.0.0:8188 to unknown.
+    const tailscaleThenAllow = [
+      "-A ufw-user-input -i tailscale0 -j ACCEPT",
+      "-A ufw-user-input -p tcp --dport 8188 -j ACCEPT",
+    ].join("\n");
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 8188, address: "0.0.0.0" },
+        { active: true, v4: tailscaleThenAllow, defaultInput: "deny" },
+      ),
+    ).toBe("allow");
+
+    const tailscaleOnlyRule = "-A ufw-user-input -i tailscale0 -p tcp --dport 8188 -j ACCEPT";
+    expect(
+      evaluateFirewall(
+        { family: 4, protocol: "tcp", port: 8188, address: "0.0.0.0" },
+        { active: true, v4: tailscaleOnlyRule, defaultInput: "deny" },
+      ),
+    ).toBe("deny");
+  });
+
+  test("F13: ChallengeResponseAuthentication yes before KbdInteractiveAuthentication no preserves yes under first-value-wins", async () => {
+    const result = await harness({
+      files: {
+        "sshd-main": [
+          "Port 22",
+          "PermitRootLogin no",
+          "PasswordAuthentication no",
+          "ChallengeResponseAuthentication yes",
+          "KbdInteractiveAuthentication no",
+        ].join("\n"),
+      },
+    }).collector.collect("scan-f13-ssh-alias", settings());
+
+    const check = checkById(result, "ssh_hardening");
+    expect(check.status).toBe("warn");
+    expect(check.summary).toContain("keyboard-interactive");
+    expect(findingsFor(result, check).length).toBeGreaterThan(0);
+  });
+
+  test("F18: falls back to /etc/ufw/ufw.conf when ufw_status fails in unprivileged mode", async () => {
+    const enabledFiles: Record<string, string | null> = {
+      "ufw-conf": "# /etc/ufw/ufw.conf\nENABLED=yes\nLOGLEVEL=low\n",
+      "ufw-default": UFW_DEFAULT_DROP,
+      "ufw-v4": "-A ufw-user-input -p tcp --dport 8188 -j ACCEPT",
+      "ufw-v6": "-A ufw6-user-input -j RETURN",
+      "sshd-main": HARDENED_SSHD,
+      "pacman-log": DEFAULT_FILES["pacman-log"],
+    };
+
+    const collector = new PostureCollector({
+      clock: { now: () => NOW },
+      runner: {
+        async run(request) {
+          if (request.kind === "ufw_status") return { status: "failed" };
+          if (request.kind === "sockets") {
+            return okResult(
+              ss(
+                "tcp   LISTEN 0      128    0.0.0.0:8188    0.0.0.0:*",
+                "tcp   LISTEN 0      128    0.0.0.0:7000    0.0.0.0:*",
+              ),
+            );
+          }
+          return DEFAULT_COMMANDS[request.kind] ?? UNAVAILABLE;
+        },
+      },
+      files: {
+        async read(source) {
+          return enabledFiles[source] ?? null;
+        },
+        async sshDropIns() {
+          return [];
+        },
+      },
+    });
+
+    const result = await collector.collect("scan-f18-unprivileged-ufw", settings());
+    const fwCheck = checkById(result, "firewall_ufw");
+    expect(fwCheck.status).toBe("pass");
+    const fwEv = result.snapshot.evidence.find(
+      (ev) => ev.kind === "criterion" && (ev.facts.criterionId ?? ev.facts.criterion) === "firewall_ufw",
+    );
+    expect(fwEv?.facts.active).toBe(true);
+
+    expect(entryByPort(result, 8188).reachability).toBe("exposed_lan");
+    expect(entryByPort(result, 7000).reachability).toBe("blocked_by_ufw");
   });
 });

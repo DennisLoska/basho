@@ -11,6 +11,7 @@ import {
   classifyListeners,
   createPostureFiles,
   PostureCollector,
+  type PostureFiles,
   type PostureResult,
 } from "./collector";
 import { loadSecurityConfig } from "./config";
@@ -108,6 +109,7 @@ export interface RuntimeCollector {
     settings: SecuritySettings,
     signal?: AbortSignal,
   ): Promise<PostureResult>;
+  primeNetworkContext?(signal?: AbortSignal): Promise<void>;
 }
 
 export interface RuntimeMonitor {
@@ -138,7 +140,7 @@ export interface RuntimeLockdown {
   approve(id: string, revision: number, settings: SecuritySettings): Promise<boolean>;
   reject(id: string, revision: number): boolean;
   unlock(actionId: string): Promise<boolean>;
-  reconcile(): Promise<void>;
+  reconcile(): Promise<void | boolean>;
 }
 
 export interface RuntimeDispatcher {
@@ -328,7 +330,10 @@ function fallbackClassifySockets(
   listeners: Listener[],
   settings: SecuritySettings,
 ): ExposureEntry[] {
-  const expectedPorts = new Set<number>(settings.expectedPorts);
+  const expectedPorts = new Set<number>([
+    ...settings.expectedPorts,
+    ...settings.workloads.flatMap((w) => w.ports ?? []),
+  ]);
   return classifyListeners({
     listeners,
     firewall: { active: null },
@@ -404,6 +409,41 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
 
   const activeCorroborations: Corroboration[] = [];
   const inFlightTasks = new Set<Promise<unknown>>();
+  let networkContextPrimed = false;
+  let networkContextPrimePromise: Promise<void> | null = null;
+
+  const containmentStateSignature = (): string => {
+    if (stopped || storeClosed) return "";
+    const proposals = store
+      .listProposals()
+      .map((p) => `${p.id}:${p.revision}:${p.status}`)
+      .join(",");
+    const actions = store
+      .listActions()
+      .map((a) => `${a.id}:${a.state}:${a.updatedAt}:${a.rollbackHandle ?? ""}`)
+      .join(",");
+    return `${proposals}|${actions}`;
+  };
+
+  const ensureNetworkContextPrimed = async (signal: AbortSignal): Promise<void> => {
+    if (networkContextPrimed || !collector.primeNetworkContext || stopped) return;
+    if (!networkContextPrimePromise) {
+      networkContextPrimePromise = trackTask(
+        collector
+          .primeNetworkContext(signal)
+          .then(() => {
+            if (!signal.aborted) {
+              networkContextPrimed = true;
+            }
+          })
+          .catch(() => {})
+          .finally(() => {
+            networkContextPrimePromise = null;
+          }),
+      );
+    }
+    await networkContextPrimePromise;
+  };
 
   const latestEvidenceAt = (): number => {
     const latestStoreEventAt = store.recentEvents(0, 1)[0]?.lastAt ?? 0;
@@ -574,6 +614,25 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
         throw new Error("Security scan aborted");
       }
 
+      const previousScan = store.latestScan();
+      const eventCooldownMs = Math.max(0, scanSettings.ai.triageCooldownMinutes) * MINUTE_MS;
+      const skipAiForCooldown =
+        trigger === "event" &&
+        lastEventAiAt !== null &&
+        eventCooldownMs > 0 &&
+        startedAt - lastEventAiAt < eventCooldownMs;
+
+      const carriedAiFindings =
+        skipAiForCooldown && previousScan
+          ? previousScan.findings.filter((finding) => finding.source === "ai")
+          : [];
+      const carriedTrail =
+        skipAiForCooldown && previousScan ? previousScan.trail : { steps: [] };
+      const carriedVerdict =
+        skipAiForCooldown && previousScan ? previousScan.verdict : undefined;
+      const carriedAiStatus =
+        skipAiForCooldown && previousScan ? previousScan.aiStatus : lastAiStatus;
+
       const deterministicScan: SecurityScan = {
         id: scanId,
         trigger,
@@ -581,20 +640,14 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
         finishedAt: clock.now(),
         snapshot: posture.snapshot,
         exposure: posture.exposure,
-        findings: [...posture.findings],
-        trail: { steps: [] },
-        aiStatus: lastAiStatus,
+        findings: [...posture.findings, ...carriedAiFindings],
+        trail: carriedTrail,
+        aiStatus: carriedAiStatus,
+        ...(carriedVerdict ? { verdict: carriedVerdict } : {}),
       };
 
       store.saveScan(deterministicScan);
       emit({ kind: "scan" });
-
-      const eventCooldownMs = Math.max(0, scanSettings.ai.triageCooldownMinutes) * MINUTE_MS;
-      const skipAiForCooldown =
-        trigger === "event" &&
-        lastEventAiAt !== null &&
-        eventCooldownMs > 0 &&
-        startedAt - lastEventAiAt < eventCooldownMs;
 
       if (skipAiForCooldown) {
         return deterministicScan;
@@ -642,7 +695,7 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
             completedScan,
             investigation.proposals,
             getActiveCorroborations(),
-            scanSettings,
+            cloneSettings(currentSettings),
           );
           if (!stopped) {
             if (considerResult.proposals.length > 0 || considerResult.actions.length > 0) {
@@ -775,6 +828,7 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
   };
 
   const invokeSocketPoll = async (signal: AbortSignal): Promise<MonitorResult> => {
+    await ensureNetworkContextPrimed(signal);
     if (options.classifySockets) {
       return (
         monitor.pollSockets as (
@@ -842,7 +896,13 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
       fixedUnsubs.push(drainSchedule.unsub);
 
       const reconcileSchedule = scheduleNonOverlapping(RECONCILE_INTERVAL_MS, async () => {
-        await lockdown.reconcile();
+        if (stopped || storeClosed) return;
+        const before = containmentStateSignature();
+        const changed = await lockdown.reconcile();
+        if (stopped || storeClosed) return;
+        if (changed === true || containmentStateSignature() !== before) {
+          emit({ kind: "containment" });
+        }
       });
       fixedUnsubs.push(reconcileSchedule.unsub);
 
@@ -854,6 +914,7 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
       schedulePeriodicScan();
 
       // Startup recovery: route through the exact same per-schedule non-overlapping guards.
+      void ensureNetworkContextPrimed(runtimeAbort.signal);
       pruneSchedule.run();
       reconcileSchedule.run();
       drainSchedule.run();
@@ -1008,13 +1069,17 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
       if (stopped) return Promise.resolve(false);
       return trackTask(
         (async () => {
+          const before = containmentStateSignature();
           try {
             const ok = await lockdown.approve(id, revision, cloneSettings(currentSettings));
-            if (ok && !stopped) {
+            if (!stopped && !storeClosed && (ok || containmentStateSignature() !== before)) {
               emit({ kind: "containment" });
             }
             return ok;
           } catch (error) {
+            if (!stopped && !storeClosed && containmentStateSignature() !== before) {
+              emit({ kind: "containment" });
+            }
             if (stopped || storeClosed) {
               return false;
             }
@@ -1037,13 +1102,17 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
       if (stopped) return Promise.resolve(false);
       return trackTask(
         (async () => {
+          const before = containmentStateSignature();
           try {
             const ok = await lockdown.unlock(id);
-            if (ok && !stopped) {
+            if (!stopped && !storeClosed && (ok || containmentStateSignature() !== before)) {
               emit({ kind: "containment" });
             }
             return ok;
           } catch (error) {
+            if (!stopped && !storeClosed && containmentStateSignature() !== before) {
+              emit({ kind: "containment" });
+            }
             if (stopped || storeClosed) {
               return false;
             }
@@ -1082,6 +1151,8 @@ export interface LiveSecurityRuntimeOptions {
   hostLabel?: string;
   helperPath?: string;
   stopTimeoutMs?: number;
+  runner?: CommandRunner;
+  files?: PostureFiles;
 }
 
 function isHelperBinaryExecutable(path: string): boolean {
@@ -1118,10 +1189,10 @@ export function createLiveSecurityRuntime(
       effectiveSettings = cloneSettings(loaded.settings);
     }
 
-    const runner = createCommandRunner();
+    const runner = options.runner ?? createCommandRunner();
     const collector = new PostureCollector({
       runner,
-      files: createPostureFiles(),
+      files: options.files ?? createPostureFiles(),
       clock,
     });
     const monitor = new EventMonitor({
@@ -1149,6 +1220,13 @@ export function createLiveSecurityRuntime(
       guard: new DeadMansSwitch(),
       adapter,
       resolveProcess,
+      getMode: () => {
+        try {
+          return store.readOverrides().mode ?? effectiveSettings.mode;
+        } catch {
+          return effectiveSettings.mode;
+        }
+      },
     });
 
     let emitInApp: (() => void) | null = null;
@@ -1162,6 +1240,11 @@ export function createLiveSecurityRuntime(
         emitInApp?.();
       },
     });
+
+    const mergedExpectedPorts = [
+      ...effectiveSettings.expectedPorts,
+      ...effectiveSettings.workloads.flatMap((w) => w.ports ?? []),
+    ];
 
     const helperPath = options.helperPath ?? DEFAULT_HELPER_PATH;
     const runtime = createSecurityRuntime({
@@ -1179,7 +1262,7 @@ export function createLiveSecurityRuntime(
         effectiveSettings.lockdown.helperEnabled && isHelperBinaryExecutable(helperPath),
       runner,
       classifySockets: (listeners) =>
-        collector.classifySockets(listeners, effectiveSettings.expectedPorts),
+        collector.classifySockets(listeners, mergedExpectedPorts),
       stopTimeoutMs: options.stopTimeoutMs,
     });
 

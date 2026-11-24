@@ -4,6 +4,7 @@ import {
   EvidenceBroker,
   createAiProviderClient,
 } from "../../src/security/ai-analyst";
+import { PostureCollector } from "../../src/security/collector";
 import type {
   AiProviderClient,
   AiTurnRequest,
@@ -1802,5 +1803,81 @@ describe("AiAnalyst provider backoff and degradation", () => {
     const ids = toolMessages(requests[2]!).map((m) => m.id);
     expect(new Set(ids).size).toBe(2);
     expect(ids.every((id) => /^[A-Za-z0-9._:-]+$/.test(id))).toBe(true);
+  });
+
+  test("F02: EvidenceBroker indexes live PostureCollector criterion evidence for read_posture_detail", async () => {
+    const collector = new PostureCollector({
+      clock: clockAt(NOW),
+      runner: {
+        async run(request) {
+          switch (request.kind) {
+            case "updates":
+              return { status: "ok", exitCode: 0, stdout: "linux 6.10.1 -> 6.10.2\n" };
+            case "ufw_status":
+              return {
+                status: "ok",
+                exitCode: 0,
+                stdout: "Status: active\nDefault: deny (incoming), allow (outgoing), disabled (routed)\n",
+              };
+            case "sockets":
+              return {
+                status: "ok",
+                exitCode: 0,
+                stdout: [
+                  "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess",
+                  'tcp   LISTEN 0      128    127.0.0.1:6969    0.0.0.0:*    users:(("bun",pid=100,fd=3))',
+                ].join("\n"),
+              };
+            case "tailscale_serve":
+            case "tailscale_funnel":
+              return { status: "ok", exitCode: 0, stdout: "{}" };
+            case "processes":
+              return { status: "ok", exitCode: 0, stdout: "  100 1 1000 60 - - bun\n" };
+            default:
+              return { status: "unavailable" };
+          }
+        },
+      },
+      files: {
+        async read(source) {
+          if (source === "ufw-default") return 'IPV6=yes\nDEFAULT_INPUT_POLICY="DROP"';
+          if (source === "ufw-v4") return "-A ufw-user-input -p tcp --dport 6969 -j ACCEPT";
+          if (source === "ufw-v6") return "-A ufw6-user-input -j RETURN";
+          if (source === "sshd-main") {
+            return "Port 22\nPermitRootLogin no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n";
+          }
+          return null;
+        },
+        async sshDropIns() {
+          return [];
+        },
+      },
+    });
+
+    const collected = await collector.collect("scan-f02-live", makeSettings());
+    const broker = new EvidenceBroker({
+      scanId: "scan-f02-live",
+      evidence: collected.snapshot.evidence,
+      recentEvents: () => [],
+    });
+
+    for (const criterionId of ["package_updates", "firewall_ufw", "ssh_hardening"] as const) {
+      const result = await broker.dispatch(
+        "read_posture_detail",
+        JSON.stringify({ criterionId }),
+      );
+      expect(result.outcome).toBe("ok");
+      expect(result.evidenceIds.length).toBeGreaterThan(0);
+      const parsed = JSON.parse(result.content) as {
+        criterionId: string;
+        evidence: { id: string; facts: Record<string, unknown> }[];
+      };
+      expect(parsed.criterionId).toBe(criterionId);
+      expect(parsed.evidence.length).toBeGreaterThan(0);
+      if (criterionId === "package_updates") {
+        expect(parsed.evidence[0]!.facts.pendingCount).toBe(1);
+        expect(parsed.evidence[0]!.facts.kernelUpdateCount).toBe(1);
+      }
+    }
   });
 });

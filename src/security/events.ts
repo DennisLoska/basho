@@ -858,14 +858,21 @@ function matchEnrolledWorkload(
       continue;
     }
 
-    if (workload.ports && workload.ports.length > 0 && !workload.ports.includes(listener.port)) {
-      continue;
-    }
-
     matches.push(workload);
   }
 
-  return matches.length === 1 ? matches[0]! : null;
+  if (matches.length === 1) {
+    return matches[0]!;
+  }
+  if (matches.length > 1) {
+    const portMatches = matches.filter(
+      (workload) => workload.ports !== undefined && workload.ports.includes(listener.port),
+    );
+    if (portMatches.length === 1) {
+      return portMatches[0]!;
+    }
+  }
+  return null;
 }
 
 interface ParsedProcessRow {
