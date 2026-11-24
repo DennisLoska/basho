@@ -4,6 +4,7 @@ import {
   AiAnalyst,
   createAiProviderClient,
   EvidenceBroker,
+  OPENCODE_HARNESS_DEADLINE_MS,
   type InvestigationResult,
   type ProposalDraft,
 } from "./ai-analyst";
@@ -1216,6 +1217,9 @@ export function createLiveSecurityRuntime(
     const analyst = new AiAnalyst({
       client: aiClient,
       clock,
+      ...(effectiveSettings.ai.provider === "opencode-harness"
+        ? { deadlineMs: OPENCODE_HARNESS_DEADLINE_MS }
+        : {}),
     });
 
     const resolveProcess = createProcProcessResolver();
