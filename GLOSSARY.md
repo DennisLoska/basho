@@ -127,3 +127,7 @@ _Avoid_: Shell executor, sudo wrapper, ufw client
 **NotificationDispatcher**:
 The alert outbox orchestrator that persists deduplicated `SecurityAlert` notices via `SecurityStore`, claims bounded `AlertDelivery` batches under timed leases, dispatches per-`AlertChannel` adapters (`in-app`, `desktop`, `ntfy`, `discord`, `telegram`) with strict origin, redirect, and secret controls and bounded retries, and projects secret-free channel health.
 _Avoid_: Webhook sender, alert mailer, raw notifier
+
+**SecurityRuntime**:
+The in-process security coordinator that schedules independent non-overlapping collection, monitoring, reconciliation, delivery, and retention loops, coalesces scans with bounded event-triage cooldowns, persists validated runtime overrides, and fans out committed state updates to subscribers.
+_Avoid_: Background worker, daemon manager, global singleton
