@@ -76,6 +76,7 @@ type ProcessIdentity = {
   comm: string;
   unit?: string;
   uunit?: string;
+  unitScope?: "user" | "system";
 };
 
 type ResolveProcess = (pid: number) => Promise<ProcessIdentity | null>;
@@ -216,7 +217,9 @@ describe("DeadMansSwitch", () => {
         uid: CURRENT_UID,
         startedAt: ENROLLED_STARTED_AT,
         comm: "ollama",
-        unit: ENROLLED_UNIT,
+        unit: `user@${CURRENT_UID}.service`,
+        uunit: ENROLLED_UNIT,
+        unitScope: "user" as const,
       },
       currentUid: CURRENT_UID,
     };
@@ -258,11 +261,38 @@ describe("DeadMansSwitch", () => {
       }),
     ).toBe(false);
 
-    // Mismatched unit.
+    // Mismatched uunit.
     expect(
       guard.allows(WORKLOAD_TARGET, {
         ...context,
-        currentProcess: { ...context.currentProcess, unit: "other.service" },
+        currentProcess: { ...context.currentProcess, uunit: "other.service" },
+      }),
+    ).toBe(false);
+
+    // System-manager unit without uunit (even if name matches enrolled unit) must be rejected.
+    expect(
+      guard.allows(WORKLOAD_TARGET, {
+        ...context,
+        currentProcess: {
+          pid: ENROLLED_PID,
+          uid: CURRENT_UID,
+          startedAt: ENROLLED_STARTED_AT,
+          comm: "ollama",
+          unit: ENROLLED_UNIT,
+        },
+      }),
+    ).toBe(false);
+    expect(
+      guard.allows(WORKLOAD_TARGET, {
+        ...context,
+        currentProcess: {
+          pid: ENROLLED_PID,
+          uid: CURRENT_UID,
+          startedAt: ENROLLED_STARTED_AT,
+          comm: "ollama",
+          unit: ENROLLED_UNIT,
+          unitScope: "system",
+        },
       }),
     ).toBe(false);
 
@@ -298,7 +328,9 @@ describe("DeadMansSwitch", () => {
           uid: CURRENT_UID,
           startedAt: ENROLLED_STARTED_AT,
           comm,
-          unit: ENROLLED_UNIT,
+          unit: `user@${CURRENT_UID}.service`,
+          uunit: ENROLLED_UNIT,
+          unitScope: "user",
         },
         currentUid: CURRENT_UID,
       });
@@ -594,7 +626,9 @@ function defaultProcess(pid: number): ProcessIdentity {
     uid: CURRENT_UID,
     startedAt: ENROLLED_STARTED_AT,
     comm: "ollama",
-    unit: ENROLLED_UNIT,
+    unit: `user@${CURRENT_UID}.service`,
+    uunit: ENROLLED_UNIT,
+    unitScope: "user",
   };
 }
 
@@ -2786,6 +2820,158 @@ describe("Council round 2 regressions (R2-F01, R2-F06)", () => {
       expect(harness.calls.apply).toHaveLength(2);
     } finally {
       harness.store.close();
+    }
+  });
+
+  test("R3-F01: createProcProcessResolver distinguishes /system.slice from user@<uid>.service cgroups and refuses to freeze system units", async () => {
+    const comfyWorkload: EnrolledWorkload = {
+      id: "comfyui",
+      unit: "comfyui.service",
+      name: "ComfyUI",
+      ports: [8188],
+    };
+    const btimeSec = 1_700_000_000;
+    const clkTck = 100;
+    const startOffsetSec = 123;
+    const startTicks = startOffsetSec * clkTck;
+    const expectedStartedAtMs = (btimeSec + startOffsetSec) * 1_000;
+
+    const writeFakeProc = (procRoot: string, pid: number, cgroupText: string): void => {
+      const pidDir = join(procRoot, String(pid));
+      mkdirSync(pidDir, { recursive: true });
+      writeFileSync(
+        join(procRoot, "stat"),
+        `cpu  100 0 50 1000 0 0 0 0 0 0\nbtime ${btimeSec}\nprocesses 4242\n`,
+        "utf8",
+      );
+      const afterCommFields = [
+        "S", "1", String(pid), String(pid), "0", "-1", "4194304", "100", "0", "0", "0",
+        "10", "5", "0", "0", "20", "0", "4", "0", String(startTicks), "1048576", "256",
+      ];
+      writeFileSync(
+        join(pidDir, "stat"),
+        `${pid} (python3) ${afterCommFields.join(" ")}\n`,
+        "utf8",
+      );
+      writeFileSync(
+        join(pidDir, "status"),
+        `Name:\tpython3\nUid:\t${CURRENT_UID}\t${CURRENT_UID}\t${CURRENT_UID}\t${CURRENT_UID}\n`,
+        "utf8",
+      );
+      writeFileSync(join(pidDir, "comm"), "python3\n", "utf8");
+      writeFileSync(join(pidDir, "cgroup"), cgroupText, "utf8");
+    };
+
+    const target: ContainmentTarget = {
+      kind: "pause_workload",
+      workloadId: comfyWorkload.id,
+      pid: 6101,
+      startedAt: expectedStartedAtMs,
+    };
+    const guard = new DeadMansSwitch();
+
+    // (1) System service in /system.slice/comfyui.service running under same UID -> MUST be rejected.
+    {
+      const procRoot = makeTempDir("proc-r3-sys");
+      writeFakeProc(procRoot, 6101, "0::/system.slice/comfyui.service\n");
+      const resolver = createProcProcessResolver({
+        procRoot,
+        clkTck,
+        exec: async () => ({
+          exitCode: 0,
+          stdout: "comfyui.service -\n",
+          stderr: "",
+        }),
+      });
+      const identity = await resolver(6101);
+      expect(identity).not.toBeNull();
+      expect(identity!.unitScope).toBe("system");
+      expect(identity!.uunit).toBeUndefined();
+      expect(
+        guard.allows(target, {
+          workloads: [comfyWorkload],
+          currentProcess: identity,
+          currentUid: CURRENT_UID,
+        }),
+      ).toBe(false);
+
+      const calls: string[][] = [];
+      const adapter = createUserWorkloadLockdownAdapter({
+        getWorkloads: () => [comfyWorkload],
+        clock: createClock().clock,
+        currentUid: CURRENT_UID,
+        resolveProcess: resolver,
+        exec: async (argv) => {
+          calls.push([...argv]);
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      });
+      await expect(
+        adapter.apply({
+          id: "act-r3-sys",
+          proposalId: "prop-r3-sys",
+          idempotencyKey: "prop-r3-sys:1",
+          target,
+          state: "pending",
+          createdAt: NOW,
+          expiresAt: NOW + 120 * SECOND,
+          updatedAt: NOW,
+        }),
+      ).rejects.toThrow(/drift|identity|unit/i);
+      expect(
+        calls.some(
+          (argv) => argv[0] === "/usr/bin/systemd-run" || argv.includes("freeze"),
+        ),
+      ).toBe(false);
+    }
+
+    // (2) Verified user-manager unit under user@1000.service/app.slice/comfyui.service -> MUST be accepted.
+    {
+      const procRoot = makeTempDir("proc-r3-user");
+      writeFakeProc(
+        procRoot,
+        6101,
+        `0::/user.slice/user-${CURRENT_UID}.slice/user@${CURRENT_UID}.service/app.slice/comfyui.service\n`,
+      );
+      const resolver = createProcProcessResolver({
+        procRoot,
+        clkTck,
+        exec: async () => {
+          throw new Error("ps should not be required when /proc/<pid>/cgroup is readable");
+        },
+      });
+      const identity = await resolver(6101);
+      expect(identity).not.toBeNull();
+      expect(identity!.unitScope).toBe("user");
+      expect(identity!.unit).toBe(`user@${CURRENT_UID}.service`);
+      expect(identity!.uunit).toBe("comfyui.service");
+      expect(
+        guard.allows(target, {
+          workloads: [comfyWorkload],
+          currentProcess: identity,
+          currentUid: CURRENT_UID,
+        }),
+      ).toBe(true);
+    }
+
+    // (3) Delegated/nested spoofing under /system.slice or mismatched user@2000.service -> MUST be rejected.
+    for (const badCgroup of [
+      `0::/system.slice/evil.service/user@${CURRENT_UID}.service/app.slice/comfyui.service\n`,
+      "0::/user.slice/user-2000.slice/user@2000.service/app.slice/comfyui.service\n",
+      `0::/user.slice/user-${CURRENT_UID}.slice/session-2.scope\n`,
+    ]) {
+      const procRoot = makeTempDir("proc-r3-bad");
+      writeFakeProc(procRoot, 6101, badCgroup);
+      const resolver = createProcProcessResolver({ procRoot, clkTck });
+      const identity = await resolver(6101);
+      expect(identity).not.toBeNull();
+      expect(
+        guard.allows(target, {
+          workloads: [comfyWorkload],
+          currentProcess: identity,
+          currentUid: CURRENT_UID,
+        }),
+      ).toBe(false);
     }
   });
 });

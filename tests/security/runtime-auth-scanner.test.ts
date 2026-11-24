@@ -1702,7 +1702,7 @@ test("real PostureCollector + EventMonitor socket classifier detects newly expos
         return {
           status: "ok",
           exitCode: 0,
-          stdout: "  4242     1  1000   120 comfy.service - comfy\n",
+          stdout: "  4242     1  1000   120 user@1000.service comfy.service comfy\n",
         };
       }
       return { status: "unavailable" };

@@ -64,6 +64,7 @@ export interface ProcessIdentity {
   comm: string;
   unit?: string;
   uunit?: string;
+  unitScope?: "user" | "system";
 }
 
 export type ResolveProcess = (pid: number) => Promise<ProcessIdentity | null>;
@@ -538,25 +539,22 @@ export class DeadMansSwitch {
           return false;
         }
 
+        if (proc.unitScope === "system") {
+          return false;
+        }
+
         const unit = normalizeUnitField(proc.unit);
         const uunit = normalizeUnitField(proc.uunit);
         const expectedUserManagerUnit = `user@${expectedUid}.service`;
 
-        if (uunit !== undefined) {
-          if (uunit !== enrolled.unit) {
-            return false;
-          }
-          if (
-            unit !== undefined &&
-            unit !== expectedUserManagerUnit &&
-            unit !== enrolled.unit
-          ) {
-            return false;
-          }
-        } else {
-          if (unit !== enrolled.unit) {
-            return false;
-          }
+        // Enrolled workloads are frozen via `systemctl --user freeze`, so require
+        // verified user-manager unit membership (`uunit`) and never accept a
+        // system-manager unit (`unit` without `uunit`).
+        if (uunit === undefined || uunit !== enrolled.unit) {
+          return false;
+        }
+        if (unit !== undefined && unit !== expectedUserManagerUnit) {
+          return false;
         }
 
         return true;
@@ -1801,6 +1799,82 @@ export interface ProcProcessResolverOptions {
 }
 
 const DEFAULT_LINUX_CLK_TCK = 100;
+const USER_MANAGER_UNIT_PATTERN = /^user@\d+\.service$/;
+
+interface ParsedProcCgroupUnit {
+  unit?: string;
+  uunit?: string;
+  unitScope: "user" | "system";
+}
+
+function parseProcCgroupUnit(cgroupRaw: string): ParsedProcCgroupUnit {
+  let unifiedPath: string | null = null;
+  let systemdV1Path: string | null = null;
+
+  for (const rawLine of cgroupRaw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const firstColon = line.indexOf(":");
+    if (firstColon === -1) continue;
+    const secondColon = line.indexOf(":", firstColon + 1);
+    if (secondColon === -1) continue;
+    const hierarchyId = line.slice(0, firstColon);
+    const controllers = line.slice(firstColon + 1, secondColon);
+    const cgroupPath = line.slice(secondColon + 1).trim();
+    if (hierarchyId === "0" && controllers === "") {
+      unifiedPath = cgroupPath;
+    } else if (controllers.split(",").includes("name=systemd")) {
+      systemdV1Path = cgroupPath;
+    }
+  }
+
+  const chosenPath =
+    unifiedPath !== null && unifiedPath !== "" && unifiedPath !== "/"
+      ? unifiedPath
+      : (systemdV1Path ?? unifiedPath ?? "");
+
+  const segments = chosenPath.split("/").filter((seg) => seg.length > 0);
+  if (segments.length === 0) {
+    return { unitScope: "system" };
+  }
+
+  // Only a top-level slice hierarchy leading into `user@<uid>.service/...`
+  // represents a user-manager systemd unit. Reject nested/delegated paths
+  // (e.g. `/system.slice/evil.service/user@1000.service/...`).
+  let idx = 0;
+  while (idx < segments.length && segments[idx]!.endsWith(".slice")) {
+    idx += 1;
+  }
+
+  const topUnit = segments[idx];
+  if (topUnit !== undefined && USER_MANAGER_UNIT_PATTERN.test(topUnit)) {
+    let userIdx = idx + 1;
+    while (userIdx < segments.length && segments[userIdx]!.endsWith(".slice")) {
+      userIdx += 1;
+    }
+    const candidateUunit = segments[userIdx];
+    if (candidateUunit !== undefined && isValidSystemdUnitName(candidateUunit)) {
+      return {
+        unit: topUnit,
+        uunit: candidateUunit,
+        unitScope: "user",
+      };
+    }
+    return {
+      unit: topUnit,
+      unitScope: "system",
+    };
+  }
+
+  if (topUnit !== undefined && isValidSystemdUnitName(topUnit)) {
+    return {
+      unit: topUnit,
+      unitScope: "system",
+    };
+  }
+
+  return { unitScope: "system" };
+}
 
 export function createProcProcessResolver(
   execOrOptions: SubprocessExecutor | ProcProcessResolverOptions = defaultSubprocessExec,
@@ -1851,15 +1925,13 @@ export function createProcProcessResolver(
     }
 
     try {
-      const [procStatRaw, statRaw, statusRaw, commRaw, psRes, clkTck] =
+      const [procStatRaw, statRaw, statusRaw, commRaw, cgroupRaw, clkTck] =
         await Promise.all([
           readFile(`${procRoot}/stat`, "utf8"),
           readFile(`${procRoot}/${pid}/stat`, "utf8"),
           readFile(`${procRoot}/${pid}/status`, "utf8"),
           readFile(`${procRoot}/${pid}/comm`, "utf8"),
-          exec(["/usr/bin/ps", "-o", "unit=,uunit=", "-p", String(pid)], {
-            timeoutMs: 3_000,
-          }).catch(() => ({ exitCode: 1, stdout: "", stderr: "" })),
+          readFile(`${procRoot}/${pid}/cgroup`, "utf8").catch(() => null),
           getClkTck(),
         ]);
 
@@ -1895,10 +1967,29 @@ export function createProcProcessResolver(
 
       let unit: string | undefined;
       let uunit: string | undefined;
-      if (psRes.exitCode === 0) {
-        const parts = psRes.stdout.trim().split(/\s+/);
-        unit = normalizeUnitField(parts[0]);
-        uunit = normalizeUnitField(parts[1]);
+      let unitScope: "user" | "system" | undefined;
+
+      if (cgroupRaw !== null) {
+        const parsedCgroup = parseProcCgroupUnit(cgroupRaw);
+        unit = parsedCgroup.unit;
+        uunit = parsedCgroup.uunit;
+        unitScope = parsedCgroup.unitScope;
+      } else {
+        const psRes = await exec(["/usr/bin/ps", "-o", "unit=,uunit=", "-p", String(pid)], {
+          timeoutMs: 3_000,
+        }).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
+        if (psRes.exitCode === 0) {
+          const parts = psRes.stdout.trim().split(/\s+/);
+          const parsedUnit = normalizeUnitField(parts[0]);
+          const parsedUunit = normalizeUnitField(parts[1]);
+          unit = parsedUnit;
+          if (parsedUunit !== undefined && parsedUnit === `user@${uid}.service`) {
+            uunit = parsedUunit;
+            unitScope = "user";
+          } else if (parsedUnit !== undefined) {
+            unitScope = "system";
+          }
+        }
       }
 
       return {
@@ -1908,6 +1999,7 @@ export function createProcProcessResolver(
         comm: commRaw.trim(),
         ...(unit ? { unit } : {}),
         ...(uunit ? { uunit } : {}),
+        ...(unitScope ? { unitScope } : {}),
       };
     } catch {
       return null;

@@ -2834,4 +2834,62 @@ describe("Council round 1 regressions (F01, F07, F13, F18)", () => {
       expect(primedEntries[0]?.reachability).toBe("unknown");
     }
   });
+
+  test("R3-F01: system-unit process with uunit='-' does not receive workloadId enrollment tagging", async () => {
+    const result = await harness({
+      commands: {
+        sockets: okResult(
+          ss(
+            'tcp   LISTEN 0      128    0.0.0.0:8188    0.0.0.0:*    users:(("comfyui",pid=4242,fd=7))',
+            'tcp   LISTEN 0      128    0.0.0.0:8189    0.0.0.0:*    users:(("comfyui",pid=4243,fd=8))',
+            'tcp   LISTEN 0      128    127.0.0.1:6969  0.0.0.0:*    users:(("bun",pid=1001,fd=3))',
+          ),
+        ),
+        processes: okResult(
+          [
+            "  4242     1  1000   120 comfyui.service   -               comfyui",
+            "  4243     1  1000   120 user@1000.service comfyui.service comfyui",
+            "  1001     1  1000   900 -                 -               bun",
+          ].join("\n"),
+        ),
+      },
+      files: {
+        "ufw-v4":
+          "-A ufw-user-input -p tcp --dport 8188 -j ACCEPT\n-A ufw-user-input -p tcp --dport 8189 -j ACCEPT",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+    }).collector.collect(
+      "scan-r3-f01-system-vs-user",
+      settings({
+        expectedPorts: [22, 6969],
+        workloads: [{ id: "comfyui", unit: "comfyui.service", name: "comfyui", ports: [8188] }],
+      }),
+    );
+
+    // PID 4242 runs in system-manager unit comfyui.service with uunit="-": MUST NOT get workloadId.
+    const systemListenerEv = result.snapshot.evidence.find(
+      (ev) => ev.kind === "listener" && ev.facts.pid === 4242,
+    );
+    expect(systemListenerEv).toBeDefined();
+    expect(systemListenerEv?.facts.workloadId).toBeUndefined();
+
+    const systemProcEv = result.snapshot.evidence.find(
+      (ev) => ev.kind === "process" && ev.facts.pid === 4242,
+    );
+    expect(systemProcEv?.facts.workloadId ?? null).toBeNull();
+
+    // PID 4243 runs in verified user-manager unit comfyui.service: MUST get workloadId.
+    const userListenerEv = result.snapshot.evidence.find(
+      (ev) => ev.kind === "listener" && ev.facts.pid === 4243,
+    );
+    expect(userListenerEv).toBeDefined();
+    expect(userListenerEv?.facts.workloadId).toBe("comfyui");
+
+    const userProcEv = result.snapshot.evidence.find(
+      (ev) => ev.kind === "process" && ev.facts.pid === 4243,
+    );
+    expect(userProcEv).toBeDefined();
+    expect(userProcEv?.facts.workloadId).toBe("comfyui");
+    expect(userProcEv?.facts.unit).toBe("comfyui.service");
+  });
 });

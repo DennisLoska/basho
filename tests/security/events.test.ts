@@ -760,7 +760,7 @@ describe("EventMonitor.pollSockets", () => {
     let poll = 0;
     const runner = runnerStub((request) => {
       if (request.kind === "processes") {
-        return ok("  4242     1  1000   120 comfy\n");
+        return ok("  4242     1  1000   120 user@1000.service comfy.service comfy\n");
       }
       poll += 1;
       return poll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WORKLOAD);
@@ -1122,7 +1122,7 @@ describe("EventMonitor edge cases", () => {
     let socketPoll = 0;
     const runner = runnerStub((request) => {
       if (request.kind === "processes") {
-        return ok(`  4242     1  1000   ${etimesSeconds} comfy\n`);
+        return ok(`  4242     1  1000   ${etimesSeconds} user@1000.service comfy.service comfy\n`);
       }
       socketPoll += 1;
       return socketPoll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WORKLOAD);
@@ -1451,50 +1451,20 @@ describe("EventMonitor edge cases", () => {
     }
   });
 
-  test("verifies systemd unit from 6-column ps output and rejects matching comm in wrong unit", async () => {
+  test("rejects 6-column ps output without user-manager uunit even when system unit and comm match", async () => {
     const workloads: EnrolledWorkload[] = [
       { id: "comfy", unit: "comfy.service", name: "comfy", ports: [8188] },
     ];
 
-    // Matching unit in 6-column ps output -> emits pause_workload target.
-    {
-      const store = memoryStore();
-      let socketPoll = 0;
-      const runner = runnerStub((request) => {
-        if (request.kind === "processes") {
-          return ok("  4242     1  1000   120 comfy.service                   comfy\n");
-        }
-        socketPoll += 1;
-        return socketPoll === 1 ? ssOutput(SS_LOOPBACK) : ssOutput(SS_LOOPBACK, SS_WORKLOAD);
-      });
-      const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW), workloads });
-      try {
-        await monitor.pollSockets(async (listeners) => benignEntries(listeners));
-        const result = await monitor.pollSockets(async (listeners) =>
-          unexpectedEntries(listeners),
-        );
-        const corroborated = result.corroboration.find(
-          (entry) => entry.rule === "unexpected_workload",
-        );
-        expect(corroborated).toBeDefined();
-        expect(corroborated!.target).toEqual({
-          kind: "pause_workload",
-          workloadId: "comfy",
-          pid: 4242,
-          startedAt: NOW - 120 * 1000,
-        });
-      } finally {
-        store.close();
-      }
-    }
-
-    // Wrong systemd unit or non-unit ("-") with matching comm -> falls back to unexpected_listener.
-    const wrongUnits = [
+    // System unit only (no uunit column) or non-unit ("-") with matching comm -> falls back to unexpected_listener.
+    const unverifiedRows = [
+      "  4242     1  1000   120 comfy.service                   comfy\n",
       "  4242     1  1000   120 session-2.scope                 comfy\n",
       "  4242     1  1000   120 user@1000.service               comfy\n",
       "  4242     1  1000   120 -                               comfy\n",
+      "  4242     1  1000   120 comfy\n",
     ];
-    for (const psLine of wrongUnits) {
+    for (const psLine of unverifiedRows) {
       const store = memoryStore();
       let socketPoll = 0;
       const runner = runnerStub((request) => {
@@ -1648,7 +1618,7 @@ describe("EventMonitor edge cases", () => {
       }
     }
 
-    // System service matching unit with uunit="-" -> emits pause_workload.
+    // System service matching unit with uunit="-" (R3-F01) -> MUST be rejected (no pause_workload).
     {
       const store = memoryStore();
       let socketPoll = 0;
@@ -1665,24 +1635,19 @@ describe("EventMonitor edge cases", () => {
         const result = await monitor.pollSockets(async (listeners) =>
           unexpectedEntries(listeners),
         );
-        const corroborated = result.corroboration.find(
-          (entry) => entry.rule === "unexpected_workload",
-        );
-        expect(corroborated).toBeDefined();
-        expect(corroborated!.target).toEqual({
-          kind: "pause_workload",
-          workloadId: "comfy",
-          pid: 4242,
-          startedAt: NOW - 120 * 1000,
-        });
+        expect(result.alerts.length).toBeGreaterThan(0);
+        expect(result.corroboration).toHaveLength(1);
+        expect(result.corroboration[0]?.rule).toBe("unexpected_listener");
+        expect(result.corroboration[0]?.target).toBeUndefined();
       } finally {
         store.close();
       }
     }
 
-    // Mismatched uunit or missing units ("-") in 7-column output -> falls back to unexpected_listener.
+    // Mismatched uunit, mismatched user@<uid>.service, or missing units ("-") -> falls back to unexpected_listener.
     const mismatchedRows = [
       "  4242     1  1000   120 user@1000.service other.service comfy\n",
+      "  4242     1  1000   120 user@2000.service comfy.service comfy\n",
       "  4242     1  1000   120 user@1000.service - comfy\n",
       "  4242     1  1000   120 - - comfy\n",
     ];

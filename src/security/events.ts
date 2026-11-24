@@ -20,20 +20,6 @@ const SSH_BURST_THRESHOLD = 5;
 const SSH_DEDUPE_WINDOW_MS = 15_000;
 const MAX_SSH_DEDUPE_ENTRIES = 1_024;
 
-const SYSTEMD_UNIT_SUFFIXES = [
-  ".service",
-  ".socket",
-  ".device",
-  ".mount",
-  ".automount",
-  ".swap",
-  ".target",
-  ".path",
-  ".timer",
-  ".slice",
-  ".scope",
-] as const;
-
 const SAFE_PROC_NAME_PATTERN = /^[A-Za-z0-9._-]{1,32}$/;
 const SAFE_USER_NAME_PATTERN = /^[A-Za-z0-9._-]{1,32}$/;
 const SAFE_PROTO_PATTERN = /^[A-Za-z0-9]{1,16}$/;
@@ -812,21 +798,6 @@ function listenerKey(listener: Listener): string {
   return `${listener.family}|${listener.protocol}|${addr}|${listener.interfaceName ?? ""}|${listener.port}`;
 }
 
-function unitStem(unit: string): string {
-  let base = unit.trim();
-  for (const suffix of SYSTEMD_UNIT_SUFFIXES) {
-    if (base.endsWith(suffix)) {
-      base = base.slice(0, -suffix.length);
-      break;
-    }
-  }
-  const atIdx = base.indexOf("@");
-  if (atIdx > 0) {
-    base = base.slice(0, atIdx);
-  }
-  return base.toLowerCase();
-}
-
 function matchEnrolledWorkload(
   listener: Listener,
   candidate: ParsedProcessRow | undefined,
@@ -842,53 +813,28 @@ function matchEnrolledWorkload(
     return null;
   }
 
-  if (candidate.hasUnitMetadata) {
-    const unitMatches = workloads.filter((workload) => {
-      const expectedUnit = workload.unit.trim();
-      return candidate.uunit === expectedUnit || candidate.unit === expectedUnit;
-    });
-    if (unitMatches.length === 1) {
-      return unitMatches[0]!;
-    }
+  // Enrolled workloads are user-space systemd units frozen via `systemctl --user`.
+  // Require verified user-manager unit membership (`uunit` under `user@<uid>.service`);
+  // never match a system-manager unit (`unit` without `uunit`) or unverified `comm`.
+  if (!candidate.uunit) {
+    return null;
+  }
+  if (candidate.unit !== `user@${candidate.uid}.service`) {
     return null;
   }
 
-  const proc = (listener.process ?? candidate.comm).trim().toLowerCase();
-  if (!proc) return null;
-
-  const matches: EnrolledWorkload[] = [];
-  for (const workload of workloads) {
-    const names = new Set<string>();
-    const idNorm = workload.id.trim().toLowerCase();
-    if (idNorm) names.add(idNorm);
-    const nameNorm = workload.name?.trim().toLowerCase();
-    if (nameNorm) names.add(nameNorm);
-    const stem = unitStem(workload.unit);
-    if (stem) names.add(stem);
-
-    if (!names.has(proc)) {
-      continue;
-    }
-
-    matches.push(workload);
-  }
-
-  if (matches.length === 1) {
-    return matches[0]!;
-  }
-  if (matches.length > 1) {
-    const portMatches = matches.filter(
-      (workload) => workload.ports !== undefined && workload.ports.includes(listener.port),
-    );
-    if (portMatches.length === 1) {
-      return portMatches[0]!;
-    }
+  const unitMatches = workloads.filter(
+    (workload) => candidate.uunit === workload.unit.trim(),
+  );
+  if (unitMatches.length === 1) {
+    return unitMatches[0]!;
   }
   return null;
 }
 
 interface ParsedProcessRow {
   pid: number;
+  uid: number;
   startedAt: number;
   comm: string;
   hasUnitMetadata: boolean;
@@ -902,11 +848,12 @@ function parseProcessRows(stdout: string, nowMs: number): Map<number, ParsedProc
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
-    const match = /^(\d+)\s+\d+\s+\d+\s+(\d+)\s+(.+)$/.exec(line);
+    const match = /^(\d+)\s+\d+\s+(\d+)\s+(\d+)\s+(.+)$/.exec(line);
     if (!match) continue;
     const pid = Number(match[1]);
-    const etimes = Number(match[2]);
-    const rest = match[3]!.trim();
+    const uid = Number(match[2]);
+    const etimes = Number(match[3]);
+    const rest = match[4]!.trim();
     let hasUnitMetadata = false;
     let unit: string | undefined;
     let uunit: string | undefined;
@@ -933,6 +880,8 @@ function parseProcessRows(stdout: string, nowMs: number): Map<number, ParsedProc
     if (
       !Number.isSafeInteger(pid) ||
       pid <= 0 ||
+      !Number.isSafeInteger(uid) ||
+      uid < 0 ||
       !Number.isSafeInteger(etimes) ||
       etimes < 0 ||
       comm.length === 0
@@ -945,6 +894,7 @@ function parseProcessRows(stdout: string, nowMs: number): Map<number, ParsedProc
     }
     map.set(pid, {
       pid,
+      uid,
       startedAt,
       comm,
       hasUnitMetadata,

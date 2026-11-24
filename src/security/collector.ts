@@ -2364,82 +2364,30 @@ function parseProcesses(stdout: string, nowMs: number): Map<number, ParsedProces
   return map;
 }
 
-const COLLECTOR_UNIT_SUFFIXES = [
-  ".service",
-  ".scope",
-  ".slice",
-  ".socket",
-  ".timer",
-  ".mount",
-  ".target",
-  ".path",
-  ".device",
-  ".swap",
-  ".automount",
-] as const;
-
-function collectorUnitStem(unit: string): string {
-  let base = unit.trim();
-  for (const suffix of COLLECTOR_UNIT_SUFFIXES) {
-    if (base.endsWith(suffix)) {
-      base = base.slice(0, -suffix.length);
-      break;
-    }
-  }
-  const atIdx = base.indexOf("@");
-  if (atIdx > 0) {
-    base = base.slice(0, atIdx);
-  }
-  return base.toLowerCase();
-}
-
 function matchEnrolledWorkloadForCollector(
-  listener: Listener,
+  _listener: Listener,
   proc: ParsedProcess | undefined,
   workloads: readonly EnrolledWorkload[],
 ): EnrolledWorkload | null {
-  if (workloads.length === 0) {
+  if (workloads.length === 0 || !proc) {
     return null;
   }
 
-  if (proc?.hasUnitMetadata) {
-    const unitMatches = workloads.filter((workload) => {
-      const expectedUnit = workload.unit.trim();
-      return proc.uunit === expectedUnit || proc.unit === expectedUnit;
-    });
-    if (unitMatches.length === 1) {
-      return unitMatches[0]!;
-    }
+  // Enrolled workloads are user-space systemd units frozen via `systemctl --user`.
+  // Require verified user-manager unit membership (`uunit` under `user@<uid>.service`);
+  // never match a system-manager unit (`unit` without `uunit`) or unverified `comm`.
+  if (!proc.uunit) {
+    return null;
+  }
+  if (proc.unit !== `user@${proc.uid}.service`) {
     return null;
   }
 
-  const rawName = (proc?.comm ?? listener.process)?.trim().toLowerCase();
-  if (!rawName) return null;
-
-  const matches: EnrolledWorkload[] = [];
-  for (const workload of workloads) {
-    const names = new Set<string>();
-    const idNorm = workload.id.trim().toLowerCase();
-    if (idNorm) names.add(idNorm);
-    const nameNorm = workload.name?.trim().toLowerCase();
-    if (nameNorm) names.add(nameNorm);
-    const stem = collectorUnitStem(workload.unit);
-    if (stem) names.add(stem);
-    if (names.has(rawName)) {
-      matches.push(workload);
-    }
-  }
-
-  if (matches.length === 1) {
-    return matches[0]!;
-  }
-  if (matches.length > 1) {
-    const portMatches = matches.filter(
-      (workload) => workload.ports !== undefined && workload.ports.includes(listener.port),
-    );
-    if (portMatches.length === 1) {
-      return portMatches[0]!;
-    }
+  const unitMatches = workloads.filter(
+    (workload) => proc.uunit === workload.unit.trim(),
+  );
+  if (unitMatches.length === 1) {
+    return unitMatches[0]!;
   }
   return null;
 }
