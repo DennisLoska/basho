@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "bun --hot src/main.ts",
     "build:css": "./build-css.sh",
-    "start": "bun src/main.ts"
+    "start": "bun src/main.ts",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest"
@@ -18,6 +19,7 @@
     "@tailwindcss/cli": "^4.2.2",
     "daisyui": "^5.0.0",
     "hono": "^4.12.9",
+    "openai": "^7.62.0",
     "systeminformation": "^5.31.7",
     "tailwindcss": "^4.2.2"
   }

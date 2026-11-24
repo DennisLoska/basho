@@ -1,12 +1,68 @@
 import type { Child } from "hono/jsx";
 
-interface AppProps {
-  children: Child;
-  title?: string;
+export interface SecurityDotState {
+  active: boolean;
+  severity?: "breach" | "critical" | "warning" | "info";
+  count?: number;
 }
 
-export const App = ({ children, title = "Resources" }: AppProps) => {
-  const isServices = title.toLowerCase() === "services";
+export interface AppProps {
+  children: Child;
+  title?: string;
+  securityDot?: SecurityDotState | boolean;
+}
+
+function normalizeDotState(input?: SecurityDotState | boolean): SecurityDotState {
+  if (typeof input === "boolean") {
+    return { active: input, severity: input ? "warning" : undefined };
+  }
+  return input ?? { active: false };
+}
+
+export const SecurityNavDot = ({
+  state,
+  oob = false,
+}: {
+  state?: SecurityDotState | boolean;
+  oob?: boolean;
+}) => {
+  const dot = normalizeDotState(state);
+  const colorClass =
+    dot.severity === "breach" || dot.severity === "critical"
+      ? "bg-error ring-2 ring-error/30 animate-pulse"
+      : dot.severity === "warning"
+        ? "bg-warning ring-2 ring-warning/30"
+        : "bg-info ring-2 ring-info/30";
+  const count = dot.count ?? 0;
+  const label = dot.active
+    ? count > 0
+      ? `${count} active security ${count === 1 ? "item" : "items"} requiring attention`
+      : "Security attention required"
+    : "Security status clear";
+
+  return (
+    <span
+      id="security-nav-dot"
+      {...(oob ? { "hx-swap-oob": "outerHTML" } : {})}
+      data-active={dot.active ? "true" : "false"}
+      class={
+        dot.active
+          ? `absolute -top-0.5 -right-1.5 inline-block w-2 h-2 rounded-full ${colorClass}`
+          : "sr-only"
+      }
+      title={label}
+    >
+      <span class="sr-only">{label}</span>
+    </span>
+  );
+};
+
+export const App = ({ children, title = "Resources", securityDot }: AppProps) => {
+  const normalizedTitle = title.trim().toLowerCase();
+  const isServices = normalizedTitle === "services";
+  const isSecurity =
+    normalizedTitle === "security" || normalizedTitle === "security login";
+  const isResources = !isServices && !isSecurity;
 
   return (
     <div class="min-h-dvh bg-base-100 oc-backdrop flex flex-col">
@@ -112,7 +168,7 @@ export const App = ({ children, title = "Resources" }: AppProps) => {
         aria-label="Primary Navigation"
         class="fixed bottom-0 inset-x-0 z-50 bg-base-200/95 backdrop-blur-xl border-t border-base-300 bottom-nav-safe shadow-[0_-8px_30px_rgba(0,0,0,0.45)]"
       >
-        <div class="max-w-md mx-auto grid grid-cols-2 h-15 px-2 gap-1.5 items-center">
+        <div class="max-w-md mx-auto grid grid-cols-3 h-15 px-2 gap-1.5 items-center">
           <a
             href="/"
             hx-get="/"
@@ -120,8 +176,9 @@ export const App = ({ children, title = "Resources" }: AppProps) => {
             hx-swap="innerHTML"
             hx-push-url="true"
             data-nav-path="/"
+            aria-current={isResources ? "page" : undefined}
             class={`oc-nav-item flex flex-col items-center justify-center h-12 rounded-md font-mono text-xs font-medium tracking-wide select-none touch-manipulation ${
-              !isServices ? "active" : ""
+              isResources ? "active" : ""
             }`}
           >
             <svg
@@ -148,6 +205,7 @@ export const App = ({ children, title = "Resources" }: AppProps) => {
             hx-swap="innerHTML"
             hx-push-url="true"
             data-nav-path="/services"
+            aria-current={isServices ? "page" : undefined}
             class={`oc-nav-item flex flex-col items-center justify-center h-12 rounded-md font-mono text-xs font-medium tracking-wide select-none touch-manipulation ${
               isServices ? "active" : ""
             }`}
@@ -167,6 +225,44 @@ export const App = ({ children, title = "Resources" }: AppProps) => {
               />
             </svg>
             <span>Services</span>
+          </a>
+
+          <a
+            href="/security"
+            hx-get="/security"
+            hx-target="#content"
+            hx-swap="innerHTML"
+            hx-push-url="true"
+            data-nav-path="/security"
+            aria-current={isSecurity ? "page" : undefined}
+            class={`oc-nav-item flex flex-col items-center justify-center h-12 rounded-md font-mono text-xs font-medium tracking-wide select-none touch-manipulation ${
+              isSecurity ? "active" : ""
+            }`}
+          >
+            <span class="relative inline-flex items-center justify-center mb-0.5">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                class="h-5 w-5"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width={1.8}
+                  d="M12 3l7 4v5c0 4.5-3 8-7 9-4-1-7-4.5-7-9V7l7-4z"
+                />
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width={1.8}
+                  d="M9.5 12l1.75 1.75L14.75 10"
+                />
+              </svg>
+              <SecurityNavDot state={securityDot} />
+            </span>
+            <span>Security</span>
           </a>
         </div>
       </nav>

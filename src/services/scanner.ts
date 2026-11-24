@@ -39,6 +39,12 @@ const PORT_NAMES: Record<number, string> = {
 const CONCURRENCY = 200;
 const TCP_TIMEOUT = 150;
 
+export interface ScanOptions {
+  ports?: number[];
+  probe?: (host: string, port: number) => Promise<boolean>;
+  title?: (host: string, port: number) => Promise<string | null>;
+}
+
 interface OpenPort {
   host: string;
   port: number;
@@ -107,7 +113,11 @@ async function fetchTitle(host: string, port: number): Promise<string | null> {
   }
 }
 
-async function scanHost(host: string, ports: number[]): Promise<OpenPort[]> {
+async function scanHost(
+  host: string,
+  ports: number[],
+  probe: (host: string, port: number) => Promise<boolean> = probeTCP,
+): Promise<OpenPort[]> {
   const open: OpenPort[] = [];
   const n = ports.length;
   for (let i = 0; i < n; i += CONCURRENCY) {
@@ -115,7 +125,7 @@ async function scanHost(host: string, ports: number[]): Promise<OpenPort[]> {
     const batch: Promise<OpenPort | null>[] = [];
     for (let j = i; j < end; j++) {
       const port = ports[j]!;
-      batch.push(probeTCP(host, port).then((ok) => (ok ? { host, port } : null)));
+      batch.push(probe(host, port).then((ok) => (ok ? { host, port } : null)));
     }
     const results = await Promise.allSettled(batch);
     for (const r of results) {
@@ -127,6 +137,7 @@ async function scanHost(host: string, ports: number[]): Promise<OpenPort[]> {
 
 async function fetchAllTitles(
   openPorts: { host: string; port: number }[],
+  titleFn: (host: string, port: number) => Promise<string | null> = fetchTitle,
 ): Promise<(string | null)[]> {
   const titles: (string | null)[] = new Array(openPorts.length);
   const n = openPorts.length;
@@ -135,7 +146,7 @@ async function fetchAllTitles(
     const batch: Promise<[number, string | null]>[] = [];
     for (let j = i; j < end; j++) {
       const { host, port } = openPorts[j]!;
-      batch.push(fetchTitle(host, port).then((t) => [j, t]));
+      batch.push(titleFn(host, port).then((t) => [j, t]));
     }
     const results = await Promise.allSettled(batch);
     for (const r of results) {
@@ -148,17 +159,19 @@ async function fetchAllTitles(
   return titles;
 }
 
-export async function scan(): Promise<ServiceEntry[]> {
+export async function scan(options?: ScanOptions): Promise<ServiceEntry[]> {
+  const useCache = options === undefined;
   const now = Date.now();
-  if (cachedResult && now - lastScan < SCAN_TTL) {
+  if (useCache && cachedResult && now - lastScan < SCAN_TTL) {
     return cachedResult;
   }
 
-  const allPorts = Array.from({ length: 9999 }, (_, i) => i + 1);
-  const openPorts = await scanHost("localhost", allPorts);
+  const ports = (options?.ports ?? Array.from({ length: 9999 }, (_, i) => i + 1))
+    .filter((port) => port !== 22);
+  const openPorts = await scanHost("localhost", ports, options?.probe ?? probeTCP);
   const entries: ServiceEntry[] = [];
 
-  const titles = await fetchAllTitles(openPorts);
+  const titles = await fetchAllTitles(openPorts, options?.title ?? fetchTitle);
   for (let i = 0; i < openPorts.length; i++) {
     const { host, port } = openPorts[i]!;
     const title = titles[i];
@@ -170,7 +183,9 @@ export async function scan(): Promise<ServiceEntry[]> {
     });
   }
 
-  cachedResult = entries;
-  lastScan = now;
+  if (useCache) {
+    cachedResult = entries;
+    lastScan = now;
+  }
   return entries;
 }

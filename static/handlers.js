@@ -8,6 +8,32 @@
   var diskIOData = [];
   var diskIOMax = 1;
 
+  // Security tab state (SSE lifecycle + client filters preserved across swaps)
+  var securityEventSource = null;
+  var securityRefreshTimer = null;
+  var securityRefreshInFlight = false;
+  var securityRefreshQueued = false;
+  var securityAuthStopped = false;
+  var securityReconnectTimer = null;
+  var securityReconnectAttempt = 0;
+  var SECURITY_RECONNECT_BASE_MS = 1000;
+  var SECURITY_RECONNECT_MAX_MS = 30000;
+  var securityCountdownInterval = null;
+  var securityClockOffsetMs = 0;
+  var securityClockSyncedEl = null;
+  var securityFlashState = null;
+  var SECURITY_FLASH_TTL_MS = 4000;
+  var DIRTY_CONTROL_SELECTOR = '#security-mode-select, #scan-interval-input, [name^="criteria."], #security-test-channel';
+  var securityDirtyControls = {};
+  var securityState = {
+    reachability: 'all',
+    exposureSearch: '',
+    eventCategory: 'all',
+    hideNoise: true,
+    openDetails: {},
+  };
+  var pendingFocusSnapshot = null;
+
   function normalizeTheme(theme) {
     if (theme === 'bumblebee' || theme === 'opencode-light' || theme === 'light') {
       return 'opencode-light';
@@ -54,6 +80,502 @@
     }
   }
 
+  function announceSecurityStatus(message, isError) {
+    var el = document.getElementById('security-status-announcer');
+    if (!el) return;
+    var cls = isError
+      ? 'oc-panel px-3.5 py-2.5 font-mono text-xs flex items-center justify-between gap-2 border-error/45 bg-error/10 text-error'
+      : 'oc-panel px-3.5 py-2.5 font-mono text-xs flex items-center justify-between gap-2 border-info/45 bg-info/10 text-info';
+    el.textContent = message;
+    el.className = cls;
+    if (message && message.trim()) {
+      securityFlashState = {
+        text: message.trim(),
+        className: cls,
+        expiresAt: Date.now() + SECURITY_FLASH_TTL_MS,
+      };
+    }
+  }
+
+  function recordVisibleFlashFromPanel(panel) {
+    if (!panel) return;
+    var el = panel.querySelector('#security-status-announcer');
+    if (!el) return;
+    var text = (el.textContent || '').trim();
+    if (text && el.className.indexOf('sr-only') === -1) {
+      securityFlashState = {
+        text: text,
+        className: el.className,
+        expiresAt: Date.now() + SECURITY_FLASH_TTL_MS,
+      };
+    }
+  }
+
+  function controlDirtyKey(el) {
+    return (el && (el.id || el.getAttribute('name'))) || '';
+  }
+
+  function markControlDirty(el) {
+    if (!el || !el.matches || !el.matches(DIRTY_CONTROL_SELECTOR)) return;
+    var key = controlDirtyKey(el);
+    if (!key) return;
+    securityDirtyControls[key] = {
+      id: el.id || null,
+      name: el.getAttribute('name') || null,
+      value: el.value,
+    };
+  }
+
+  function clearFormDirtyControls(form) {
+    if (!form) {
+      securityDirtyControls = {};
+      return;
+    }
+    var controls = form.querySelectorAll(DIRTY_CONTROL_SELECTOR);
+    for (var i = 0; i < controls.length; i++) {
+      var key = controlDirtyKey(controls[i]);
+      if (key) delete securityDirtyControls[key];
+    }
+  }
+
+  function formatCountdownDuration(deltaMs) {
+    if (!isFinite(deltaMs) || deltaMs <= 0) return 'due now';
+    var totalSec = Math.ceil(deltaMs / 1000);
+    var hours = Math.floor(totalSec / 3600);
+    var mins = Math.floor((totalSec % 3600) / 60);
+    var secs = totalSec % 60;
+    if (hours > 0) return hours + 'h ' + mins + 'm';
+    if (mins > 0) return mins + 'm ' + secs + 's';
+    return secs + 's';
+  }
+
+  function syncSecurityClockOffset(el) {
+    if (!el || securityClockSyncedEl === el) return;
+    securityClockSyncedEl = el;
+    var serverNowRaw = el.getAttribute('data-server-now');
+    var serverNow = serverNowRaw ? Number(serverNowRaw) : NaN;
+    if (isFinite(serverNow) && serverNow > 0) {
+      var clockOffset = serverNow - Date.now();
+      securityClockOffsetMs = clockOffset;
+    } else {
+      securityClockOffsetMs = 0;
+    }
+  }
+
+  function stopSecurityCountdown() {
+    if (securityCountdownInterval !== null) {
+      clearInterval(securityCountdownInterval);
+      securityCountdownInterval = null;
+    }
+    securityClockSyncedEl = null;
+    securityClockOffsetMs = 0;
+  }
+
+  function updateSecurityNextScanCountdown() {
+    var panel = document.getElementById('security-panel');
+    if (!panel) {
+      stopSecurityCountdown();
+      return;
+    }
+    var el = panel.querySelector('[data-next-scan-at]');
+    if (!el) return;
+    syncSecurityClockOffset(el);
+    if (el.getAttribute('data-scan-running') === 'true') {
+      el.textContent = 'Scan running...';
+      return;
+    }
+    var raw = el.getAttribute('data-next-scan-at');
+    if (!raw) {
+      el.textContent = 'Next scan: paused';
+      return;
+    }
+    var targetMs = Number(raw);
+    if (!isFinite(targetMs) || targetMs <= 0) {
+      el.textContent = 'Next scan: paused';
+      return;
+    }
+    el.textContent = 'Next scan: ' + formatCountdownDuration(targetMs - (Date.now() + securityClockOffsetMs));
+  }
+
+  function startSecurityCountdown() {
+    if (!document.getElementById('security-panel')) {
+      stopSecurityCountdown();
+      return;
+    }
+    updateSecurityNextScanCountdown();
+    if (securityCountdownInterval === null) {
+      securityCountdownInterval = setInterval(updateSecurityNextScanCountdown, 1000);
+    }
+  }
+
+  function captureSecurityState() {
+    var panel = document.getElementById('security-panel');
+    if (!panel) return null;
+
+    var reachEl = panel.querySelector('[data-exposure-reachability]');
+    if (reachEl) securityState.reachability = reachEl.value || 'all';
+
+    var searchEl = panel.querySelector('[data-exposure-search]');
+    if (searchEl) securityState.exposureSearch = searchEl.value || '';
+
+    var hideNoiseEl = panel.querySelector('[data-hide-noise]');
+    if (hideNoiseEl) securityState.hideNoise = !!hideNoiseEl.checked;
+
+    var openMap = {};
+    var details = panel.querySelectorAll('details[data-detail-id]');
+    for (var i = 0; i < details.length; i++) {
+      var id = details[i].getAttribute('data-detail-id');
+      if (id && details[i].open) openMap[id] = true;
+    }
+    securityState.openDetails = openMap;
+
+    var active = document.activeElement;
+    var focusInfo = null;
+    if (active && panel.contains(active)) {
+      focusInfo = {
+        id: active.id || null,
+        name: active.getAttribute('name') || null,
+        tagName: active.tagName || null,
+        selectionStart: typeof active.selectionStart === 'number' ? active.selectionStart : null,
+        selectionEnd: typeof active.selectionEnd === 'number' ? active.selectionEnd : null,
+      };
+    }
+    return focusInfo;
+  }
+
+  function applySecurityFilters() {
+    var panel = document.getElementById('security-panel');
+    if (!panel) return;
+
+    var reachFilter = (securityState.reachability || 'all').toLowerCase();
+    var query = (securityState.exposureSearch || '').trim().toLowerCase();
+    var exposureRows = panel.querySelectorAll('[data-exposure-row]');
+    for (var i = 0; i < exposureRows.length; i++) {
+      var row = exposureRows[i];
+      var rowReach = (row.getAttribute('data-reachability') || '').toLowerCase();
+      var rowSearch = (row.getAttribute('data-search') || '').toLowerCase();
+      var reachOk = reachFilter === 'all' || rowReach === reachFilter;
+      var queryOk = !query || rowSearch.indexOf(query) !== -1;
+      row.style.display = (reachOk && queryOk) ? '' : 'none';
+    }
+
+    var activeCategory = (securityState.eventCategory || 'all').toLowerCase();
+    var hideNoise = !!securityState.hideNoise;
+    var chips = panel.querySelectorAll('[data-event-category]');
+    for (var c = 0; c < chips.length; c++) {
+      var chip = chips[c];
+      var isSelected = (chip.getAttribute('data-event-category') || '').toLowerCase() === activeCategory;
+      chip.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+      chip.className = isSelected
+        ? 'h-7 px-2.5 rounded border font-mono text-[11px] font-semibold bg-primary/15 border-primary/45 text-primary cursor-pointer'
+        : 'h-7 px-2.5 rounded border font-mono text-[11px] bg-base-100 border-base-300 text-base-content/70 hover:text-base-content cursor-pointer';
+    }
+
+    var eventRows = panel.querySelectorAll('[data-event-row]');
+    for (var j = 0; j < eventRows.length; j++) {
+      var evRow = eventRows[j];
+      var evCat = (evRow.getAttribute('data-category') || '').toLowerCase();
+      var isNoise = evRow.getAttribute('data-noise') === 'true';
+      var catOk = activeCategory === 'all' || evCat === activeCategory;
+      var noiseOk = !hideNoise || !isNoise;
+      if (catOk && noiseOk) {
+        evRow.classList.remove('hidden');
+      } else {
+        evRow.classList.add('hidden');
+      }
+    }
+  }
+
+  function restoreSecurityState(focusInfo, options) {
+    var panel = document.getElementById('security-panel');
+    if (!panel) return;
+    var preserveFlash = !!(options && options.preserveFlash);
+
+    var reachEl = panel.querySelector('[data-exposure-reachability]');
+    if (reachEl) reachEl.value = securityState.reachability || 'all';
+
+    var searchEl = panel.querySelector('[data-exposure-search]');
+    if (searchEl) searchEl.value = securityState.exposureSearch || '';
+
+    var hideNoiseEl = panel.querySelector('[data-hide-noise]');
+    if (hideNoiseEl) hideNoiseEl.checked = !!securityState.hideNoise;
+
+    var details = panel.querySelectorAll('details[data-detail-id]');
+    for (var i = 0; i < details.length; i++) {
+      var id = details[i].getAttribute('data-detail-id');
+      if (id && securityState.openDetails[id]) {
+        details[i].open = true;
+      }
+    }
+
+    var dirtyKeys = Object.keys(securityDirtyControls);
+    for (var d = 0; d < dirtyKeys.length; d++) {
+      var dirty = securityDirtyControls[dirtyKeys[d]];
+      if (!dirty) continue;
+      var ctrl = dirty.id ? document.getElementById(dirty.id) : null;
+      if (!ctrl && dirty.name) {
+        var named = panel.querySelectorAll('[name]');
+        for (var n = 0; n < named.length; n++) {
+          if (named[n].getAttribute('name') === dirty.name) {
+            ctrl = named[n];
+            break;
+          }
+        }
+      }
+      if (ctrl && panel.contains(ctrl)) {
+        ctrl.value = dirty.value;
+      }
+    }
+
+    if (preserveFlash && securityFlashState) {
+      if (Date.now() < securityFlashState.expiresAt) {
+        var announcer = panel.querySelector('#security-status-announcer');
+        if (announcer && !(announcer.textContent || '').trim()) {
+          announcer.textContent = securityFlashState.text;
+          announcer.className = securityFlashState.className;
+        }
+      } else {
+        securityFlashState = null;
+      }
+    }
+
+    applySecurityFilters();
+    updateSecurityNextScanCountdown();
+
+    if (focusInfo) {
+      var target = null;
+      if (focusInfo.id) {
+        target = document.getElementById(focusInfo.id);
+      }
+      if (!target && focusInfo.name && focusInfo.tagName) {
+        var candidates = panel.querySelectorAll(focusInfo.tagName.toLowerCase() + '[name]');
+        for (var k = 0; k < candidates.length; k++) {
+          if (candidates[k].getAttribute('name') === focusInfo.name) {
+            target = candidates[k];
+            break;
+          }
+        }
+      }
+      if (target && panel.contains(target) && typeof target.focus === 'function') {
+        try {
+          target.focus({ preventScroll: true });
+          if (
+            focusInfo.selectionStart !== null &&
+            focusInfo.selectionEnd !== null &&
+            typeof target.setSelectionRange === 'function'
+          ) {
+            target.setSelectionRange(focusInfo.selectionStart, focusInfo.selectionEnd);
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  function closeSecurityStream() {
+    if (securityRefreshTimer !== null) {
+      clearTimeout(securityRefreshTimer);
+      securityRefreshTimer = null;
+    }
+    if (securityReconnectTimer !== null) {
+      clearTimeout(securityReconnectTimer);
+      securityReconnectTimer = null;
+    }
+    securityRefreshQueued = false;
+    if (securityEventSource) {
+      try {
+        securityEventSource.close();
+      } catch (e) {}
+      securityEventSource = null;
+    }
+  }
+
+  function scheduleSecurityReconnect() {
+    if (securityAuthStopped || !document.querySelector('[data-security-stream]')) {
+      return;
+    }
+    if (securityReconnectTimer !== null) return;
+    var delay = Math.min(
+      SECURITY_RECONNECT_MAX_MS,
+      SECURITY_RECONNECT_BASE_MS * Math.pow(2, securityReconnectAttempt),
+    );
+    securityReconnectAttempt = Math.min(securityReconnectAttempt + 1, 10);
+    securityReconnectTimer = setTimeout(function() {
+      securityReconnectTimer = null;
+      syncSecurityStream();
+    }, delay);
+  }
+
+  function refreshSecurityFragment() {
+    if (!document.querySelector('[data-security-stream]')) {
+      closeSecurityStream();
+      return;
+    }
+    if (securityAuthStopped) return;
+    if (securityRefreshInFlight) {
+      securityRefreshQueued = true;
+      return;
+    }
+
+    securityRefreshInFlight = true;
+    securityRefreshQueued = false;
+
+    fetch('/security/fragment', {
+      credentials: 'same-origin',
+      headers: { 'HX-Request': 'true' },
+      redirect: 'manual',
+    })
+      .then(function(response) {
+        if (
+          response.type === 'opaqueredirect' ||
+          response.status === 401 ||
+          response.status === 403 ||
+          response.status === 302 ||
+          response.status === 303
+        ) {
+          securityAuthStopped = true;
+          closeSecurityStream();
+          announceSecurityStatus('Security session expired. Sign in again to resume live updates.', true);
+          return null;
+        }
+        if (!response.ok) {
+          announceSecurityStatus('Unable to refresh security view (HTTP ' + response.status + ').', true);
+          return null;
+        }
+        return response.text();
+      })
+      .then(function(htmlText) {
+        if (htmlText === null) return;
+        var currentPanel = document.getElementById('security-panel');
+        if (!currentPanel) {
+          closeSecurityStream();
+          return;
+        }
+
+        var focusInfo = captureSecurityState();
+        var tpl = document.createElement('template');
+        tpl.innerHTML = htmlText;
+
+        var nextPanel = tpl.content.querySelector('#security-panel');
+        var nextDot = tpl.content.querySelector('#security-nav-dot');
+
+        if (nextPanel && currentPanel.parentNode) {
+          currentPanel.parentNode.replaceChild(nextPanel, currentPanel);
+          if (window.htmx && typeof window.htmx.process === 'function') {
+            window.htmx.process(nextPanel);
+          }
+        }
+        if (nextDot) {
+          nextDot.removeAttribute('hx-swap-oob');
+          var existingDot = document.getElementById('security-nav-dot');
+          if (existingDot && existingDot.parentNode) {
+            existingDot.parentNode.replaceChild(nextDot, existingDot);
+          }
+        }
+
+        restoreSecurityState(focusInfo, { preserveFlash: true });
+      })
+      .catch(function() {
+        announceSecurityStatus('Unable to reach Basho Security service for live update.', true);
+      })
+      .finally(function() {
+        securityRefreshInFlight = false;
+        if (securityRefreshQueued && !securityAuthStopped) {
+          scheduleSecurityRefresh();
+        }
+      });
+  }
+
+  function scheduleSecurityRefresh() {
+    if (securityAuthStopped || !document.querySelector('[data-security-stream]')) {
+      return;
+    }
+    if (securityRefreshTimer !== null) return;
+    securityRefreshTimer = setTimeout(function() {
+      securityRefreshTimer = null;
+      refreshSecurityFragment();
+    }, 150);
+  }
+
+  function syncSecurityStream() {
+    var host = document.querySelector('[data-security-stream]');
+    if (!host) {
+      closeSecurityStream();
+      stopSecurityCountdown();
+      securityAuthStopped = false;
+      securityReconnectAttempt = 0;
+      securityFlashState = null;
+      securityDirtyControls = {};
+      return;
+    }
+
+    applySecurityFilters();
+    startSecurityCountdown();
+
+    if (securityAuthStopped) return;
+    if (securityEventSource && securityEventSource.readyState !== 2) {
+      return;
+    }
+
+    var streamUrl = host.getAttribute('data-security-stream') || '/sse/security';
+    try {
+      var es = new EventSource(streamUrl);
+      securityEventSource = es;
+
+      es.addEventListener('open', function() {
+        if (securityEventSource !== es) return;
+        securityReconnectAttempt = 0;
+      });
+
+      es.addEventListener('security', function() {
+        if (securityEventSource !== es) return;
+        securityReconnectAttempt = 0;
+        scheduleSecurityRefresh();
+      });
+
+      es.addEventListener('error', function() {
+        if (securityEventSource !== es) return;
+        if (!document.querySelector('[data-security-stream]')) {
+          closeSecurityStream();
+          stopSecurityCountdown();
+          return;
+        }
+        if (es.readyState === 2) {
+          closeSecurityStream();
+          // Verify whether auth expired; stop reconnecting if login is required.
+          fetch('/security/fragment', {
+            credentials: 'same-origin',
+            headers: { 'HX-Request': 'true' },
+            redirect: 'manual',
+          })
+            .then(function(res) {
+              if (
+                res.type === 'opaqueredirect' ||
+                res.status === 401 ||
+                res.status === 403 ||
+                res.status === 302 ||
+                res.status === 303
+              ) {
+                securityAuthStopped = true;
+                announceSecurityStatus('Security session expired. Sign in again to resume live updates.', true);
+                return;
+              }
+              if (res.status === 200) {
+                announceSecurityStatus('Security live stream interrupted. Reconnecting...', true);
+                scheduleSecurityReconnect();
+                return;
+              }
+              announceSecurityStatus('Security live stream disconnected (HTTP ' + res.status + '). Reconnecting...', true);
+              scheduleSecurityReconnect();
+            })
+            .catch(function() {
+              announceSecurityStatus('Security live stream disconnected. Reconnecting...', true);
+              scheduleSecurityReconnect();
+            });
+        }
+      });
+    } catch (e) {}
+  }
+
   function init() {
     var html = document.documentElement;
     var savedTheme = null;
@@ -63,6 +585,7 @@
 
     applyTheme(savedTheme || html.getAttribute('data-theme') || 'opencode');
     syncActiveNav();
+    syncSecurityStream();
 
     window.toggleTheme = function() {
       var current = normalizeTheme(html.getAttribute('data-theme'));
@@ -195,7 +718,80 @@
     return card;
   }
 
-  document.addEventListener('htmx:beforeSwap', function() {
+  document.addEventListener('change', function(evt) {
+    var target = evt.target;
+    if (!target) return;
+    if (target.matches && target.matches('[data-exposure-reachability]')) {
+      securityState.reachability = target.value || 'all';
+      applySecurityFilters();
+    } else if (target.matches && target.matches('[data-hide-noise]')) {
+      securityState.hideNoise = !!target.checked;
+      applySecurityFilters();
+    } else if (target.matches && target.matches(DIRTY_CONTROL_SELECTOR)) {
+      markControlDirty(target);
+    }
+  });
+
+  document.addEventListener('input', function(evt) {
+    var target = evt.target;
+    if (!target || !target.matches) return;
+    if (target.matches('[data-exposure-search]')) {
+      securityState.exposureSearch = target.value || '';
+      applySecurityFilters();
+    } else if (target.matches(DIRTY_CONTROL_SELECTOR)) {
+      markControlDirty(target);
+    }
+  });
+
+  document.addEventListener('submit', function(evt) {
+    var form = evt.target;
+    if (form && form.closest && form.closest('#security-panel')) {
+      clearFormDirtyControls(form);
+    }
+  });
+
+  document.addEventListener('click', function(evt) {
+    var target = evt.target && evt.target.closest ? evt.target.closest('[data-event-category]') : null;
+    if (!target) return;
+    securityState.eventCategory = target.getAttribute('data-event-category') || 'all';
+    applySecurityFilters();
+  });
+
+  document.addEventListener('htmx:beforeRequest', function(evt) {
+    var detail = evt.detail || {};
+    var path = (detail.requestConfig && detail.requestConfig.path) || '';
+    var verb = (detail.requestConfig && detail.requestConfig.verb) || '';
+    if (path.indexOf('/security/') === 0 && verb.toLowerCase() === 'post') {
+      var form = detail.elt && detail.elt.closest ? detail.elt.closest('form') : null;
+      if (form) clearFormDirtyControls(form);
+    }
+  });
+
+  document.addEventListener('htmx:beforeSwap', function(evt) {
+    var detail = evt.detail || {};
+    var xhr = detail.xhr;
+    var reqPath = (detail.requestConfig && detail.requestConfig.path)
+      || (detail.pathInfo && detail.pathInfo.requestPath)
+      || '';
+    if (
+      xhr &&
+      (xhr.status === 400 || xhr.status === 404 || xhr.status === 409) &&
+      (reqPath.indexOf('/security/') === 0 || reqPath === '/security')
+    ) {
+      var body = typeof detail.serverResponse === 'string'
+        ? detail.serverResponse
+        : (xhr.responseText || '');
+      if (body.indexOf('id="security-panel"') !== -1) {
+        detail.shouldSwap = true;
+        detail.isError = false;
+      }
+    }
+
+    var target = detail.target;
+    if (target && target.id === 'security-panel') {
+      pendingFocusSnapshot = captureSecurityState();
+      return;
+    }
     cpuData = [];
     ramData = [];
     gpuData = [];
@@ -205,13 +801,68 @@
     gpuTotal = 0;
   });
 
+  document.addEventListener('htmx:afterSwap', function(evt) {
+    var detail = evt.detail || {};
+    var target = detail.target;
+    var panel = document.getElementById('security-panel');
+    if ((target && target.id === 'security-panel') || (panel && detail.elt && detail.elt.id === 'security-panel')) {
+      recordVisibleFlashFromPanel(panel);
+      restoreSecurityState(pendingFocusSnapshot, { preserveFlash: false });
+      pendingFocusSnapshot = null;
+    }
+    syncSecurityStream();
+  });
+
+  document.addEventListener('htmx:afterRequest', function(evt) {
+    var detail = evt.detail || {};
+    var path = (detail.requestConfig && detail.requestConfig.path) || '';
+    var verb = (detail.requestConfig && detail.requestConfig.verb) || '';
+    if (detail.successful && path.indexOf('/security/') === 0 && verb.toLowerCase() === 'post') {
+      var form = detail.elt && detail.elt.closest ? detail.elt.closest('form') : null;
+      if (form) clearFormDirtyControls(form);
+    }
+  });
+
   document.addEventListener('htmx:afterSettle', function() {
     syncActiveNav();
+    syncSecurityStream();
+  });
+
+  document.addEventListener('htmx:responseError', function(evt) {
+    var xhr = evt.detail && evt.detail.xhr;
+    var path = (evt.detail && evt.detail.requestConfig && evt.detail.requestConfig.path) || '';
+    if (path.indexOf('/security') !== 0) return;
+    var status = xhr ? xhr.status : 0;
+    if (status === 401 || status === 403) {
+      securityAuthStopped = true;
+      closeSecurityStream();
+      announceSecurityStatus('Security action rejected (HTTP ' + status + '). Sign in or reload to continue.', true);
+      return;
+    }
+    var msg = (xhr && xhr.responseText && xhr.responseText.length < 200)
+      ? xhr.responseText
+      : 'Security request failed (HTTP ' + status + ').';
+    announceSecurityStatus(msg, true);
+  });
+
+  document.addEventListener('htmx:sendError', function(evt) {
+    var path = (evt.detail && evt.detail.requestConfig && evt.detail.requestConfig.path) || '';
+    if (path.indexOf('/security') !== 0) return;
+    announceSecurityStatus('Network error while contacting Basho Security.', true);
   });
 
   window.addEventListener('popstate', function() {
     syncActiveNav();
+    syncSecurityStream();
   });
+
+  function teardownSecurityPage() {
+    closeSecurityStream();
+    stopSecurityCountdown();
+  }
+
+  window.addEventListener('pagehide', teardownSecurityPage);
+  window.addEventListener('beforeunload', teardownSecurityPage);
 
   document.addEventListener('htmx:sseBeforeMessage', function(evt) {
     evt.preventDefault();
