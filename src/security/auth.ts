@@ -323,7 +323,16 @@ export function createSecurityAuth(options: SecurityAuthOptions = {}): SecurityA
 
   const shouldSetSecureCookie = (request: Request): boolean => {
     const reqOrigin = parseRequestOrigin(request.url);
-    return Boolean(reqOrigin?.isHttps || configuredPublic?.isHttps);
+    if (reqOrigin?.isHttps) {
+      return true;
+    }
+    if (configuredPublic?.isHttps) {
+      const matchedOrigin = resolveBrowserOrigin(request);
+      if (matchedOrigin === configuredPublic.origin) {
+        return true;
+      }
+    }
+    return false;
   };
 
   /**

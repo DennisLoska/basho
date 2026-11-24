@@ -215,9 +215,16 @@ type CollectImpl = (
   signal?: AbortSignal,
 ) => Promise<PostureResult>;
 
-type InvestigateImpl = (scanId: string, broker: unknown) => Promise<InvestigationResult>;
+type InvestigateImpl = (
+  scanId: string,
+  broker: unknown,
+  signal?: AbortSignal,
+) => Promise<InvestigationResult>;
 
 type JournalImpl = (signal?: AbortSignal) => Promise<MonitorResult>;
+type ApproveImpl = (id: string, revision: number, settings: SecuritySettings) => Promise<boolean>;
+type UnlockImpl = (actionId: string) => Promise<boolean>;
+type ReconcileImpl = () => Promise<void>;
 
 function createHarness(options: { settings?: SecuritySettings } = {}) {
   const clock = fakeClock();
@@ -231,7 +238,7 @@ function createHarness(options: { settings?: SecuritySettings } = {}) {
   const monitorCalls = { journal: 0, sockets: 0 };
   let journalImpl: JournalImpl = async () => emptyMonitorResult();
 
-  const analystCalls: { scanId: string; broker: unknown }[] = [];
+  const analystCalls: { scanId: string; broker: unknown; signal?: AbortSignal }[] = [];
   let investigateImpl: InvestigateImpl = async () => unconfiguredInvestigation();
 
   const lockdownCalls = {
@@ -241,6 +248,9 @@ function createHarness(options: { settings?: SecuritySettings } = {}) {
     unlock: [] as string[],
     reconcile: 0,
   };
+  let approveImpl: ApproveImpl = async () => true;
+  let unlockImpl: UnlockImpl = async () => true;
+  let reconcileImpl: ReconcileImpl = async () => {};
 
   const dispatcherCalls = {
     publish: 0,
@@ -267,9 +277,9 @@ function createHarness(options: { settings?: SecuritySettings } = {}) {
   };
 
   const analyst = {
-    async investigate(scanId: string, broker: unknown) {
-      analystCalls.push({ scanId, broker });
-      return investigateImpl(scanId, broker);
+    async investigate(scanId: string, broker: unknown, signal?: AbortSignal) {
+      analystCalls.push({ scanId, broker, signal });
+      return investigateImpl(scanId, broker, signal);
     },
   };
 
@@ -283,9 +293,9 @@ function createHarness(options: { settings?: SecuritySettings } = {}) {
       lockdownCalls.consider += 1;
       return { proposals: [], actions: [], alerts: [] };
     },
-    async approve(id: string, revision: number, _settings: SecuritySettings) {
+    async approve(id: string, revision: number, scanSettings: SecuritySettings) {
       lockdownCalls.approve.push([id, revision]);
-      return true;
+      return approveImpl(id, revision, scanSettings);
     },
     reject(id: string, revision: number) {
       lockdownCalls.reject.push([id, revision]);
@@ -293,10 +303,11 @@ function createHarness(options: { settings?: SecuritySettings } = {}) {
     },
     async unlock(actionId: string) {
       lockdownCalls.unlock.push(actionId);
-      return true;
+      return unlockImpl(actionId);
     },
     async reconcile() {
       lockdownCalls.reconcile += 1;
+      return reconcileImpl();
     },
   };
 
@@ -348,6 +359,15 @@ function createHarness(options: { settings?: SecuritySettings } = {}) {
     },
     setInvestigate(next: InvestigateImpl) {
       investigateImpl = next;
+    },
+    setApprove(next: ApproveImpl) {
+      approveImpl = next;
+    },
+    setUnlock(next: UnlockImpl) {
+      unlockImpl = next;
+    },
+    setReconcile(next: ReconcileImpl) {
+      reconcileImpl = next;
     },
   };
 }
@@ -402,9 +422,11 @@ test("demo runtime seeds fictional host fixtures without real adapters", async (
     expect(view.latestScan?.exposure.length).toBeGreaterThan(0);
 
     const serialized = JSON.stringify(view);
+    expect(serialized).toContain("192.0.2.12");
     expect(serialized).toContain("198.51.100.42");
     expect(serialized).toContain("203.0.113.19");
     expect(serialized).toContain("2001:db8::10");
+    expect(serialized).not.toContain("100.64.");
 
     expect(view.proposals.some((proposal: { status: string }) => proposal.status === "pending")).toBe(true);
     expect(view.actions.some((action: { state: string }) => action.state === "active")).toBe(true);
@@ -598,9 +620,12 @@ test("composed runtime exposes the plan contract and coalesces manual scans", as
   }
 });
 
-test("an event request during an active scan runs exactly one follow-up scan", async () => {
+test("an event request during an active scan runs exactly one follow-up scan when new evidence arrives", async () => {
   const harness = createHarness();
   try {
+    harness.runtime.start();
+    await flushMicrotasks();
+
     const gate = deferred<PostureResult>();
     let collected = 0;
     harness.setCollect(async (scanId) => {
@@ -613,6 +638,23 @@ test("an event request during an active scan runs exactly one follow-up scan", a
     await flushUntil(() => harness.collectorCalls.length === 1, "active scan start");
 
     harness.clock.advance(1_000);
+    const journalTick = harness.scheduler.ticks.find((tick) => tick.ms === 5_000);
+    expect(journalTick).toBeDefined();
+    harness.setJournal(async () => ({
+      alerts: [
+        {
+          id: "alert-during-scan",
+          fingerprint: "ssh:burst:198.51.100.42",
+          severity: "critical",
+          summary: "New SSH burst arrived during active scan",
+          createdAt: harness.clock.now(),
+        },
+      ],
+      corroboration: [],
+      coverage: "complete",
+    }));
+    journalTick!.run();
+    await flushMicrotasks();
     const eventPromise = harness.runtime.requestScan("event");
     await flushMicrotasks();
     expect(harness.collectorCalls.length).toBe(1);
@@ -626,6 +668,32 @@ test("an event request during an active scan runs exactly one follow-up scan", a
     expect(harness.collectorCalls.length).toBe(2);
     expect(harness.store.savedScans.some((scan) => scan.trigger === "event")).toBe(true);
     expect(harness.runtime.view().latestScan?.trigger).toBe("event");
+  } finally {
+    await harness.runtime.stop();
+    harness.store.close();
+  }
+});
+
+test("event requests without new evidence coalesce without queuing a redundant follow-up scan", async () => {
+  const harness = createHarness();
+  try {
+    const gate = deferred<PostureResult>();
+    harness.setCollect(async () => gate.promise);
+
+    const activePromise = harness.runtime.requestScan("manual");
+    await flushUntil(() => harness.collectorCalls.length === 1, "active scan start");
+
+    harness.clock.advance(5_000);
+    const eventPromise = harness.runtime.requestScan("event");
+    expect(eventPromise).toBe(activePromise);
+
+    gate.resolve(postureResult("scan-only", harness.clock.now()));
+    const [active, coalesced] = await Promise.all([activePromise, eventPromise]);
+    await flushMicrotasks();
+
+    expect(coalesced.id).toBe(active.id);
+    expect(harness.collectorCalls.length).toBe(1);
+    expect(harness.store.savedScans.some((scan) => scan.trigger === "event")).toBe(false);
   } finally {
     await harness.runtime.stop();
     harness.store.close();
@@ -852,6 +920,135 @@ test("stop aborts in-flight scans, clears schedules, drops subscribers, and clos
     expect(updates).not.toContainEqual({ kind: "scan" });
 
     unsubscribe();
+  } finally {
+    if (harness.store.calls.close === 0) {
+      harness.store.close();
+    }
+  }
+});
+
+test("startup reconcile shares the non-overlapping guard with periodic reconcile ticks", async () => {
+  const harness = createHarness();
+  try {
+    const startupGate = deferred<void>();
+    let calls = 0;
+    harness.setReconcile(async () => {
+      calls += 1;
+      if (calls === 1) {
+        await startupGate.promise;
+      }
+    });
+
+    harness.runtime.start();
+    await flushUntil(() => harness.lockdownCalls.reconcile === 1, "startup reconcile start");
+
+    const reconcileTick = harness.scheduler.ticks.find((tick) => tick.ms === 15_000);
+    expect(reconcileTick).toBeDefined();
+
+    reconcileTick!.run();
+    reconcileTick!.run();
+    await flushMicrotasks();
+    expect(harness.lockdownCalls.reconcile).toBe(1);
+
+    startupGate.resolve();
+    await flushMicrotasks();
+
+    reconcileTick!.run();
+    await flushUntil(() => harness.lockdownCalls.reconcile === 2, "post-startup reconcile tick");
+    expect(harness.lockdownCalls.reconcile).toBe(2);
+  } finally {
+    await harness.runtime.stop();
+    harness.store.close();
+  }
+});
+
+test("stop awaits in-flight approve and unlock writes before closing the store and refuses new mutations", async () => {
+  const harness = createHarness();
+  try {
+    const approveGate = deferred<boolean>();
+    const unlockGate = deferred<boolean>();
+    harness.setApprove(async () => approveGate.promise);
+    harness.setUnlock(async () => unlockGate.promise);
+
+    const approvePromise = harness.runtime.approve("proposal-1", 1);
+    const unlockPromise = harness.runtime.unlock("action-1");
+    await flushUntil(
+      () => harness.lockdownCalls.approve.length === 1 && harness.lockdownCalls.unlock.length === 1,
+      "in-flight approve and unlock start",
+    );
+
+    let stopSettled = false;
+    const stopPromise = harness.runtime.stop().then(() => {
+      stopSettled = true;
+    });
+    await flushMicrotasks();
+
+    expect(stopSettled).toBe(false);
+    expect(harness.store.calls.close).toBe(0);
+
+    // New mutations must be refused once stop() has begun.
+    await expect(harness.runtime.approve("proposal-2", 1)).resolves.toBe(false);
+    await expect(harness.runtime.unlock("action-2")).resolves.toBe(false);
+    expect(harness.runtime.reject("proposal-2", 1)).toBe(false);
+    expect(harness.runtime.dismissAlert("alert-1")).toBe(false);
+    expect(() => harness.runtime.updateSettings({ mode: "monitor" })).toThrow();
+    expect(() => harness.runtime.sendTestAlert("in-app")).toThrow();
+    await expect(harness.runtime.requestScan("manual")).rejects.toThrow();
+    expect(harness.lockdownCalls.approve.length).toBe(1);
+    expect(harness.lockdownCalls.unlock.length).toBe(1);
+
+    approveGate.resolve(true);
+    await expect(approvePromise).resolves.toBe(true);
+    await flushMicrotasks();
+    expect(stopSettled).toBe(false);
+    expect(harness.store.calls.close).toBe(0);
+
+    unlockGate.resolve(true);
+    await expect(unlockPromise).resolves.toBe(true);
+    await stopPromise;
+    expect(stopSettled).toBe(true);
+    expect(harness.store.calls.close).toBe(1);
+  } finally {
+    if (harness.store.calls.close === 0) {
+      harness.store.close();
+    }
+  }
+});
+
+test("stop aborts an in-flight analyst.investigate call via its AbortSignal", async () => {
+  const harness = createHarness();
+  try {
+    const gate = deferred<InvestigationResult>();
+    harness.setInvestigate(async (_scanId, _broker, signal) => {
+      if (signal?.aborted) {
+        return { status: "offline", findings: [], proposals: [], trail: { steps: [] }, reason: "timeout" };
+      }
+      return gate.promise;
+    });
+
+    const scanPromise = harness.runtime.requestScan("manual");
+    await flushUntil(() => harness.analystCalls.length === 1, "analyst investigate start");
+
+    const activeCall = harness.analystCalls[0]!;
+    expect(activeCall.signal).toBeDefined();
+    expect(activeCall.signal?.aborted).toBe(false);
+
+    let stopSettled = false;
+    const stopPromise = harness.runtime.stop().then(() => {
+      stopSettled = true;
+    });
+    await flushMicrotasks();
+
+    expect(activeCall.signal?.aborted).toBe(true);
+    expect(stopSettled).toBe(false);
+    expect(harness.store.calls.close).toBe(0);
+
+    gate.resolve({ status: "offline", findings: [], proposals: [], trail: { steps: [] }, reason: "timeout" });
+    await scanPromise.catch(() => undefined);
+    await stopPromise;
+
+    expect(stopSettled).toBe(true);
+    expect(harness.store.calls.close).toBe(1);
   } finally {
     if (harness.store.calls.close === 0) {
       harness.store.close();
@@ -1119,7 +1316,7 @@ test("login rejects a wrong token or mismatched origin and issues a Secure-free 
   expect(setCookie).not.toContain(FIXTURE_TOKEN);
 });
 
-test("login adds Secure for HTTPS requests and when a public origin is configured", () => {
+test("login adds Secure only for HTTPS requests or matched HTTPS publicOrigin, not plain-HTTP requests", () => {
   const auth = asAuth(createSecurityAuth({ token: FIXTURE_TOKEN, clock: fakeClock() }));
   const httpsLogin = auth.login(
     new Request("https://basho.example.test/security/login", {
@@ -1131,22 +1328,57 @@ test("login adds Secure for HTTPS requests and when a public origin is configure
   expect(httpsLogin.ok).toBe(true);
   expect((httpsLogin.cookie ?? "").toLowerCase()).toContain("secure");
 
-  const proxied = asAuth(
+  const withHttpsPublicOrigin = asAuth(
     createSecurityAuth({
       token: FIXTURE_TOKEN,
       clock: fakeClock(),
       publicOrigin: "https://basho.example.test",
     }),
   );
-  const proxiedLogin = proxied.login(
+
+  // Plain-HTTP localhost request must NOT get ; Secure even when publicOrigin is HTTPS.
+  const plainHttpLocalhost = withHttpsPublicOrigin.login(
+    new Request("http://localhost/security/login", {
+      method: "POST",
+      headers: { Origin: "http://localhost" },
+    }),
+    FIXTURE_TOKEN,
+  );
+  expect(plainHttpLocalhost.ok).toBe(true);
+  expect((plainHttpLocalhost.cookie ?? "").toLowerCase()).not.toContain("secure");
+
+  // Plain-HTTP loopback request with loopback Origin must NOT get ; Secure either.
+  const plainHttpLoopback = withHttpsPublicOrigin.login(
     new Request(`${LOCAL_ORIGIN}/security/login`, {
       method: "POST",
       headers: { Origin: LOCAL_ORIGIN },
     }),
     FIXTURE_TOKEN,
   );
-  expect(proxiedLogin.ok).toBe(true);
-  expect((proxiedLogin.cookie ?? "").toLowerCase()).toContain("secure");
+  expect(plainHttpLoopback.ok).toBe(true);
+  expect((plainHttpLoopback.cookie ?? "").toLowerCase()).not.toContain("secure");
+
+  // Request carrying matched HTTPS publicOrigin Origin DOES get ; Secure.
+  const proxiedByOrigin = withHttpsPublicOrigin.login(
+    new Request(`${LOCAL_ORIGIN}/security/login`, {
+      method: "POST",
+      headers: { Origin: "https://basho.example.test" },
+    }),
+    FIXTURE_TOKEN,
+  );
+  expect(proxiedByOrigin.ok).toBe(true);
+  expect((proxiedByOrigin.cookie ?? "").toLowerCase()).toContain("secure");
+
+  // Request carrying matched HTTPS publicOrigin Referer (without Origin) DOES get ; Secure.
+  const proxiedByReferer = withHttpsPublicOrigin.login(
+    new Request(`${LOCAL_ORIGIN}/security/login`, {
+      method: "POST",
+      headers: { Referer: "https://basho.example.test/security" },
+    }),
+    FIXTURE_TOKEN,
+  );
+  expect(proxiedByReferer.ok).toBe(true);
+  expect((proxiedByReferer.cookie ?? "").toLowerCase()).toContain("secure");
 });
 
 test("an authenticated session passes reads and origin-checked CSRF mutations", () => {
@@ -1404,8 +1636,11 @@ test("runtime passes scanId into EvidenceBroker and rejects invalid mode or unkn
 test("demo services and system stats fixtures return fictional lab-node-01 data", () => {
   const services = getDemoServices();
   expect(services.length).toBeGreaterThan(0);
-  expect(JSON.stringify(services)).toContain("lab-node-01");
-  expect(JSON.stringify(services)).toContain("198.51.100.42");
+  const serializedServices = JSON.stringify(services);
+  expect(serializedServices).toContain("lab-node-01");
+  expect(serializedServices).toContain("192.0.2.12");
+  expect(serializedServices).not.toContain("100.64.");
+  expect(serializedServices).not.toContain("198.51.100.42");
 
   const stats = getDemoSystemStats();
   expect(stats.cpu.count).toBe(stats.cpu.cores.length);

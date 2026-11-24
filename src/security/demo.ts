@@ -28,7 +28,8 @@ const DAY_MS = 86_400_000;
 const DEMO_HOST_LABEL = "lab-node-01";
 const DEMO_START_MS = 1_764_000_000_000;
 
-// Strictly RFC 5737 (IPv4 TEST-NET-2 / TEST-NET-3) and RFC 3849 (IPv6 documentation) addresses.
+// Strictly RFC 5737 (IPv4 TEST-NET-1 / TEST-NET-2 / TEST-NET-3) and RFC 3849 (IPv6 documentation) addresses.
+const DEMO_IP_HOST = "192.0.2.12";
 const DEMO_IP_ATTACKER = "198.51.100.42";
 const DEMO_IP_CONTAINED = "203.0.113.19";
 const DEMO_IPV6_DOC = "2001:db8::10";
@@ -147,7 +148,7 @@ function buildDemoScan(
       kind: "listener",
       facts: {
         protocol: "tcp",
-        address: "100.64.10.12",
+        address: DEMO_IP_HOST,
         port: 8091,
         family: 4,
         interfaceName: "tailscale0",
@@ -253,9 +254,9 @@ function buildDemoScan(
     {
       id: `exp:${scanId}:8091`,
       listener: {
-        id: "listener:tcp:4:100.64.10.12:8091:2210",
+        id: `listener:tcp:4:${DEMO_IP_HOST}:8091:2210`,
         protocol: "tcp",
-        address: "100.64.10.12",
+        address: DEMO_IP_HOST,
         port: 8091,
         family: 4,
         interfaceName: "tailscale0",
@@ -888,13 +889,13 @@ export function getDemoServices(): ServiceEntry[] {
     },
     {
       name: "Ntfy Alerts",
-      url: "http://198.51.100.42:8091",
+      url: `http://${DEMO_IP_HOST}:8091`,
       description: "Tailnet push notification relay on port 8091",
       icon: "🔌",
     },
     {
       name: "ComfyUI",
-      url: "http://198.51.100.42:8188",
+      url: `http://${DEMO_IP_HOST}:8188`,
       description: "Synthetic image workflow service on port 8188",
       icon: "🎨",
     },

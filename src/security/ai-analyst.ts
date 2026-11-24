@@ -1483,6 +1483,7 @@ export class AiAnalyst {
   async investigate(
     scanId: string,
     broker: EvidenceBroker,
+    signal?: AbortSignal,
   ): Promise<InvestigationResult> {
     if (!this.client) {
       return {
@@ -1526,7 +1527,21 @@ export class AiAnalyst {
     const controller = new AbortController();
     const wallStarted = Date.now();
     let deadlineExpired = false;
+    let externalAborted = false;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const onExternalAbort = () => {
+      externalAborted = true;
+      controller.abort();
+    };
+    if (signal) {
+      if (signal.aborted) {
+        externalAborted = true;
+        controller.abort();
+      } else {
+        signal.addEventListener("abort", onExternalAbort, { once: true });
+      }
+    }
 
     const scheduleDeadline = (delayMs: number) => {
       deadlineTimer = setTimeout(() => {
@@ -1539,7 +1554,9 @@ export class AiAnalyst {
         controller.abort();
       }, delayMs);
     };
-    scheduleDeadline(this.deadlineMs);
+    if (!externalAborted) {
+      scheduleDeadline(this.deadlineMs);
+    }
 
     const trail: InvestigationTrail = { steps: [] };
     const tools = broker.getToolDefinitions();
@@ -1577,12 +1594,15 @@ export class AiAnalyst {
           throw new AiProviderError("timeout", "AI provider request timed out");
         }
 
-        const response = await this.client.complete({
-          scanId,
-          messages,
-          tools,
-          signal: controller.signal,
-        });
+        const response = await raceWithAbort(
+          this.client.complete({
+            scanId,
+            messages,
+            tools,
+            signal: controller.signal,
+          }),
+          controller.signal,
+        );
 
         const calls = response.calls ?? [];
         if (calls.length === 0) {
@@ -1658,12 +1678,15 @@ export class AiAnalyst {
         throw new AiProviderError("timeout", "AI provider request timed out");
       }
 
-      const finalResponse = await this.client.complete({
-        scanId,
-        messages: trimMessagesForBudget(messages),
-        tools: [],
-        signal: controller.signal,
-      });
+      const finalResponse = await raceWithAbort(
+        this.client.complete({
+          scanId,
+          messages: trimMessagesForBudget(messages),
+          tools: [],
+          signal: controller.signal,
+        }),
+        controller.signal,
+      );
 
       const finalCalls = finalResponse.calls ?? [];
       const finalContent =
@@ -1674,9 +1697,11 @@ export class AiAnalyst {
     } catch (error) {
       const wrapped = wrapProviderError(
         error,
-        deadlineExpired || controller.signal.aborted,
+        deadlineExpired || externalAborted || controller.signal.aborted,
       );
-      this.recordProviderFailure(wrapped);
+      if (!externalAborted) {
+        this.recordProviderFailure(wrapped);
+      }
       return {
         status: "offline",
         findings: [],
@@ -1685,6 +1710,9 @@ export class AiAnalyst {
         reason: wrapped.reason,
       };
     } finally {
+      if (signal) {
+        signal.removeEventListener("abort", onExternalAbort);
+      }
       if (deadlineTimer !== undefined) {
         clearTimeout(deadlineTimer);
       }

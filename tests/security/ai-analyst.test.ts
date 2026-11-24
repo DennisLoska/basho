@@ -1629,6 +1629,54 @@ describe("AiAnalyst provider backoff and degradation", () => {
     expect(result.proposals).toEqual([]);
   });
 
+  test("aborts an in-flight provider call immediately when an external AbortSignal aborts", async () => {
+    let sawAbort = false;
+    let calls = 0;
+    const client: AiProviderClient = {
+      complete({ signal }) {
+        calls += 1;
+        if (calls >= 2) {
+          return Promise.resolve(finalTurn());
+        }
+        return new Promise<never>((_resolve, reject) => {
+          const fail = () => {
+            sawAbort = true;
+            const error = new Error("The operation was aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          if (signal.aborted) fail();
+          else signal.addEventListener("abort", fail, { once: true });
+        });
+      },
+    };
+
+    const analyst = new AiAnalyst({
+      client,
+      clock: clockAt(NOW),
+      deadlineMs: 10_000,
+    });
+    const external = new AbortController();
+    const started = Date.now();
+    const pending = analyst.investigate("scan-ext-abort", makeBroker(), external.signal);
+    queueMicrotask(() => external.abort());
+
+    const result = await pending;
+    const elapsed = Date.now() - started;
+
+    expect(sawAbort).toBe(true);
+    expect(elapsed).toBeLessThan(1_000);
+    expect(result.status).toBe("offline");
+    expect(result.reason).toBe("timeout");
+    expect(result.findings).toEqual([]);
+    expect(result.proposals).toEqual([]);
+
+    // External cancellation should not park the analyst in provider backoff.
+    const next = await analyst.investigate("scan-after-abort", makeBroker());
+    expect(next.status).toBe("ready");
+    expect(calls).toBe(3);
+  });
+
   test("aborts a hanging broker.dispatch cleanly when the investigation deadline fires", async () => {
     const client = scriptedClient([
       () => ({

@@ -120,7 +120,11 @@ export interface RuntimeMonitor {
 }
 
 export interface RuntimeAnalyst {
-  investigate(scanId: string, broker: EvidenceBroker): Promise<InvestigationResult>;
+  investigate(
+    scanId: string,
+    broker: EvidenceBroker,
+    signal?: AbortSignal,
+  ): Promise<InvestigationResult>;
 }
 
 export interface RuntimeLockdown {
@@ -379,7 +383,8 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
 
   let scanRunning = false;
   let activeScanPromise: Promise<SecurityScan> | null = null;
-  let activeScanStartedAt = 0;
+  let activeScanInputAt = 0;
+  let activeScanEvidenceVersion = 0;
   let pendingEventFollowUp: {
     promise: Promise<SecurityScan>;
     resolve: (scan: SecurityScan) => void;
@@ -387,12 +392,18 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
   } | null = null;
   let lastEventAiAt: number | null = null;
   let lastEvidenceAt = 0;
+  let evidenceVersion = 0;
   let nextScanAt: number | null = null;
   let lastAiStatus: SecurityScan["aiStatus"] =
     store.latestScan()?.aiStatus ?? "unconfigured";
 
   const activeCorroborations: Corroboration[] = [];
   const inFlightTasks = new Set<Promise<unknown>>();
+
+  const latestEvidenceAt = (): number => {
+    const latestStoreEventAt = store.recentEvents(0, 1)[0]?.lastAt ?? 0;
+    return Math.max(lastEvidenceAt, latestStoreEventAt);
+  };
 
   const emit = (update: SecurityUpdate): void => {
     if (stopped) return;
@@ -458,6 +469,7 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
 
     if (result.alerts.length > 0 || result.corroboration.length > 0) {
       lastEvidenceAt = Math.max(lastEvidenceAt, now);
+      evidenceVersion += 1;
       emit({ kind: "events" });
       void requestScan("event").catch(() => {});
     }
@@ -470,7 +482,8 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
 
     const scanId = crypto.randomUUID();
     const startedAt = clock.now();
-    activeScanStartedAt = startedAt;
+    activeScanInputAt = Math.max(startedAt, latestEvidenceAt());
+    activeScanEvidenceVersion = evidenceVersion;
     const scanSettings = cloneSettings(currentSettings);
     const scanAbort = new AbortController();
 
@@ -533,7 +546,7 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
           : {}),
       });
 
-      const investigation = await analyst.investigate(scanId, broker);
+      const investigation = await analyst.investigate(scanId, broker, scanAbort.signal);
 
       if (stopped || scanAbort.signal.aborted) {
         throw new Error("Security scan aborted");
@@ -619,7 +632,8 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
     if (activeScanPromise !== null) {
       if (trigger === "event") {
         const hasNewEvidence =
-          clock.now() > activeScanStartedAt || lastEvidenceAt > activeScanStartedAt;
+          latestEvidenceAt() > activeScanInputAt ||
+          evidenceVersion > activeScanEvidenceVersion;
         if (hasNewEvidence) {
           if (!pendingEventFollowUp) {
             let resolve!: (scan: SecurityScan) => void;
@@ -639,12 +653,11 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
     return launchScan(trigger);
   };
 
-  const scheduleNonOverlapping = (
-    ms: number,
+  const createNonOverlappingRunner = (
     fn: (signal: AbortSignal) => Promise<void> | void,
   ): (() => void) => {
     let running = false;
-    return scheduler.every(ms, () => {
+    return () => {
       if (stopped || running) return;
       running = true;
       const execution = Promise.resolve()
@@ -654,7 +667,16 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
           running = false;
         });
       trackTask(execution);
-    });
+    };
+  };
+
+  const scheduleNonOverlapping = (
+    ms: number,
+    fn: (signal: AbortSignal) => Promise<void> | void,
+  ): { run: () => void; unsub: () => void } => {
+    const run = createNonOverlappingRunner(fn);
+    const unsub = scheduler.every(ms, run);
+    return { run, unsub };
   };
 
   const schedulePeriodicScan = (): void => {
@@ -668,7 +690,7 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
     scanTickUnsub = scheduleNonOverlapping(intervalMs, async () => {
       nextScanAt = clock.now() + currentSettings.scanIntervalMinutes * MINUTE_MS;
       await requestScan("scheduled");
-    });
+    }).unsub;
   };
 
   const invokeSocketPoll = async (signal: AbortSignal): Promise<MonitorResult> => {
@@ -696,34 +718,21 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
       if (started || stopped) return;
       started = true;
 
-      // Startup recovery: prune old records, reconcile containment leases, drain outbox.
-      try {
-        store.prune(clock.now());
-      } catch {
-        // Startup prune failures should not prevent runtime scheduling.
-      }
-      void trackTask(
-        Promise.resolve()
-          .then(() => lockdown.reconcile())
-          .catch(() => {}),
-      );
-      void trackTask(
-        Promise.resolve()
-          .then(() => dispatcher.drain())
-          .catch(() => {}),
-      );
-
       // Independent non-overlapping periodic schedules.
       fixedUnsubs.push(
         scheduleNonOverlapping(JOURNAL_POLL_MS, async (signal) => {
           const beforeLast = store.recentEvents(0, 1)[0]?.lastAt ?? 0;
           const result = await monitor.pollJournal(signal);
           const afterLast = store.recentEvents(0, 1)[0]?.lastAt ?? 0;
-          if (!stopped && afterLast > beforeLast && result.alerts.length === 0 && result.corroboration.length === 0) {
-            emit({ kind: "events" });
+          if (!stopped && afterLast > beforeLast) {
+            lastEvidenceAt = Math.max(lastEvidenceAt, afterLast, clock.now());
+            evidenceVersion += 1;
+            if (result.alerts.length === 0 && result.corroboration.length === 0) {
+              emit({ kind: "events" });
+            }
           }
           handleMonitorResult(result);
-        }),
+        }).unsub,
       );
 
       fixedUnsubs.push(
@@ -731,32 +740,38 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
           const beforeLast = store.recentEvents(0, 1)[0]?.lastAt ?? 0;
           const result = await invokeSocketPoll(signal);
           const afterLast = store.recentEvents(0, 1)[0]?.lastAt ?? 0;
-          if (!stopped && afterLast > beforeLast && result.alerts.length === 0 && result.corroboration.length === 0) {
-            emit({ kind: "events" });
+          if (!stopped && afterLast > beforeLast) {
+            lastEvidenceAt = Math.max(lastEvidenceAt, afterLast, clock.now());
+            evidenceVersion += 1;
+            if (result.alerts.length === 0 && result.corroboration.length === 0) {
+              emit({ kind: "events" });
+            }
           }
           handleMonitorResult(result);
-        }),
+        }).unsub,
       );
 
-      fixedUnsubs.push(
-        scheduleNonOverlapping(DRAIN_INTERVAL_MS, async () => {
-          await dispatcher.drain();
-        }),
-      );
+      const drainSchedule = scheduleNonOverlapping(DRAIN_INTERVAL_MS, async () => {
+        await dispatcher.drain();
+      });
+      fixedUnsubs.push(drainSchedule.unsub);
 
-      fixedUnsubs.push(
-        scheduleNonOverlapping(RECONCILE_INTERVAL_MS, async () => {
-          await lockdown.reconcile();
-        }),
-      );
+      const reconcileSchedule = scheduleNonOverlapping(RECONCILE_INTERVAL_MS, async () => {
+        await lockdown.reconcile();
+      });
+      fixedUnsubs.push(reconcileSchedule.unsub);
 
-      fixedUnsubs.push(
-        scheduleNonOverlapping(PRUNE_INTERVAL_MS, () => {
-          store.prune(clock.now());
-        }),
-      );
+      const pruneSchedule = scheduleNonOverlapping(PRUNE_INTERVAL_MS, () => {
+        store.prune(clock.now());
+      });
+      fixedUnsubs.push(pruneSchedule.unsub);
 
       schedulePeriodicScan();
+
+      // Startup recovery: route through the exact same per-schedule non-overlapping guards.
+      pruneSchedule.run();
+      reconcileSchedule.run();
+      drainSchedule.run();
     },
 
     stop(): Promise<void> {
@@ -871,13 +886,17 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
       emit({ kind: "settings" });
     },
 
-    async approve(id: string, revision: number): Promise<boolean> {
-      if (stopped) return false;
-      const ok = await lockdown.approve(id, revision, cloneSettings(currentSettings));
-      if (ok) {
-        emit({ kind: "containment" });
-      }
-      return ok;
+    approve(id: string, revision: number): Promise<boolean> {
+      if (stopped) return Promise.resolve(false);
+      return trackTask(
+        (async () => {
+          const ok = await lockdown.approve(id, revision, cloneSettings(currentSettings));
+          if (ok) {
+            emit({ kind: "containment" });
+          }
+          return ok;
+        })(),
+      );
     },
 
     reject(id: string, revision: number): boolean {
@@ -889,13 +908,17 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
       return ok;
     },
 
-    async unlock(id: string): Promise<boolean> {
-      if (stopped) return false;
-      const ok = await lockdown.unlock(id);
-      if (ok) {
-        emit({ kind: "containment" });
-      }
-      return ok;
+    unlock(id: string): Promise<boolean> {
+      if (stopped) return Promise.resolve(false);
+      return trackTask(
+        (async () => {
+          const ok = await lockdown.unlock(id);
+          if (ok) {
+            emit({ kind: "containment" });
+          }
+          return ok;
+        })(),
+      );
     },
 
     dismissAlert(id: string): boolean {
