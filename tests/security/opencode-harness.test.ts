@@ -668,6 +668,233 @@ describe("createOpencodeHarnessClient", () => {
     expect(second.calls).toEqual([]);
   });
 
+  test("resets cached provider when port.generate.text() fails with a 401/transport error and recovers on Turn 3", async () => {
+    let providerCreateCount = 0;
+    let provider1Disposed = 0;
+    let provider1Calls = 0;
+
+    const client = requiresClient()({
+      model: MODEL,
+      createProvider: () => {
+        providerCreateCount += 1;
+        const instance = providerCreateCount;
+        return {
+          getClientManager: () => ({
+            getPort: async () => ({
+              generate: {
+                text: async () => {
+                  if (instance === 1) {
+                    provider1Calls += 1;
+                    if (provider1Calls === 1) {
+                      return { text: JSON.stringify({ turn: 1 }) };
+                    }
+                    throw httpError("401 Unauthorized: stale service credentials", 401);
+                  }
+                  return { text: JSON.stringify({ turn: 3, recovered: true }) };
+                },
+              },
+            }),
+          }),
+          dispose: async () => {
+            if (instance === 1) {
+              provider1Disposed += 1;
+            }
+          },
+        };
+      },
+    });
+
+    const turn1 = await client.complete(turnRequest());
+    expect(turn1.content).toBe(JSON.stringify({ turn: 1 }));
+    expect(providerCreateCount).toBe(1);
+    expect(provider1Disposed).toBe(0);
+
+    const turn2Err = await captureError(() => client.complete(turnRequest()));
+    expect(turn2Err).toBeInstanceOf(AiProviderError);
+    expect((turn2Err as AiProviderError).reason).toBe("provider_unavailable");
+    expect(provider1Disposed).toBe(1);
+
+    const turn3 = await client.complete(turnRequest());
+    expect(providerCreateCount).toBe(2);
+    expect(turn3.content).toBe(JSON.stringify({ turn: 3, recovered: true }));
+    expect(turn3.calls).toEqual([]);
+  });
+
+  test("does not reset cached provider when port.generate.text() fails with HTTP 429 rate limit", async () => {
+    let providerCreateCount = 0;
+    let provider1Disposed = 0;
+    let provider1Calls = 0;
+
+    const client = requiresClient()({
+      model: MODEL,
+      createProvider: () => {
+        providerCreateCount += 1;
+        const instance = providerCreateCount;
+        return {
+          getClientManager: () => ({
+            getPort: async () => ({
+              generate: {
+                text: async () => {
+                  provider1Calls += 1;
+                  if (provider1Calls === 2) {
+                    throw httpError("429 Too Many Requests", 429, { "retry-after": "15" });
+                  }
+                  return { text: JSON.stringify({ instance, call: provider1Calls }) };
+                },
+              },
+            }),
+          }),
+          dispose: async () => {
+            if (instance === 1) {
+              provider1Disposed += 1;
+            }
+          },
+        };
+      },
+    });
+
+    const turn1 = await client.complete(turnRequest());
+    expect(turn1.content).toBe(JSON.stringify({ instance: 1, call: 1 }));
+    expect(providerCreateCount).toBe(1);
+
+    const turn2Err = await captureError(() => client.complete(turnRequest()));
+    expect(turn2Err).toBeInstanceOf(AiProviderError);
+    const providerError = turn2Err as AiProviderError;
+    expect(providerError.reason).toBe("rate_limited");
+    expect(providerError.retryAfter).toEqual({ kind: "seconds", seconds: 15 });
+    expect(provider1Disposed).toBe(0);
+
+    const turn3 = await client.complete(turnRequest());
+    expect(providerCreateCount).toBe(1);
+    expect(provider1Disposed).toBe(0);
+    expect(turn3.content).toBe(JSON.stringify({ instance: 1, call: 3 }));
+  });
+
+  test("resets cached provider on turn timeout during port.generate.text() but preserves it on caller abort", async () => {
+    // Part A: turn timeout (turnAbort fires while caller request.signal is NOT aborted) resets provider.
+    let timeoutCreates = 0;
+    let timeoutProvider1Disposed = 0;
+    let timeoutProvider1Calls = 0;
+
+    const timeoutClient = requiresClient()({
+      model: MODEL,
+      timeoutMs: 30,
+      createProvider: () => {
+        timeoutCreates += 1;
+        const instance = timeoutCreates;
+        return {
+          getClientManager: () => ({
+            getPort: async () => ({
+              generate: {
+                text: async (_input, opts) => {
+                  if (instance === 1) {
+                    timeoutProvider1Calls += 1;
+                    if (timeoutProvider1Calls === 1) {
+                      return { text: JSON.stringify({ ok: 1 }) };
+                    }
+                    return await new Promise<{ text: string }>((_resolve, reject) => {
+                      opts?.signal?.addEventListener(
+                        "abort",
+                        () => {
+                          reject(
+                            Object.assign(new Error("The operation was aborted"), {
+                              name: "AbortError",
+                            }),
+                          );
+                        },
+                        { once: true },
+                      );
+                    });
+                  }
+                  return { text: JSON.stringify({ ok: 3 }) };
+                },
+              },
+            }),
+          }),
+          dispose: async () => {
+            if (instance === 1) {
+              timeoutProvider1Disposed += 1;
+            }
+          },
+        };
+      },
+    });
+
+    expect((await timeoutClient.complete(turnRequest())).content).toBe(JSON.stringify({ ok: 1 }));
+    const timeoutErr = await captureError(() => timeoutClient.complete(turnRequest()));
+    expect(timeoutErr).toBeInstanceOf(AiProviderError);
+    expect((timeoutErr as AiProviderError).reason).toBe("timeout");
+    expect(timeoutProvider1Disposed).toBe(1);
+
+    const recovered = await timeoutClient.complete(turnRequest());
+    expect(timeoutCreates).toBe(2);
+    expect(recovered.content).toBe(JSON.stringify({ ok: 3 }));
+
+    // Part B: caller abort (request.signal.aborted === true) preserves the cached healthy provider.
+    let abortCreates = 0;
+    let abortProvider1Disposed = 0;
+    let abortProvider1Calls = 0;
+
+    const abortClient = requiresClient()({
+      model: MODEL,
+      timeoutMs: 5_000,
+      createProvider: () => {
+        abortCreates += 1;
+        const instance = abortCreates;
+        return {
+          getClientManager: () => ({
+            getPort: async () => ({
+              generate: {
+                text: async (_input, opts) => {
+                  abortProvider1Calls += 1;
+                  if (abortProvider1Calls === 2) {
+                    return await new Promise<{ text: string }>((_resolve, reject) => {
+                      opts?.signal?.addEventListener(
+                        "abort",
+                        () => {
+                          reject(
+                            Object.assign(new Error("Caller aborted"), {
+                              name: "AbortError",
+                            }),
+                          );
+                        },
+                        { once: true },
+                      );
+                    });
+                  }
+                  return { text: JSON.stringify({ instance, call: abortProvider1Calls }) };
+                },
+              },
+            }),
+          }),
+          dispose: async () => {
+            if (instance === 1) {
+              abortProvider1Disposed += 1;
+            }
+          },
+        };
+      },
+    });
+
+    expect((await abortClient.complete(turnRequest())).content).toBe(
+      JSON.stringify({ instance: 1, call: 1 }),
+    );
+    const callerController = new AbortController();
+    const pendingTurn2 = captureError(() =>
+      abortClient.complete(turnRequest([], callerController.signal)),
+    );
+    setTimeout(() => callerController.abort(), 10);
+    const abortErr = await pendingTurn2;
+    expect(abortErr).toBeInstanceOf(AiProviderError);
+    expect((abortErr as AiProviderError).reason).toBe("timeout");
+    expect(abortProvider1Disposed).toBe(0);
+
+    const turn3 = await abortClient.complete(turnRequest());
+    expect(abortCreates).toBe(1);
+    expect(abortProvider1Disposed).toBe(0);
+    expect(turn3.content).toBe(JSON.stringify({ instance: 1, call: 3 }));
+  });
+
   test("does not inject OPENCODE_SERVER_PASSWORD Basic auth header in service-discovery mode", async () => {
     const capturedOptions: Record<string, unknown>[] = [];
 

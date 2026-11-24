@@ -901,7 +901,9 @@ export function createOpencodeHarnessClient(
 
       const turnAbort = new AbortController();
       let timedOut = false;
+      let callerAborted = false;
       const onCallerAbort = () => {
+        callerAborted = true;
         turnAbort.abort();
       };
       request.signal.addEventListener("abort", onCallerAbort, { once: true });
@@ -943,10 +945,25 @@ export function createOpencodeHarnessClient(
             await resetProvider(activeProvider);
             throw error;
           }
-          const response = await port.generate.text(
-            { prompt, model: parsedModel },
-            { signal: turnAbort.signal },
-          );
+          let response: { text?: string };
+          try {
+            response = await raceWithAbort(
+              port.generate.text(
+                { prompt, model: parsedModel },
+                { signal: turnAbort.signal },
+              ),
+              turnAbort.signal,
+            );
+          } catch (error) {
+            const isCallerAbort = callerAborted || Boolean(request.signal?.aborted);
+            const isRateLimited =
+              extractHttpStatus(error) === 429 ||
+              (error instanceof AiProviderError && error.reason === "rate_limited");
+            if (!isCallerAbort && !isRateLimited) {
+              await resetProvider(activeProvider);
+            }
+            throw error;
+          }
           text = typeof response?.text === "string" ? response.text : "";
         }
 
