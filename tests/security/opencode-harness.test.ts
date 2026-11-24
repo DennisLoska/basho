@@ -1285,8 +1285,13 @@ describe("createLiveSecurityRuntime AI provider composition", () => {
   });
 
   test(
-    "wires a 90_000 ms AiAnalyst deadline for opencode-harness while preserving default 45_000 ms for openai-compatible",
+    "wires a 130_000 ms AiAnalyst deadline for opencode-harness while preserving default 45_000 ms for openai-compatible",
     async () => {
+      expect(aiAnalystModule.OPENCODE_HARNESS_DEADLINE_MS).toBe(130_000);
+      expect(aiAnalystModule.OPENCODE_HARNESS_DEADLINE_MS).toBeGreaterThanOrEqual(
+        (aiAnalystModule.MAX_TOOL_ROUNDS + 1) * aiAnalystModule.OPENCODE_HARNESS_TIMEOUT_MS,
+      );
+
       const originalSetTimeout = globalThis.setTimeout;
       const recordedDelays: number[] = [];
       globalThis.setTimeout = ((
@@ -1318,7 +1323,7 @@ describe("createLiveSecurityRuntime AI provider composition", () => {
         } finally {
           await harnessRuntime.stop();
         }
-        expect(recordedDelays).toContain(90_000);
+        expect(recordedDelays).toContain(130_000);
         expect(recordedDelays).toContain(30_000);
 
         recordedDelays.length = 0;
@@ -1341,7 +1346,7 @@ describe("createLiveSecurityRuntime AI provider composition", () => {
           await compatRuntime.stop();
         }
         expect(recordedDelays).toContain(45_000);
-        expect(recordedDelays).not.toContain(90_000);
+        expect(recordedDelays).not.toContain(130_000);
       } finally {
         globalThis.setTimeout = originalSetTimeout;
       }
