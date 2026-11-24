@@ -29,6 +29,35 @@ export interface BashoApp {
   request(input: Request | string | URL, init?: RequestInit): Promise<Response>;
 }
 
+export const SERVER_IDLE_TIMEOUT_SECONDS = 60;
+
+export interface ServeTimeoutTarget {
+  timeout?: (request: Request, seconds: number) => void;
+}
+
+export function createServeOptions(params: {
+  port: number;
+  hostname: string;
+  app: BashoApp;
+}) {
+  return {
+    port: params.port,
+    hostname: params.hostname,
+    idleTimeout: SERVER_IDLE_TIMEOUT_SECONDS,
+    fetch(request: Request, server: ServeTimeoutTarget): Response | Promise<Response> {
+      try {
+        const url = new URL(request.url);
+        if (url.pathname.startsWith("/sse/") && typeof server.timeout === "function") {
+          server.timeout(request, 0);
+        }
+      } catch {
+        // Ignore malformed request URLs; Hono handles them normally.
+      }
+      return params.app.fetch(request);
+    },
+  };
+}
+
 export function createApp(options: CreateAppOptions): BashoApp {
   const resolvePeer = options.peer ?? (() => undefined);
   const app = new Hono();
@@ -107,11 +136,13 @@ async function startServer(): Promise<void> {
   });
 
   try {
-    server = Bun.serve({
-      port: settings.process.port,
-      hostname: settings.process.host,
-      fetch: app.fetch,
-    });
+    server = Bun.serve(
+      createServeOptions({
+        port: settings.process.port,
+        hostname: settings.process.host,
+        app,
+      }),
+    );
   } catch (error) {
     await runtime.stop().catch(() => {});
     throw error;

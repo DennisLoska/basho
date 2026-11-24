@@ -262,7 +262,7 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
     const view = runtime.view();
     return c.html(
       <>
-        <SecurityPanel view={view} csrfToken={csrf?.token} flash={flash} serverNow={nowMs()} />
+        <SecurityPanel view={view} csrfToken={csrf?.token} flash={flash} serverNow={view.serverNow} />
         <SecurityNavDot state={deriveSecurityDot(view)} oob />
       </>,
       status,
@@ -355,6 +355,10 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
       return c.redirect("/security", 303);
     }
 
+    if (!isSameBrowserOrigin(c.req.raw, publicOrigin)) {
+      return c.text("Forbidden origin.", 403);
+    }
+
     const key = normalizePeerKey(peer(c.req.raw));
     const now = nowMs();
     const activeFailure = getActiveLoginFailure(key, now);
@@ -371,10 +375,6 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
     const parsed = await parseUrlEncodedForm(c.req.raw);
     if (!parsed.ok) {
       return c.text(parsed.message, parsed.status);
-    }
-
-    if (!isSameBrowserOrigin(c.req.raw, publicOrigin)) {
-      return c.text("Forbidden origin.", 403);
     }
 
     const token = parsed.fields.get("token") ?? "";
@@ -413,10 +413,9 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
       c.header("Set-Cookie", csrf.cookie, { append: true });
     }
     const view = runtime.view();
-    const serverNow = nowMs();
     return renderPage(
       c,
-      () => <SecurityPanel view={view} csrfToken={csrf?.token} serverNow={serverNow} />,
+      () => <SecurityPanel view={view} csrfToken={csrf?.token} serverNow={view.serverNow} />,
       "Security",
       { securityDot: deriveSecurityDot(view) },
     );

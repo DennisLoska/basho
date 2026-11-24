@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { createApp } from "../../src/main";
+import { createApp, createServeOptions } from "../../src/main";
 import { createDemoSecurityRuntime } from "../../src/security/demo";
 import { createSecurityAuth } from "../../src/security/auth";
 
@@ -1230,15 +1230,22 @@ test("POST /security/login enforces rate limit across concurrent requests from o
   }
 });
 
-test("SecurityPanel renders data-server-now and handlers.js syncs countdown against clock skew", async () => {
+test("SecurityPanel renders data-server-now from runtime view and handlers.js syncs countdown against clock skew", async () => {
   const serverClock = 1_800_000_000_000;
   await withDemoApp(
-    async ({ app }) => {
+    async ({ app, runtime }) => {
+      const demoView = runtime.view();
+      expect(typeof demoView.serverNow).toBe("number");
+      expect(demoView.nextScanAt).not.toBeNull();
+      expect(demoView.nextScanAt!).toBeGreaterThan(demoView.serverNow);
+
       const pageHtml = await (await app.request(`${LOCAL_ORIGIN}/security`)).text();
-      expect(pageHtml).toContain(`data-server-now="${serverClock}"`);
+      expect(pageHtml).toContain(`data-server-now="${demoView.serverNow}"`);
+      expect(pageHtml).not.toContain("Next scan: due now");
 
       const fragHtml = await (await app.request(`${LOCAL_ORIGIN}/security/fragment`)).text();
-      expect(fragHtml).toContain(`data-server-now="${serverClock}"`);
+      expect(fragHtml).toContain(`data-server-now="${demoView.serverNow}"`);
+      expect(fragHtml).not.toContain("Next scan: due now");
     },
     { clock: { now: () => serverClock } },
   );
@@ -1343,4 +1350,136 @@ test("SecurityPanel renders data-server-now and handlers.js syncs countdown agai
   browserNow += 5_000;
   intervalCallback!();
   expect(countdownEl.textContent).toBe("Next scan: 40s");
+});
+
+// ---------------------------------------------------------------------------
+// Council Round 1 Cluster B regression tests (F03, F04, F08, F25)
+// ---------------------------------------------------------------------------
+
+test("F03: UPDATES KPI tile reads live PostureCollector package_updates facts (criterion + kernelUpdateCount)", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const baseView = runtime.view.bind(runtime);
+    runtime.view = () => {
+      const view = baseView();
+      const scan = view.latestScan!;
+      return {
+        ...view,
+        latestScan: {
+          ...scan,
+          snapshot: {
+            ...scan.snapshot,
+            evidence: scan.snapshot.evidence.map((ev) =>
+              ev.kind === "criterion" && ev.facts.criterionId === "package_updates"
+                ? {
+                    id: ev.id,
+                    kind: "criterion",
+                    facts: {
+                      criterion: "package_updates",
+                      pendingCount: 4,
+                      kernelUpdateCount: 1,
+                      daysSinceLastUpgrade: 3,
+                      advisoryCount: 0,
+                      highAdvisoryCount: 0,
+                    },
+                  }
+                : ev,
+            ),
+          },
+        },
+      };
+    };
+
+    const html = await (await app.request(`${LOCAL_ORIGIN}/security`)).text();
+    expect(html).toContain("4 PENDING");
+    expect(html).toContain("KERNEL PENDING");
+  });
+});
+
+test("F04: server options set idleTimeout above SSE keep-alive and disable timeout on /sse/* requests", async () => {
+  await withDemoApp(async ({ app }) => {
+    const options = createServeOptions({
+      port: 6969,
+      hostname: "127.0.0.1",
+      app: app as Parameters<typeof createServeOptions>[0]["app"],
+    });
+    expect(options.idleTimeout).toBeGreaterThan(15);
+    expect(options.idleTimeout).toBe(60);
+
+    const calls: Array<{ url: string; seconds: number }> = [];
+    const mockServer = {
+      timeout(req: Request, seconds: number) {
+        calls.push({ url: req.url, seconds });
+      },
+    };
+
+    const pageReq = new Request(`${LOCAL_ORIGIN}/security`);
+    const pageRes = await options.fetch(pageReq, mockServer);
+    expect(pageRes.status).toBe(200);
+    expect(calls.length).toBe(0);
+
+    const sseReq = new Request(`${LOCAL_ORIGIN}/sse/security`);
+    const sseRes = await options.fetch(sseReq, mockServer);
+    expect(sseRes.status).toBe(200);
+    expect(calls).toEqual([{ url: `${LOCAL_ORIGIN}/sse/security`, seconds: 0 }]);
+    await sseRes.body?.cancel();
+  });
+});
+
+test("F08: live SecurityPanel computes nextScan, proposal expiry, and lease remaining from view.serverNow", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const baseView = runtime.view.bind(runtime);
+    const base = baseView();
+    const scanFinishedAt = base.latestScan!.finishedAt;
+    // Advance live serverNow 20 minutes past the last stored scan/event/action timestamp
+    const advancedNow = scanFinishedAt + 20 * 60_000;
+
+    runtime.view = () => {
+      const view = baseView();
+      return {
+        ...view,
+        serverNow: advancedNow,
+        nextScanAt: advancedNow + 12 * 60_000, // 12m 0s from serverNow (would be 32m from scanFinishedAt)
+        proposals: view.proposals.map((p) =>
+          p.status === "pending"
+            ? { ...p, expiresAt: advancedNow + 7 * 60_000 } // 7m 0s from serverNow (27m from scanFinishedAt)
+            : p,
+        ),
+        actions: view.actions.map((a) =>
+          a.state === "active"
+            ? { ...a, expiresAt: advancedNow + 3 * 60_000 } // 3m 0s from serverNow (23m from scanFinishedAt)
+            : a,
+        ),
+      };
+    };
+
+    const html = await (await app.request(`${LOCAL_ORIGIN}/security`)).text();
+    expect(html).toContain(`data-server-now="${advancedNow}"`);
+    expect(html).toContain("Next scan: 12m 0s");
+    expect(html).toContain("expires 7m 0s");
+    expect(html).toContain("Remaining: 3m 0s");
+  });
+});
+
+test("F25: cross-origin POST /security/login returns 403 without burning peer rate-limit quota", async () => {
+  await withDemoApp(
+    async ({ app }) => {
+      for (let i = 0; i < 10; i++) {
+        const res = await app.request(
+          `${LOCAL_ORIGIN}/security/login`,
+          mutation({ token: "wrong-token" }, { origin: "http://evil.example" }),
+        );
+        expect(res.status).toBe(403);
+        expect(res.headers.get("cache-control")).toContain("no-store");
+      }
+
+      // Same-origin valid login from the exact same peer IP must still succeed (303, NOT 429)
+      const valid = await app.request(
+        `${LOCAL_ORIGIN}/security/login`,
+        mutation({ token: TOKEN }),
+      );
+      expect(valid.status).toBe(303);
+      expect(valid.headers.get("location")).toBe("/security");
+    },
+    { token: TOKEN, peer: "198.51.100.88" },
+  );
 });

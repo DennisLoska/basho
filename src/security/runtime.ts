@@ -71,6 +71,7 @@ export type SecurityUpdate = {
 
 export interface SecurityView {
   hostLabel: string;
+  serverNow: number;
   latestScan: SecurityScan | null;
   events: SecurityEvent[];
   hourly: { hour: number; signal: number; noise: number }[];
@@ -471,6 +472,7 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
     const latestScan = store.latestScan();
     return {
       hostLabel,
+      serverNow: now,
       latestScan,
       events: store.recentEvents(now - RECENT_EVENTS_WINDOW_MS, RECENT_EVENTS_LIMIT),
       hourly: store.hourlyEvents(now),
@@ -502,6 +504,7 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
 
   const buildFallbackStoppedView = (): SecurityView => ({
     hostLabel,
+    serverNow: clock.now(),
     latestScan: null,
     events: [],
     hourly: [],

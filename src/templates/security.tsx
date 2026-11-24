@@ -196,18 +196,6 @@ function formatDurationMs(deltaMs: number): string {
   return `${secs}s`;
 }
 
-function deriveReferenceNow(view: SecurityView): number {
-  const candidates: number[] = [];
-  if (view.latestScan) {
-    candidates.push(view.latestScan.finishedAt, view.latestScan.startedAt);
-  }
-  for (const ev of view.events) candidates.push(ev.lastAt);
-  for (const al of view.alerts) candidates.push(al.createdAt);
-  for (const act of view.actions) candidates.push(act.updatedAt, act.createdAt);
-  const maxSeen = candidates.length > 0 ? Math.max(...candidates) : 0;
-  return maxSeen > 0 ? maxSeen : Date.now();
-}
-
 function derivePostureSummary(view: SecurityView): {
   label: string;
   toneClass: string;
@@ -262,10 +250,15 @@ function deriveUpdatesSummary(view: SecurityView): {
   const scan = view.latestScan;
   const pkgCheck = scan?.snapshot.checks.find((c) => c.id === "package_updates");
   const pkgEvidence = scan?.snapshot.evidence.find(
-    (ev) => ev.kind === "criterion" && ev.facts.criterionId === "package_updates",
+    (ev) =>
+      ev.kind === "criterion" &&
+      (ev.facts.criterionId ?? ev.facts.criterion) === "package_updates",
   );
   const pendingRaw = pkgEvidence?.facts.pendingCount;
-  const kernelPending = pkgEvidence?.facts.kernelUpdatePending === true;
+  const kernelPending =
+    pkgEvidence?.facts.kernelUpdatePending === true ||
+    (typeof pkgEvidence?.facts.kernelUpdateCount === "number" &&
+      pkgEvidence.facts.kernelUpdateCount > 0);
 
   if (typeof pendingRaw === "number") {
     return {
@@ -463,8 +456,9 @@ export const SecurityPanel = ({ view, csrfToken, flash, serverNow }: SecurityPan
   const resolvedServerNow =
     typeof serverNow === "number" && Number.isFinite(serverNow) && serverNow > 0
       ? serverNow
-      : Date.now();
-  const refNow = deriveReferenceNow(view);
+      : typeof view.serverNow === "number" && Number.isFinite(view.serverNow) && view.serverNow > 0
+        ? view.serverNow
+        : Date.now();
   const posture = derivePostureSummary(view);
   const updates = deriveUpdatesSummary(view);
   const aiInfo = aiStatusInfo(view.aiStatus);
@@ -510,7 +504,7 @@ export const SecurityPanel = ({ view, csrfToken, flash, serverNow }: SecurityPan
 
   const nextScanText =
     view.nextScanAt !== null
-      ? formatDurationMs(view.nextScanAt - refNow)
+      ? formatDurationMs(view.nextScanAt - resolvedServerNow)
       : "paused";
 
   const channelEntries = Object.entries(view.channelHealth) as Array<
@@ -1018,7 +1012,7 @@ export const SecurityPanel = ({ view, csrfToken, flash, serverNow }: SecurityPan
                     </div>
                     <span class="font-mono text-[11px] text-base-content/55 tabular-nums shrink-0">
                       Lease {proposal.leaseSeconds}s · expires{" "}
-                      {formatDurationMs(proposal.expiresAt - refNow)}
+                      {formatDurationMs(proposal.expiresAt - resolvedServerNow)}
                     </span>
                   </div>
 
@@ -1124,7 +1118,7 @@ export const SecurityPanel = ({ view, csrfToken, flash, serverNow }: SecurityPan
                         </span>
                       </div>
                       <div class="font-mono text-[11px] text-base-content/55 tabular-nums">
-                        Remaining: {formatDurationMs(action.expiresAt - refNow)}
+                        Remaining: {formatDurationMs(action.expiresAt - resolvedServerNow)}
                         {action.rollbackHandle
                           ? ` · handle ${action.rollbackHandle}`
                           : ""}

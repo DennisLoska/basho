@@ -27,6 +27,7 @@ const MINUTE_MS = 60_000;
 const DAY_MS = 86_400_000;
 const DEMO_HOST_LABEL = "lab-node-01";
 const DEMO_START_MS = 1_764_000_000_000;
+const DEMO_NEXT_SCAN_OFFSET_MS = 55 * MINUTE_MS;
 
 // Strictly RFC 5737 (IPv4 TEST-NET-1 / TEST-NET-2 / TEST-NET-3) and RFC 3849 (IPv6 documentation) addresses.
 const DEMO_IP_HOST = "192.0.2.12";
@@ -692,7 +693,7 @@ export function createDemoSecurityRuntime(): SecurityRuntime {
     },
   };
   let currentOverrides: RuntimeOverrides = {};
-  let nextScanAt: number | null = now + currentSettings.scanIntervalMinutes * MINUTE_MS;
+  let nextScanAt: number | null = now + DEMO_NEXT_SCAN_OFFSET_MS;
 
   const listeners = new Set<(update: SecurityUpdate) => void>();
   let cachedView: SecurityView | null = null;
@@ -712,6 +713,7 @@ export function createDemoSecurityRuntime(): SecurityRuntime {
     const latestScan = store.latestScan();
     return {
       hostLabel: DEMO_HOST_LABEL,
+      serverNow: now,
       latestScan,
       events: store.recentEvents(now - DAY_MS, 100),
       hourly: store.hourlyEvents(now),
@@ -743,6 +745,7 @@ export function createDemoSecurityRuntime(): SecurityRuntime {
 
   const buildFallbackStoppedView = (): SecurityView => ({
     hostLabel: DEMO_HOST_LABEL,
+    serverNow: now,
     latestScan: null,
     events: [],
     hourly: [],
@@ -770,7 +773,9 @@ export function createDemoSecurityRuntime(): SecurityRuntime {
   return {
     start(): void {
       if (stopped) return;
-      nextScanAt = now + currentSettings.scanIntervalMinutes * MINUTE_MS;
+      if (nextScanAt === null) {
+        nextScanAt = now + DEMO_NEXT_SCAN_OFFSET_MS;
+      }
     },
 
     async stop(): Promise<void> {

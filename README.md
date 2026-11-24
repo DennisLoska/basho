@@ -160,10 +160,10 @@ Firewall containment (`deny_peer_ip` and `isolate_lan_ingress`) is disabled by d
 sudo install -o root -g root -m 0755 scripts/basho-lockdown-helper.sh /usr/local/libexec/basho-lockdown-helper
 ```
 
-Create a narrow `/etc/sudoers.d/basho-lockdown` entry (validated with `visudo -cf`) restricted to that exact binary and its 5 supported subcommands (`status`, `deny-ip`, `isolate-lan`, `inspect`, `rollback`; trailing `""` locks `status` to zero extra arguments):
+Create a narrow `/etc/sudoers.d/basho-lockdown` entry (validated with `visudo -cf`) restricted to that exact binary and its 5 supported subcommands (`status`, `deny-ip`, `isolate-lan`, `inspect`, `rollback`; omitting a trailing wildcard restricts `status` to that exact single argument):
 
 ```sudoers
-basho ALL=(root) NOPASSWD: /usr/local/libexec/basho-lockdown-helper status "", \
+basho ALL=(root) NOPASSWD: /usr/local/libexec/basho-lockdown-helper status, \
   /usr/local/libexec/basho-lockdown-helper deny-ip *, \
   /usr/local/libexec/basho-lockdown-helper isolate-lan *, \
   /usr/local/libexec/basho-lockdown-helper inspect *, \
