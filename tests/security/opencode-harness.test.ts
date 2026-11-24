@@ -72,6 +72,7 @@ import type {
 // ---------------------------------------------------------------------------
 
 interface HarnessGenerateTextCall {
+  prompt?: string;
   model: { providerID: string; id: string };
   messages: unknown[];
   tools?: unknown[];
@@ -1012,6 +1013,80 @@ describe("createOpencodeHarnessClient", () => {
     expect(userinfoErr).toBeInstanceOf(AiProviderError);
     expect(transportCalls).toHaveLength(1);
   });
+
+  test("defaults turn timeout to 30_000 ms and still respects custom timeoutMs", async () => {
+    const exportedTimeout = (
+      aiAnalystModule as unknown as { OPENCODE_HARNESS_TIMEOUT_MS?: number }
+    ).OPENCODE_HARNESS_TIMEOUT_MS;
+    expect(exportedTimeout).toBe(30_000);
+
+    const originalSetTimeout = globalThis.setTimeout;
+    const recordedDelays: number[] = [];
+    globalThis.setTimeout = ((
+      fn: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      if (typeof delay === "number") {
+        recordedDelays.push(delay);
+      }
+      return originalSetTimeout(fn, delay, ...args);
+    }) as typeof setTimeout;
+
+    try {
+      const defaultClient = buildClient({
+        generateText: fakeSeam(() => ({ text: "{}" })).generateText,
+      });
+      await defaultClient.complete(turnRequest());
+      expect(recordedDelays).toContain(30_000);
+
+      recordedDelays.length = 0;
+      const customClient = buildClient({
+        timeoutMs: 4_321,
+        generateText: fakeSeam(() => ({ text: "{}" })).generateText,
+      });
+      await customClient.complete(turnRequest());
+      expect(recordedDelays).toContain(4_321);
+      expect(recordedDelays).not.toContain(30_000);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+
+    const fastTimeoutClient = buildClient({
+      timeoutMs: 25,
+      generateText: async (call) =>
+        await new Promise<{ text: string }>((_resolve, reject) => {
+          call.abortSignal?.addEventListener(
+            "abort",
+            () => {
+              reject(Object.assign(new Error("Timed out"), { name: "AbortError" }));
+            },
+            { once: true },
+          );
+        }),
+    });
+    const timeoutErr = await captureError(() => fastTimeoutClient.complete(turnRequest()));
+    expect(timeoutErr).toBeInstanceOf(AiProviderError);
+    expect((timeoutErr as AiProviderError).reason).toBe("timeout");
+  });
+
+  test("includes the exact final verdict JSON schema in both tool-enabled and tool-free prompts", async () => {
+    const expectedSchema =
+      '{"verdict":{"kind":"healthy|warn|breach","confidence":0.0,"summary":"..."},"findings":[{"severity":"info|warning|critical|breach","summary":"...","evidenceIds":["..."]}],"proposals":[{"target":{"kind":"deny_peer_ip","ip":"..."}|{"kind":"pause_workload","workloadId":"...","pid":123,"startedAt":123}|{"kind":"isolate_lan_ingress"},"evidenceIds":["..."]}]}';
+    const seam = fakeSeam(() => ({ text: JSON.stringify(FINAL_VERDICT) }));
+    const broker = makeBroker();
+    const client = buildClient({ generateText: seam.generateText });
+
+    await client.complete(turnRequest(broker.getToolDefinitions()));
+    await client.complete(turnRequest([]));
+
+    expect(seam.calls).toHaveLength(2);
+    const toolTurnPrompt = seam.calls[0]?.prompt ?? "";
+    const finalTurnPrompt = seam.calls[1]?.prompt ?? "";
+    expect(toolTurnPrompt).toContain(expectedSchema);
+    expect(finalTurnPrompt).toContain(expectedSchema);
+    expect(finalTurnPrompt).toContain("Do NOT output tool_calls");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1208,4 +1283,74 @@ describe("createLiveSecurityRuntime AI provider composition", () => {
     expect(sentBodies).toHaveLength(1);
     expect(sentBodies[0]!.model).toBe("deepseek-v4.1-flash");
   });
+
+  test(
+    "wires a 130_000 ms AiAnalyst deadline for opencode-harness while preserving default 45_000 ms for openai-compatible",
+    async () => {
+      expect(aiAnalystModule.OPENCODE_HARNESS_DEADLINE_MS).toBe(130_000);
+      expect(aiAnalystModule.OPENCODE_HARNESS_DEADLINE_MS).toBeGreaterThanOrEqual(
+        (aiAnalystModule.MAX_TOOL_ROUNDS + 1) * aiAnalystModule.OPENCODE_HARNESS_TIMEOUT_MS,
+      );
+
+      const originalSetTimeout = globalThis.setTimeout;
+      const recordedDelays: number[] = [];
+      globalThis.setTimeout = ((
+        fn: (...args: unknown[]) => void,
+        delay?: number,
+        ...args: unknown[]
+      ) => {
+        if (typeof delay === "number") {
+          recordedDelays.push(delay);
+        }
+        return originalSetTimeout(fn, delay, ...args);
+      }) as typeof setTimeout;
+
+      try {
+        const harness = liveSettings({
+          BASHO_AI_PROVIDER: "opencode-harness",
+          OPENCODE_SERVER_URL: "http://127.0.0.1:1",
+        });
+        const harnessRuntime = createLiveSecurityRuntime({
+          settings: harness.settings,
+          secrets: harness.secrets,
+          clock: { now: () => NOW },
+          scheduler: noopScheduler,
+          runner: unavailableRunner,
+          files: emptyFiles,
+        });
+        try {
+          await harnessRuntime.requestScan("manual");
+        } finally {
+          await harnessRuntime.stop();
+        }
+        expect(recordedDelays).toContain(130_000);
+        expect(recordedDelays).toContain(30_000);
+
+        recordedDelays.length = 0;
+        const compat = liveSettings({
+          BASHO_AI_PROVIDER: "openai-compatible",
+          OPENCODE_API_KEY: "test-key",
+        });
+        compat.settings.ai.baseURL = "http://127.0.0.1:1";
+        const compatRuntime = createLiveSecurityRuntime({
+          settings: compat.settings,
+          secrets: compat.secrets,
+          clock: { now: () => NOW },
+          scheduler: noopScheduler,
+          runner: unavailableRunner,
+          files: emptyFiles,
+        });
+        try {
+          await compatRuntime.requestScan("manual");
+        } finally {
+          await compatRuntime.stop();
+        }
+        expect(recordedDelays).toContain(45_000);
+        expect(recordedDelays).not.toContain(130_000);
+      } finally {
+        globalThis.setTimeout = originalSetTimeout;
+      }
+    },
+    20_000,
+  );
 });
