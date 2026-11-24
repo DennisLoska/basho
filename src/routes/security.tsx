@@ -262,7 +262,7 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
     const view = runtime.view();
     return c.html(
       <>
-        <SecurityPanel view={view} csrfToken={csrf?.token} flash={flash} />
+        <SecurityPanel view={view} csrfToken={csrf?.token} flash={flash} serverNow={nowMs()} />
         <SecurityNavDot state={deriveSecurityDot(view)} oob />
       </>,
       status,
@@ -364,6 +364,10 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
       return c.text("Too many failed login attempts. Try again later.", 429);
     }
 
+    // Reserve an attempt slot synchronously before yielding to async body parsing
+    // so concurrent login bursts cannot bypass LOGIN_MAX_FAILURES.
+    recordLoginFailure(key, now);
+
     const parsed = await parseUrlEncodedForm(c.req.raw);
     if (!parsed.ok) {
       return c.text(parsed.message, parsed.status);
@@ -376,7 +380,6 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
     const token = parsed.fields.get("token") ?? "";
     const result = auth.login(c.req.raw, token);
     if (!result.ok || !result.cookie) {
-      recordLoginFailure(key, now);
       return renderPage(
         c,
         () => <SecurityLogin error="Invalid access token." />,
@@ -410,9 +413,10 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
       c.header("Set-Cookie", csrf.cookie, { append: true });
     }
     const view = runtime.view();
+    const serverNow = nowMs();
     return renderPage(
       c,
-      () => <SecurityPanel view={view} csrfToken={csrf?.token} />,
+      () => <SecurityPanel view={view} csrfToken={csrf?.token} serverNow={serverNow} />,
       "Security",
       { securityDot: deriveSecurityDot(view) },
     );

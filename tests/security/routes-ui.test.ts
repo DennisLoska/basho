@@ -1178,8 +1178,9 @@ test("static/handlers.js supports 400/409 swaps, live countdown, flash/dirty pre
   expect(source).toContain("detail.isError = false");
   expect(source).toContain('id="security-panel"');
 
-  // Verify live next-scan countdown interval + cleanup
+  // Verify live next-scan countdown interval + clock skew sync + cleanup
   expect(source).toContain("data-next-scan-at");
+  expect(source).toContain("data-server-now");
   expect(source).toContain("stopSecurityCountdown");
 
   // Verify flash preservation, dirty control tracking, and bounded reconnect backoff
@@ -1190,4 +1191,156 @@ test("static/handlers.js supports 400/409 swaps, live countdown, flash/dirty pre
   expect(source).toContain("#security-test-channel");
   expect(source).toContain("scheduleSecurityReconnect");
   expect(source).toContain("SECURITY_RECONNECT_MAX_MS");
+});
+
+test("POST /security/login enforces rate limit across concurrent requests from one peer", async () => {
+  const now = 1_800_000_000_000;
+  const runtime = createDemoSecurityRuntime();
+  const auth = createSecurityAuth({ token: TOKEN, clock: { now: () => now } });
+  const app = createApp({
+    runtime,
+    auth,
+    demo: true,
+    peer: () => "198.51.100.77",
+  });
+
+  try {
+    const totalRequests = 12;
+    const responses = await Promise.all(
+      Array.from({ length: totalRequests }, () =>
+        app.request(`${LOCAL_ORIGIN}/security/login`, mutation({ token: "wrong-token" })),
+      ),
+    );
+
+    const unauthorized = responses.filter((res) => res.status === 401);
+    const rateLimited = responses.filter((res) => res.status === 429);
+
+    expect(unauthorized.length).toBeLessThanOrEqual(5);
+    expect(unauthorized.length).toBeGreaterThanOrEqual(1);
+    expect(unauthorized.length + rateLimited.length).toBe(totalRequests);
+    expect(rateLimited.length).toBeGreaterThanOrEqual(totalRequests - 5);
+
+    for (const res of rateLimited) {
+      expect(res.headers.get("cache-control")).toContain("no-store");
+      const retryAfter = Number(res.headers.get("retry-after"));
+      expect(Number.isFinite(retryAfter) && retryAfter > 0).toBe(true);
+    }
+  } finally {
+    await runtime.stop();
+  }
+});
+
+test("SecurityPanel renders data-server-now and handlers.js syncs countdown against clock skew", async () => {
+  const serverClock = 1_800_000_000_000;
+  await withDemoApp(
+    async ({ app }) => {
+      const pageHtml = await (await app.request(`${LOCAL_ORIGIN}/security`)).text();
+      expect(pageHtml).toContain(`data-server-now="${serverClock}"`);
+
+      const fragHtml = await (await app.request(`${LOCAL_ORIGIN}/security/fragment`)).text();
+      expect(fragHtml).toContain(`data-server-now="${serverClock}"`);
+    },
+    { clock: { now: () => serverClock } },
+  );
+
+  // Execute static/handlers.js in an isolated harness where browser Date.now() is skewed by 2 hours
+  const source = await Bun.file("static/handlers.js").text();
+  let browserNow = serverClock - 2 * 60 * 60 * 1_000;
+  let intervalCallback: (() => void) | null = null;
+  const docListeners = new Map<string, Array<(evt: unknown) => void>>();
+
+  const makeCountdownEl = (nextScanAt: number, serverNow: number) => {
+    const attrs: Record<string, string> = {
+      "data-next-scan-at": String(nextScanAt),
+      "data-server-now": String(serverNow),
+      "data-scan-running": "false",
+    };
+    return {
+      textContent: "",
+      getAttribute: (name: string) => (name in attrs ? attrs[name] : null),
+    };
+  };
+
+  let countdownEl = makeCountdownEl(serverClock + 90_000, serverClock);
+  const makePanel = () => ({
+    id: "security-panel",
+    getAttribute: (name: string) => (name === "data-security-stream" ? "/sse/security" : null),
+    querySelector: (sel: string) => (sel === "[data-next-scan-at]" ? countdownEl : null),
+    querySelectorAll: () => [],
+    contains: () => false,
+  });
+  let panel = makePanel();
+
+  const fakeDoc = {
+    readyState: "complete",
+    activeElement: null,
+    documentElement: {
+      getAttribute: () => "opencode",
+      setAttribute: () => {},
+    },
+    getElementById: (id: string) => (id === "security-panel" ? panel : null),
+    querySelector: (sel: string) => (sel === "[data-security-stream]" ? panel : null),
+    querySelectorAll: () => [],
+    addEventListener: (name: string, fn: (evt: unknown) => void) => {
+      const list = docListeners.get(name) ?? [];
+      list.push(fn);
+      docListeners.set(name, list);
+    },
+  };
+  const fakeWin = {
+    location: { pathname: "/security", hostname: "localhost" },
+    addEventListener: () => {},
+  };
+  const fakeDate = { now: () => browserNow };
+  const fakeSetInterval = (fn: () => void) => {
+    intervalCallback = fn;
+    return 1;
+  };
+  const fakeClearInterval = () => {
+    intervalCallback = null;
+  };
+
+  const run = new Function(
+    "window",
+    "document",
+    "Date",
+    "setInterval",
+    "clearInterval",
+    "EventSource",
+    source,
+  );
+  run(
+    fakeWin,
+    fakeDoc,
+    fakeDate,
+    fakeSetInterval,
+    fakeClearInterval,
+    function FakeEventSource() {
+      throw new Error("no-sse-in-unit-test");
+    },
+  );
+
+  // Initial render: 90s remaining despite 2h browser clock skew
+  expect(countdownEl.textContent).toBe("Next scan: 1m 30s");
+
+  // Advance browser clock by 10s -> countdown ticks down to 1m 20s (offset stays fixed)
+  browserNow += 10_000;
+  expect(intervalCallback).not.toBeNull();
+  intervalCallback!();
+  expect(countdownEl.textContent).toBe("Next scan: 1m 20s");
+
+  // Simulate panel swap with a fresh serverNow + nextScanAt and a different skew
+  const swappedServerNow = serverClock + 30_000;
+  browserNow += 5_000; // client jumped differently than server
+  countdownEl = makeCountdownEl(swappedServerNow + 45_000, swappedServerNow);
+  panel = makePanel();
+  for (const fn of docListeners.get("htmx:afterSwap") ?? []) {
+    fn({ detail: { target: panel, elt: panel } });
+  }
+  expect(countdownEl.textContent).toBe("Next scan: 45s");
+
+  // Tick 5s after swap -> 40s
+  browserNow += 5_000;
+  intervalCallback!();
+  expect(countdownEl.textContent).toBe("Next scan: 40s");
 });

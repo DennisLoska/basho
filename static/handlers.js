@@ -19,6 +19,8 @@
   var SECURITY_RECONNECT_BASE_MS = 1000;
   var SECURITY_RECONNECT_MAX_MS = 30000;
   var securityCountdownInterval = null;
+  var securityClockOffsetMs = 0;
+  var securityClockSyncedEl = null;
   var securityFlashState = null;
   var SECURITY_FLASH_TTL_MS = 4000;
   var DIRTY_CONTROL_SELECTOR = '#security-mode-select, #scan-interval-input, [name^="criteria."], #security-test-channel';
@@ -147,11 +149,26 @@
     return secs + 's';
   }
 
+  function syncSecurityClockOffset(el) {
+    if (!el || securityClockSyncedEl === el) return;
+    securityClockSyncedEl = el;
+    var serverNowRaw = el.getAttribute('data-server-now');
+    var serverNow = serverNowRaw ? Number(serverNowRaw) : NaN;
+    if (isFinite(serverNow) && serverNow > 0) {
+      var clockOffset = serverNow - Date.now();
+      securityClockOffsetMs = clockOffset;
+    } else {
+      securityClockOffsetMs = 0;
+    }
+  }
+
   function stopSecurityCountdown() {
     if (securityCountdownInterval !== null) {
       clearInterval(securityCountdownInterval);
       securityCountdownInterval = null;
     }
+    securityClockSyncedEl = null;
+    securityClockOffsetMs = 0;
   }
 
   function updateSecurityNextScanCountdown() {
@@ -162,6 +179,7 @@
     }
     var el = panel.querySelector('[data-next-scan-at]');
     if (!el) return;
+    syncSecurityClockOffset(el);
     if (el.getAttribute('data-scan-running') === 'true') {
       el.textContent = 'Scan running...';
       return;
@@ -176,7 +194,7 @@
       el.textContent = 'Next scan: paused';
       return;
     }
-    el.textContent = 'Next scan: ' + formatCountdownDuration(targetMs - Date.now());
+    el.textContent = 'Next scan: ' + formatCountdownDuration(targetMs - (Date.now() + securityClockOffsetMs));
   }
 
   function startSecurityCountdown() {

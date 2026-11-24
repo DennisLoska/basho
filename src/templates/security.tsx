@@ -24,6 +24,7 @@ export interface SecurityPanelProps {
   view: SecurityView;
   csrfToken?: string;
   flash?: SecurityFlash;
+  serverNow?: number;
 }
 
 export interface SecurityLoginProps {
@@ -458,7 +459,11 @@ function isLanBoundExposure(entry: ExposureEntry): boolean {
   return !isLoopbackBindAddress(entry.listener.address);
 }
 
-export const SecurityPanel = ({ view, csrfToken, flash }: SecurityPanelProps) => {
+export const SecurityPanel = ({ view, csrfToken, flash, serverNow }: SecurityPanelProps) => {
+  const resolvedServerNow =
+    typeof serverNow === "number" && Number.isFinite(serverNow) && serverNow > 0
+      ? serverNow
+      : Date.now();
   const refNow = deriveReferenceNow(view);
   const posture = derivePostureSummary(view);
   const updates = deriveUpdatesSummary(view);
@@ -708,6 +713,7 @@ export const SecurityPanel = ({ view, csrfToken, flash }: SecurityPanelProps) =>
             <span
               id="security-next-scan"
               data-next-scan-at={view.nextScanAt !== null ? String(view.nextScanAt) : ""}
+              data-server-now={String(resolvedServerNow)}
               data-scan-running={view.scanRunning ? "true" : "false"}
               class="px-2 py-0.5 rounded bg-base-300/70 border border-base-300 text-[11px] text-base-content/75 tabular-nums"
             >
