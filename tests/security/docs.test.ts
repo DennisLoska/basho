@@ -61,6 +61,30 @@ test("README documents the lockdown helper, modes, preserved paths, and layout",
   expect(scriptsSection).toContain("bun test");
 });
 
+test("README accurately documents unset BASHO_AUTH_TOKEN behavior and UFW prerequisites", async () => {
+  const readme = await Bun.file("README.md").text();
+
+  // Unset BASHO_AUTH_TOKEN leaves /security reads open to peers reaching BASHO_HOST
+  // while mutations remain direct loopback-only without proxy headers.
+  expect(readme).not.toContain(
+    "Operator bearer/login token required for remote reads and mutations on `/security`",
+  );
+  expect(readme).toMatch(/BASHO_AUTH_TOKEN`?\s+is unset.*reads are open/i);
+  expect(readme).toMatch(/bind(?:ing)?\s+`?BASHO_HOST`?\s+to\s+`?127\.0\.0\.1`?/i);
+
+  // Helper UFW prerequisites, existing-rule verification wording, and no-arg sudoers rule.
+  for (const term of [
+    "ufw allow in on tailscale0",
+    "ufw allow 41641/udp",
+    "lan_policy=missing",
+    '/usr/local/libexec/basho-lockdown-helper status ""',
+  ]) {
+    expect(readme).toContain(term);
+  }
+  expect(readme).toMatch(/refuse.*modify protected paths/i);
+  expect(readme).toMatch(/verifies.*allow rules already exist rather than adding them/i);
+});
+
 function pngChunks(bytes: Uint8Array): { type: string; data: Uint8Array }[] {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const chunks: { type: string; data: Uint8Array }[] = [];

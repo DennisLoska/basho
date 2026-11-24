@@ -108,7 +108,7 @@ for a private topic. Use Test Alert to verify delivery.
 | `OPENCODE_BASE_URL` | `https://opencode.ai/zen/go/v1` | OpenAI-compatible base URL (overrides `ai.baseURL` in `config/security.json`) |
 | `BASHO_HOST` | `0.0.0.0` | Bind address for the HTTP server |
 | `BASHO_PORT` | `6969` | Listen port for the HTTP server |
-| `BASHO_AUTH_TOKEN` | *(unset)* | Operator bearer/login token required for remote reads and mutations on `/security` |
+| `BASHO_AUTH_TOKEN` | *(unset)* | Operator bearer/login token protecting `/security` reads and mutations; when unset, `/security` reads are open to any peer that can reach `BASHO_HOST` (default `0.0.0.0`) while mutations fall back to direct loopback-only (`127.0.0.1` / `::1`) without proxy headers |
 | `BASHO_SECURITY_DB` | `data/basho-security.db` | SQLite database path for scans, events, alerts, proposals, and containment audit logs |
 | `BASHO_DEMO_SECURITY` | `0` | Set `BASHO_DEMO_SECURITY=1` to run in isolated demo mode using fictional `lab-node-01` fixtures |
 | `BASHO_NTFY_TOKEN` | *(unset)* | Bearer token sent in the `Authorization` header for private `ntfy` topics |
@@ -118,8 +118,8 @@ for a private topic. Use Test Alert to verify delivery.
 
 #### Session Login & Remote Mutations
 
-- **Same-origin session login:** When `BASHO_AUTH_TOKEN` is set, remote operators authenticate via `POST /security/login`, which issues a signed `HttpOnly; SameSite=Lax` cookie (`Secure` over HTTPS). All state-changing forms require a matching CSRF token and same-origin `Origin`/`Referer` check.
-- **Remote vs. loopback writes:** Remote mutations require `BASHO_AUTH_TOKEN` and an authenticated session. When `BASHO_AUTH_TOKEN` is unset, mutations are restricted strictly to direct loopback connections (`127.0.0.1` / `::1`) without proxy forwarding headers (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Proto`).
+- **Same-origin session login:** When `BASHO_AUTH_TOKEN` is set, `/security` reads and mutations require a valid bearer token or an authenticated session via `POST /security/login`, which issues a signed `HttpOnly; SameSite=Lax` cookie (`Secure` over HTTPS). All state-changing forms require a matching CSRF token and same-origin `Origin`/`Referer` check.
+- **Unset `BASHO_AUTH_TOKEN` behavior:** When `BASHO_AUTH_TOKEN` is unset, `/security` reads are open to any peer that can reach `BASHO_HOST` (default `0.0.0.0`), while mutations fall back to direct loopback-only (`127.0.0.1` / `::1`) without proxy forwarding headers (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Proto`). Set `BASHO_AUTH_TOKEN` (or bind `BASHO_HOST` to `127.0.0.1` or a Tailscale IP) before exposing Basho on a network.
 
 #### AI Provider & Notification Channels
 
@@ -160,19 +160,20 @@ Firewall containment (`deny_peer_ip` and `isolate_lan_ingress`) is disabled by d
 sudo install -o root -g root -m 0755 scripts/basho-lockdown-helper.sh /usr/local/libexec/basho-lockdown-helper
 ```
 
-Create a narrow `/etc/sudoers.d/basho-lockdown` entry (validated with `visudo -cf`) restricted to that exact binary and its 5 supported subcommands (`status`, `deny-ip`, `isolate-lan`, `inspect`, `rollback`):
+Create a narrow `/etc/sudoers.d/basho-lockdown` entry (validated with `visudo -cf`) restricted to that exact binary and its 5 supported subcommands (`status`, `deny-ip`, `isolate-lan`, `inspect`, `rollback`; trailing `""` locks `status` to zero extra arguments):
 
 ```sudoers
-basho ALL=(root) NOPASSWD: /usr/local/libexec/basho-lockdown-helper status, \
+basho ALL=(root) NOPASSWD: /usr/local/libexec/basho-lockdown-helper status "", \
   /usr/local/libexec/basho-lockdown-helper deny-ip *, \
   /usr/local/libexec/basho-lockdown-helper isolate-lan *, \
   /usr/local/libexec/basho-lockdown-helper inspect *, \
   /usr/local/libexec/basho-lockdown-helper rollback *
 ```
 
+- **UFW prerequisite:** UFW must be active with an existing inbound allow rule such as `ufw allow in on tailscale0` or `ufw allow 41641/udp`; otherwise `status` fails (when UFW is inactive) or reports `lan_policy=missing` (when the Tailscale allow rule is absent).
 - **LAN isolation enrollment:** Create root-owned `/etc/basho-lockdown/lan-policy.conf` (mode `0644` or `0600`, owned by `root:root`) defining `LAN_INTERFACE=<iface>` (never `lo` or `tailscale*`) and `LAN_PORTS=<comma-separated-ports>` (port `41641` is rejected). Runtime lease metadata is stored in root-owned `/var/lib/basho-lockdown` (mode `0700`).
-- **Readiness check & independent rollback:** Verify installation with `sudo -n /usr/local/libexec/basho-lockdown-helper status` (expects `status=ready` and `lan_policy=ready` when LAN isolation is enrolled). Before prepending any `ufw` rule, the helper arms an independent `systemd-run` rollback timer (`basho-rollback-<id>`) so leases revert automatically even if Basho crashes.
-- **Preserved management paths:** Both `DeadMansSwitch` and the helper unconditionally protect loopback (`lo`, `127.0.0.0/8`, `::1`), Tailscale Tailnet management (`tailscale0`, `100.64.0.0/10`, `fd7a:115c:a1e0::/48`), and Tailscale WireGuard (`UDP/41641`).
+- **Readiness check & independent rollback:** Verify installation with `sudo -n /usr/local/libexec/basho-lockdown-helper status` (expects `status=ready` and `lan_policy=ready` when UFW is active, an inbound Tailscale allow rule exists, and LAN isolation is enrolled). Before prepending any `ufw` rule, the helper arms an independent `systemd-run` rollback timer (`basho-rollback-<id>`) so leases revert automatically even if Basho crashes.
+- **Preserved management paths:** Both `DeadMansSwitch` and the helper refuse to modify protected paths (`lo`, `127.0.0.0/8`, `::1`, `tailscale0`, `100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `UDP/41641`), and the helper verifies those inbound Tailscale allow rules already exist rather than adding them itself.
 - **Disabling helper access:** Set `"helperEnabled": false` under `lockdown` in `config/security.json` and remove `/etc/sudoers.d/basho-lockdown` and `/usr/local/libexec/basho-lockdown-helper`.
 
 ### Building CSS
