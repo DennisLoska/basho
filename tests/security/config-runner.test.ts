@@ -87,8 +87,9 @@ test("default settings match the documented security defaults", () => {
   expect(settings.expectedPorts).toEqual([22, 6969]);
   expect(settings.workloads).toEqual([]);
 
+  expect(settings.ai.provider).toBe("opencode-harness");
   expect(settings.ai.baseURL).toBe("https://opencode.ai/zen/go/v1");
-  expect(settings.ai.model).toBe("deepseek-v4.1-flash");
+  expect(settings.ai.model).toBe("opencode-go/deepseek-v4.1-flash");
   expect(settings.ai.sessionHeader).toBe(true);
   expect(settings.ai.confidenceThreshold).toBe(0.85);
   expect(settings.ai.triageCooldownMinutes).toBe(10);

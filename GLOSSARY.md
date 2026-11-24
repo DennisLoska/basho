@@ -105,7 +105,7 @@ The bounded AI investigation orchestrator that runs read-only evidence-tool turn
 _Avoid_: Autonomous agent, AI engine, chatbot
 
 **AiProviderClient**:
-The transport boundary that sends bounded chat-completion turns to a configured OpenAI-compatible provider under strict timeout, origin, redirect, and header controls, mapping provider failures without leaking secrets or raw upstream bodies.
+The transport boundary that sends bounded investigation turns either to the local OpenCode 2.x harness (`opencode-harness`, default, session-less and tool-less via `generate.text`) or to a configured OpenAI-compatible endpoint (`openai-compatible`) under strict timeout, origin, redirect, and header controls, mapping provider failures without leaking secrets or raw upstream bodies.
 _Avoid_: Raw HTTP client, OpenAI SDK wrapper, LLM fetcher
 
 **EvidenceBroker**:

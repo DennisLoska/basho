@@ -166,6 +166,7 @@ export interface SecurityRuntimeOptions {
   runner?: CommandRunner;
   classifySockets?: (listeners: Listener[]) => Promise<ExposureEntry[]> | ExposureEntry[];
   stopTimeoutMs?: number;
+  onStop?: () => void | Promise<void>;
 }
 
 export function createSystemScheduler(): Scheduler {
@@ -1019,6 +1020,11 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
         } catch {
           // Ignore close errors if store was already closed.
         }
+        try {
+          await Promise.resolve(options.onStop?.());
+        } catch {
+          // Ignore cleanup errors during runtime shutdown.
+        }
       })();
 
       return stopPromise;
@@ -1176,6 +1182,7 @@ export function createLiveSecurityRuntime(
       : loadSecurityConfig();
   const clock: Clock = options.clock ?? { now: () => Date.now() };
   const store = new SecurityStore(loaded.settings.process.securityDbPath);
+  let aiClient: ReturnType<typeof createAiProviderClient>;
   try {
     let effectiveSettings = cloneSettings(loaded.settings);
     try {
@@ -1205,7 +1212,7 @@ export function createLiveSecurityRuntime(
       workloads: effectiveSettings.workloads,
     });
 
-    const aiClient = createAiProviderClient(effectiveSettings, loaded.secrets);
+    aiClient = createAiProviderClient(effectiveSettings, loaded.secrets);
     const analyst = new AiAnalyst({
       client: aiClient,
       clock,
@@ -1267,6 +1274,7 @@ export function createLiveSecurityRuntime(
       classifySockets: (listeners) =>
         collector.classifySockets(listeners, mergedExpectedPorts),
       stopTimeoutMs: options.stopTimeoutMs,
+      ...(aiClient?.dispose ? { onStop: () => aiClient?.dispose?.() } : {}),
     });
 
     emitInApp = () => {
@@ -1275,6 +1283,11 @@ export function createLiveSecurityRuntime(
 
     return runtime;
   } catch (error) {
+    try {
+      void Promise.resolve(aiClient?.dispose?.()).catch(() => {});
+    } catch {
+      // Preserve the original startup failure.
+    }
     try {
       store.close();
     } catch {

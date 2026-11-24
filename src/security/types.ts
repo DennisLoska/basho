@@ -16,6 +16,9 @@ export type Severity = "info" | "warning" | "critical" | "breach";
 export const lockdownModes = ["monitor", "approve", "auto-lockdown"] as const;
 export type LockdownMode = (typeof lockdownModes)[number];
 
+export const aiProviderKinds = ["opencode-harness", "openai-compatible"] as const;
+export type AiProviderKind = (typeof aiProviderKinds)[number];
+
 export const alertChannels = [
   "in-app",
   "desktop",
@@ -251,6 +254,8 @@ export interface SecuritySettings {
   expectedPorts: number[];
   workloads: EnrolledWorkload[];
   ai: {
+    provider: AiProviderKind;
+    serverUrl?: string;
     baseURL: string;
     model: string;
     sessionHeader: boolean;
@@ -273,6 +278,7 @@ export interface SecuritySettings {
 
 export interface SecuritySecrets {
   aiKey?: string;
+  opencodeServerPassword?: string;
   authToken?: string;
   ntfyToken?: string;
   discordWebhook?: string;

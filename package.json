@@ -17,6 +17,8 @@
   },
   "dependencies": {
     "@tailwindcss/cli": "^4.2.2",
+    "ai": "^7.0.0",
+    "ai-sdk-provider-opencode-sdk": "^5.0.1",
     "daisyui": "^5.0.0",
     "hono": "^4.12.9",
     "openai": "^7.62.0",

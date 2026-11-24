@@ -58,6 +58,7 @@ function makeSettings(ai: Partial<SecuritySettings["ai"]> = {}): SecuritySetting
     expectedPorts: [22],
     workloads: [],
     ai: {
+      provider: "openai-compatible",
       baseURL: "https://opencode.example.test/zen/go/v1",
       model: "deepseek-v4.1-flash",
       sessionHeader: true,

@@ -1,10 +1,18 @@
+import { existsSync } from "node:fs";
 import { isIP } from "node:net";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import {
+  createOpencode,
+  type OpencodeProvider,
+} from "ai-sdk-provider-opencode-sdk";
 import OpenAI from "openai";
 import type {
   ChatCompletionMessageParam,
   ChatCompletionMessageToolCall,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
+import { redactSecrets } from "./config";
 import { isValidSystemdUnitName } from "./runner";
 import { criterionIds, evidenceTools } from "./types";
 import type {
@@ -151,6 +159,29 @@ export interface AiTurnResponse {
 
 export interface AiProviderClient {
   complete(request: AiTurnRequest): Promise<AiTurnResponse>;
+  dispose?: () => void | Promise<void>;
+}
+
+export interface HarnessModelRef {
+  providerID: string;
+  id: string;
+}
+
+export interface HarnessGenerateTextCall {
+  prompt: string;
+  model: HarnessModelRef;
+  messages: ChatCompletionMessageParam[];
+  tools?: ChatCompletionTool[];
+  abortSignal?: AbortSignal;
+}
+
+export interface OpencodeHarnessClientOptions {
+  model: string;
+  serverUrl?: string;
+  serverPassword?: string;
+  generateText?: (call: HarnessGenerateTextCall) => Promise<{ text: string }>;
+  getPort?: () => number | undefined | Promise<number | undefined>;
+  timeoutMs?: number;
 }
 
 export interface ProposalDraft {
@@ -376,17 +407,42 @@ function parseRetryAfterHeader(
 
 function extractRetryAfter(error: unknown): RetryAfterHint | undefined {
   if (!error || typeof error !== "object") return undefined;
-  const headers = (error as { headers?: unknown }).headers;
-  if (!headers) return undefined;
-  if (typeof (headers as Headers).get === "function") {
-    return parseRetryAfterHeader((headers as Headers).get("retry-after"));
-  }
-  if (isPlainObject(headers)) {
-    for (const [k, v] of Object.entries(headers)) {
-      if (k.toLowerCase() === "retry-after" && typeof v === "string") {
-        return parseRetryAfterHeader(v);
+  const err = error as {
+    headers?: unknown;
+    responseHeaders?: unknown;
+    cause?: unknown;
+  };
+  for (const candidate of [err.headers, err.responseHeaders]) {
+    if (!candidate) continue;
+    if (typeof (candidate as Headers).get === "function") {
+      const parsed = parseRetryAfterHeader((candidate as Headers).get("retry-after"));
+      if (parsed) return parsed;
+    } else if (isPlainObject(candidate)) {
+      for (const [k, v] of Object.entries(candidate)) {
+        if (k.toLowerCase() === "retry-after" && typeof v === "string") {
+          const parsed = parseRetryAfterHeader(v);
+          if (parsed) return parsed;
+        }
       }
     }
+  }
+  if (err.cause && err.cause !== error) {
+    return extractRetryAfter(err.cause);
+  }
+  return undefined;
+}
+
+function extractHttpStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const err = error as {
+    status?: unknown;
+    statusCode?: unknown;
+    cause?: unknown;
+  };
+  if (typeof err.status === "number") return err.status;
+  if (typeof err.statusCode === "number") return err.statusCode;
+  if (err.cause && err.cause !== error) {
+    return extractHttpStatus(err.cause);
   }
   return undefined;
 }
@@ -416,17 +472,21 @@ function isTimeoutOrAbortError(error: unknown): boolean {
   return false;
 }
 
-function wrapProviderError(error: unknown, signalAborted: boolean): AiProviderError {
+function wrapProviderError(
+  error: unknown,
+  signalAborted: boolean,
+  secrets: SecuritySecrets = {},
+): AiProviderError {
   if (error instanceof AiProviderError) {
-    return error;
+    const safeMessage = redactSecrets(error.message, secrets);
+    return safeMessage === error.message
+      ? error
+      : new AiProviderError(error.reason, safeMessage, error.retryAfter);
   }
   if (signalAborted || isTimeoutOrAbortError(error)) {
     return new AiProviderError("timeout", "AI provider request timed out");
   }
-  const status =
-    error && typeof error === "object"
-      ? (error as { status?: unknown }).status
-      : undefined;
+  const status = extractHttpStatus(error);
   if (error instanceof OpenAI.RateLimitError || status === 429) {
     return new AiProviderError(
       "rate_limited",
@@ -434,7 +494,10 @@ function wrapProviderError(error: unknown, signalAborted: boolean): AiProviderEr
       extractRetryAfter(error),
     );
   }
-  return new AiProviderError("provider_unavailable", "AI provider unavailable");
+  return new AiProviderError(
+    "provider_unavailable",
+    redactSecrets("AI provider unavailable", secrets),
+  );
 }
 
 function createSafeFetcher(
@@ -506,11 +569,331 @@ function createSafeFetcher(
   return safeFetch as unknown as typeof fetch;
 }
 
+function parseHarnessModel(rawModel: string): HarnessModelRef {
+  const trimmed = rawModel.trim();
+  const slashIdx = trimmed.indexOf("/");
+  if (slashIdx > 0 && slashIdx < trimmed.length - 1) {
+    return {
+      providerID: trimmed.slice(0, slashIdx),
+      id: trimmed.slice(slashIdx + 1),
+    };
+  }
+  return {
+    providerID: "opencode-go",
+    id: trimmed || "deepseek-v4.1-flash",
+  };
+}
+
+function resolveOpencodeServiceFile(): string | undefined {
+  const home = homedir();
+  const xdgStateHome = process.env.XDG_STATE_HOME || join(home, ".local", "state");
+  const stateFile = join(xdgStateHome, "opencode", "service.json");
+  if (existsSync(stateFile)) {
+    return stateFile;
+  }
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME || join(home, ".config");
+  const configFile = join(xdgConfigHome, "opencode", "service.json");
+  if (existsSync(configFile)) {
+    return configFile;
+  }
+  return undefined;
+}
+
+function serializeMessageContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content === null || content === undefined) return "";
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
+}
+
+function buildHarnessPrompt(
+  messages: ChatCompletionMessageParam[],
+  tools: ChatCompletionTool[],
+): string {
+  const sections: string[] = [];
+
+  for (const message of messages) {
+    const role = message.role.toUpperCase();
+    if (message.role === "assistant") {
+      const parts: string[] = [];
+      const text = serializeMessageContent(message.content);
+      if (text) parts.push(text);
+      const toolCalls = (
+        message as { tool_calls?: ChatCompletionMessageToolCall[] }
+      ).tool_calls;
+      if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+        parts.push(
+          `TOOL_CALLS: ${JSON.stringify(
+            toolCalls.map((tc) => ({
+              id: tc.id,
+              name: tc.type === "function" ? tc.function.name : "",
+              arguments: tc.type === "function" ? tc.function.arguments : "{}",
+            })),
+          )}`,
+        );
+      }
+      if (parts.length > 0) {
+        sections.push(`${role}:\n${parts.join("\n")}`);
+      }
+    } else if (message.role === "tool") {
+      const callId = (message as { tool_call_id?: string }).tool_call_id ?? "";
+      sections.push(
+        `TOOL_RESULT (call_id=${callId}):\n${serializeMessageContent(message.content)}`,
+      );
+    } else {
+      sections.push(`${role}:\n${serializeMessageContent(message.content)}`);
+    }
+  }
+
+  if (tools.length > 0) {
+    sections.push(
+      [
+        "AVAILABLE READ-ONLY EVIDENCE TOOLS (closed JSON schemas):",
+        JSON.stringify(tools),
+        "",
+        "RESPONSE PROTOCOL:",
+        "Respond with ONLY a single valid JSON object (no extra text outside the JSON).",
+        "Option A — to inspect additional read-only evidence via the tools above, respond with:",
+        '{"tool_calls":[{"name":"<tool_name>","arguments":{...}}]}',
+        "Option B — if you have sufficient evidence to conclude, respond with the final verdict JSON:",
+        '{"verdict":{"kind":"healthy|warn|breach","confidence":0.0,"summary":"..."},"findings":[...],"proposals":[...]}',
+      ].join("\n"),
+    );
+  } else {
+    sections.push(
+      [
+        "FINAL VERDICT PROTOCOL:",
+        "No tools are available on this turn. Do NOT output tool_calls.",
+        "Respond with ONLY a single valid JSON object matching the required verdict schema (no surrounding text or markdown).",
+      ].join("\n"),
+    );
+  }
+
+  return sections.join("\n\n");
+}
+
+function unwrapJsonCodeFence(raw: string): string {
+  const trimmed = raw.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n```$/i);
+  if (fenced?.[1] !== undefined) {
+    return fenced[1].trim();
+  }
+  const inlineFenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (inlineFenced?.[1] !== undefined) {
+    return inlineFenced[1].trim();
+  }
+  return trimmed;
+}
+
+function parseHarnessResponse(
+  rawText: string,
+  toolsEnabled: boolean,
+): AiTurnResponse {
+  const unwrapped = unwrapJsonCodeFence(rawText);
+
+  if (!toolsEnabled) {
+    if (unwrapped !== rawText.trim()) {
+      try {
+        const parsed: unknown = JSON.parse(unwrapped);
+        if (isPlainObject(parsed)) {
+          return { content: unwrapped, calls: [] };
+        }
+      } catch {
+        // Fall back to raw text if the fenced block is not valid JSON.
+      }
+    }
+    return { content: rawText, calls: [] };
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(unwrapped);
+    if (isPlainObject(parsed) && Array.isArray(parsed.tool_calls)) {
+      const calls: AiToolCall[] = [];
+      for (let i = 0; i < parsed.tool_calls.length; i += 1) {
+        const entry = parsed.tool_calls[i];
+        if (!isPlainObject(entry)) continue;
+        const name = typeof entry.name === "string" ? entry.name : "";
+        const id =
+          typeof entry.id === "string" && entry.id.trim().length > 0
+            ? entry.id.trim()
+            : `harness-call-${i + 1}`;
+        let serializedArgs = "{}";
+        if (typeof entry.arguments === "string") {
+          serializedArgs = entry.arguments;
+        } else if (entry.arguments !== undefined) {
+          serializedArgs = JSON.stringify(entry.arguments);
+        }
+        calls.push({ id, name, arguments: serializedArgs });
+      }
+      return { content: "", calls };
+    }
+    if (isPlainObject(parsed) && unwrapped !== rawText.trim()) {
+      return { content: unwrapped, calls: [] };
+    }
+  } catch {
+    // Non-JSON or malformed output passes through as raw content for downstream validation.
+  }
+
+  return { content: rawText, calls: [] };
+}
+
+function buildBasicAuthHeaders(
+  password: string | undefined,
+): Record<string, string> | undefined {
+  if (!password) return undefined;
+  const token = Buffer.from(`opencode:${password}`, "utf8").toString("base64");
+  return { Authorization: `Basic ${token}` };
+}
+
+export function createOpencodeHarnessClient(
+  options: OpencodeHarnessClientOptions,
+): AiProviderClient & { dispose(): Promise<void> } {
+  const parsedModel = parseHarnessModel(options.model);
+  const timeoutMs =
+    typeof options.timeoutMs === "number" &&
+    Number.isFinite(options.timeoutMs) &&
+    options.timeoutMs > 0
+      ? options.timeoutMs
+      : PROVIDER_TIMEOUT_MS;
+  const secretsForRedaction: SecuritySecrets = options.serverPassword
+    ? { opencodeServerPassword: options.serverPassword }
+    : {};
+
+  let provider: OpencodeProvider | null = null;
+  let disposed = false;
+
+  const ensureProvider = async (): Promise<OpencodeProvider> => {
+    if (provider) return provider;
+
+    const authHeaders = buildBasicAuthHeaders(options.serverPassword);
+    const headers: Record<string, string> = {
+      "User-Agent": USER_AGENT,
+      ...(authHeaders ?? {}),
+    };
+
+    let explicitBaseUrl = options.serverUrl?.trim() || undefined;
+    if (!explicitBaseUrl && options.getPort) {
+      const port = await options.getPort();
+      if (typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535) {
+        explicitBaseUrl = `http://127.0.0.1:${port}`;
+      }
+    }
+
+    if (explicitBaseUrl) {
+      provider = createOpencode({
+        baseUrl: explicitBaseUrl,
+        autoStart: false,
+        clientOptions: {
+          headers,
+          fetch: createSafeFetcher(explicitBaseUrl),
+        },
+      });
+    } else {
+      const serviceFile = resolveOpencodeServiceFile();
+      provider = createOpencode({
+        autoStart: false,
+        ...(serviceFile ? { service: { file: serviceFile } } : {}),
+        clientOptions: { headers },
+      });
+    }
+
+    return provider;
+  };
+
+  return {
+    async complete(request: AiTurnRequest): Promise<AiTurnResponse> {
+      if (disposed) {
+        throw new AiProviderError("provider_unavailable", "AI provider disposed");
+      }
+      if (request.signal.aborted) {
+        throw new AiProviderError("timeout", "AI provider request timed out");
+      }
+
+      const turnAbort = new AbortController();
+      let timedOut = false;
+      const onCallerAbort = () => {
+        turnAbort.abort();
+      };
+      request.signal.addEventListener("abort", onCallerAbort, { once: true });
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        turnAbort.abort();
+      }, timeoutMs);
+      if (typeof timer === "object" && timer !== null && "unref" in timer) {
+        (timer as { unref?: () => void }).unref?.();
+      }
+
+      try {
+        const prompt = buildHarnessPrompt(request.messages, request.tools);
+        let text: string;
+
+        if (options.generateText) {
+          const response = await options.generateText({
+            prompt,
+            model: parsedModel,
+            messages: request.messages,
+            tools: request.tools,
+            abortSignal: turnAbort.signal,
+          });
+          text = typeof response?.text === "string" ? response.text : "";
+        } else {
+          const activeProvider = await ensureProvider();
+          const port = await activeProvider.getClientManager().getPort();
+          const response = await port.generate.text(
+            { prompt, model: parsedModel },
+            { signal: turnAbort.signal },
+          );
+          text = typeof response?.text === "string" ? response.text : "";
+        }
+
+        return parseHarnessResponse(text, request.tools.length > 0);
+      } catch (error) {
+        throw wrapProviderError(
+          error,
+          request.signal.aborted || timedOut,
+          secretsForRedaction,
+        );
+      } finally {
+        clearTimeout(timer);
+        request.signal.removeEventListener("abort", onCallerAbort);
+      }
+    },
+
+    async dispose(): Promise<void> {
+      if (disposed) return;
+      disposed = true;
+      const activeProvider = provider;
+      provider = null;
+      if (activeProvider) {
+        try {
+          await activeProvider.dispose();
+        } catch {
+          // Disposal must remain graceful and idempotent.
+        }
+      }
+    },
+  };
+}
+
 export function createAiProviderClient(
   settings: SecuritySettings,
   secrets: SecuritySecrets,
   fetcher?: HttpFetcher,
 ): AiProviderClient | undefined {
+  if (settings.ai.provider === "opencode-harness") {
+    return createOpencodeHarnessClient({
+      model: settings.ai.model,
+      ...(settings.ai.serverUrl ? { serverUrl: settings.ai.serverUrl } : {}),
+      ...(secrets.opencodeServerPassword
+        ? { serverPassword: secrets.opencodeServerPassword }
+        : {}),
+    });
+  }
+
   const apiKey = secrets.aiKey?.trim();
   if (!apiKey) {
     return undefined;
@@ -563,7 +946,7 @@ export function createAiProviderClient(
           typeof message?.content === "string" ? message.content : undefined;
         return content !== undefined ? { content, calls } : { calls };
       } catch (error) {
-        throw wrapProviderError(error, request.signal.aborted);
+        throw wrapProviderError(error, request.signal.aborted, secrets);
       }
     },
   };
