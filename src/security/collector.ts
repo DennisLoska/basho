@@ -3337,6 +3337,8 @@ export class PostureCollector {
   private readonly files: PostureFiles;
   private readonly clock: Clock;
   private readonly concurrency: number;
+  private latestFirewall: FirewallInputs | null = null;
+  private latestPublications: TailscalePublications | null = null;
 
   constructor(options: PostureCollectorOptions) {
     this.runner = options.runner;
@@ -3345,7 +3347,36 @@ export class PostureCollector {
     this.concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
   }
 
-  async collect(scanId: string, settings: SecuritySettings): Promise<PostureResult> {
+  classifySockets(
+    listeners: readonly Listener[],
+    expectedPorts: ReadonlySet<number> | readonly number[],
+  ): ExposureEntry[] {
+    const expectedPortSet =
+      expectedPorts instanceof Set ? expectedPorts : new Set<number>(expectedPorts);
+    const firewall: FirewallInputs = this.latestFirewall ?? { active: null };
+    const publications: TailscalePublications = this.latestPublications ?? {
+      servePorts: new Set(),
+      funnelPorts: new Set(),
+      serveTargets: [],
+      funnelTargets: [],
+      serveCoverage: "unavailable",
+      funnelCoverage: "unavailable",
+    };
+
+    return classifyListeners({
+      listeners,
+      firewall,
+      publications,
+      expectedPorts: expectedPortSet,
+      evidenceIdForListener: (_listener, index) => `socket-poll:${index}`,
+    });
+  }
+
+  async collect(
+    scanId: string,
+    settings: SecuritySettings,
+    signal?: AbortSignal,
+  ): Promise<PostureResult> {
     const capturedAt = this.clock.now();
     const enabled = new Set<CriterionId>(
       criterionIds.filter((id) => settings.criteria[id] !== false),
@@ -3412,7 +3443,7 @@ export class PostureCollector {
 
     for (const kind of [...neededCommands].sort(lexicalCompare) as SimpleCommandKind[]) {
       tasks.push(async () => {
-        const result = await this.runner.run({ kind });
+        const result = await this.runner.run({ kind }, signal);
         commandResults.set(kind, result);
       });
     }
@@ -3510,6 +3541,15 @@ export class PostureCollector {
       commandResults.get("tailscale_serve"),
       commandResults.get("tailscale_funnel"),
     );
+
+    if (!signal?.aborted) {
+      if (neededCommands.has("ufw_status")) {
+        this.latestFirewall = firewallInputs;
+      }
+      if (neededCommands.has("tailscale_serve") || neededCommands.has("tailscale_funnel")) {
+        this.latestPublications = publications;
+      }
+    }
 
     const expectedPortSet = new Set<number>(settings.expectedPorts);
     for (const workload of settings.workloads) {

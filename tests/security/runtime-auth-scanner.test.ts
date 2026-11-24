@@ -1,20 +1,27 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createDemoSecurityRuntime,
   getDemoServices,
   getDemoSystemStats,
 } from "../../src/security/demo";
 import { createSecurityAuth } from "../../src/security/auth";
-import { createSecurityRuntime } from "../../src/security/runtime";
+import { createLiveSecurityRuntime, createSecurityRuntime } from "../../src/security/runtime";
 import { scan } from "../../src/services/scanner";
 import { loadSecurityConfig } from "../../src/security/config";
 import { SecurityStore } from "../../src/security/store";
 import type { InvestigationResult, ProposalDraft } from "../../src/security/ai-analyst";
-import type { PostureResult } from "../../src/security/collector";
-import type { MonitorResult } from "../../src/security/events";
+import { PostureCollector, type PostureFiles, type PostureResult } from "../../src/security/collector";
+import { EventMonitor, type MonitorResult } from "../../src/security/events";
 import type { ConsiderResult } from "../../src/security/lockdown";
 import type {
   AlertChannel,
+  CommandRequest,
+  CommandResult,
+  CommandRunner,
   Corroboration,
   RuntimeOverrides,
   SecurityAlert,
@@ -1647,4 +1654,558 @@ test("demo services and system stats fixtures return fictional lab-node-01 data"
   expect(stats.ram.total).toBeGreaterThan(0);
   expect(stats.disks.length).toBeGreaterThan(0);
   expect(stats.gpu).not.toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Stage 2 code quality hardening tests
+// ---------------------------------------------------------------------------
+
+test("real PostureCollector + EventMonitor socket classifier detects newly exposed 0.0.0.0:8188 listener and feeds unexpected_workload corroboration to lockdown.consider", async () => {
+  const clock = fakeClock();
+  const scheduler = fakeScheduler();
+  const store = new SpyStore(":memory:");
+  const settings = settingsFixture((s) => {
+    s.expectedPorts = [22, 6969];
+    s.workloads = [{ id: "comfy", unit: "comfy.service", name: "comfy", ports: [8188] }];
+  });
+
+  const ssHeader = "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess";
+  const ssLoopback = 'tcp   LISTEN 0      128    127.0.0.1:6969   0.0.0.0:*    users:(("bun",pid=1001,fd=3))';
+  const ssExposedComfy = 'tcp   LISTEN 0      128    0.0.0.0:8188     0.0.0.0:*    users:(("comfy",pid=4242,fd=7))';
+
+  let exposeComfy = false;
+  const runner: CommandRunner = {
+    async run(request: CommandRequest): Promise<CommandResult> {
+      if (request.kind === "ufw_status") {
+        return {
+          status: "ok",
+          exitCode: 0,
+          stdout: [
+            "Status: active",
+            "Default: deny (incoming), allow (outgoing), disabled (routed)",
+          ].join("\n"),
+        };
+      }
+      if (request.kind === "tailscale_serve" || request.kind === "tailscale_funnel") {
+        return { status: "ok", exitCode: 0, stdout: "{}" };
+      }
+      if (request.kind === "sockets") {
+        return {
+          status: "ok",
+          exitCode: 0,
+          stdout: exposeComfy
+            ? [ssHeader, ssLoopback, ssExposedComfy].join("\n")
+            : [ssHeader, ssLoopback].join("\n"),
+        };
+      }
+      if (request.kind === "processes") {
+        return {
+          status: "ok",
+          exitCode: 0,
+          stdout: "  4242     1  1000   120 comfy.service - comfy\n",
+        };
+      }
+      return { status: "unavailable" };
+    },
+  };
+
+  const files: PostureFiles = {
+    async read(source) {
+      if (source === "ufw-v4") return "-A ufw-user-input -p tcp --dport 8188 -j ACCEPT";
+      if (source === "ufw-v6") return "-A ufw6-user-input -j RETURN";
+      if (source === "ufw-default") return 'IPV6=yes\nDEFAULT_INPUT_POLICY="DROP"';
+      return null;
+    },
+    async sshDropIns() {
+      return [];
+    },
+  };
+
+  const collector = new PostureCollector({ runner, files, clock });
+  const monitor = new EventMonitor({
+    store,
+    runner,
+    clock,
+    workloads: settings.workloads,
+  });
+
+  const publishedAlerts: SecurityAlert[] = [];
+  let drainCount = 0;
+  const considerCalls: { scan: SecurityScan; drafts: readonly ProposalDraft[]; corroboration: readonly Corroboration[] }[] = [];
+
+  const runtime = createSecurityRuntime({
+    store,
+    collector,
+    monitor,
+    analyst: {
+      async investigate(scanId): Promise<InvestigationResult> {
+        if (!exposeComfy) {
+          return unconfiguredInvestigation();
+        }
+        return {
+          status: "ready",
+          verdict: { kind: "warn", confidence: 0.9, summary: "Unexpected comfy listener" },
+          findings: [],
+          proposals: [
+            {
+              target: {
+                kind: "pause_workload",
+                workloadId: "comfy",
+                pid: 4242,
+                startedAt: clock.now() - 120_000,
+              },
+              evidenceIds: [`ev:${scanId}:listener:0`],
+            },
+          ],
+          trail: { steps: [] },
+        };
+      },
+    },
+    lockdown: {
+      async consider(scan, drafts, corroboration) {
+        considerCalls.push({ scan, drafts, corroboration });
+        return { proposals: [], actions: [], alerts: [] };
+      },
+      async approve() { return true; },
+      reject() { return true; },
+      async unlock() { return true; },
+      async reconcile() {},
+    },
+    dispatcher: {
+      publish(alert) {
+        publishedAlerts.push(alert);
+        return true;
+      },
+      sendTestAlert() { return "test"; },
+      async drain() { drainCount += 1; },
+      health() { return {}; },
+    },
+    clock,
+    scheduler,
+    settings,
+    runner,
+    classifySockets: (listeners) => collector.classifySockets(listeners, settings.expectedPorts),
+  });
+
+  try {
+    runtime.start();
+    await flushMicrotasks();
+
+    // 1. Initial scan captures UFW/Tailscale context in PostureCollector.
+    await runtime.requestScan("manual");
+
+    // 2. First 30s socket poll establishes EventMonitor baseline (loopback only).
+    const socketTick = scheduler.ticks.find((tick) => tick.ms === 30_000);
+    expect(socketTick).toBeDefined();
+    socketTick!.run();
+    await flushMicrotasks();
+
+    const drainBefore = drainCount;
+    expect(publishedAlerts.length).toBe(0);
+
+    // 3. New 0.0.0.0:8188 listener opens for enrolled workload comfy.
+    clock.advance(30_000);
+    exposeComfy = true;
+    socketTick!.run();
+
+    await flushUntil(() => considerCalls.length === 1, "event scan lockdown.consider call");
+
+    // Verify critical listener_opened event persisted, critical alert published & drained.
+    const openedEvent = store
+      .recentEvents(0, 50)
+      .find((ev) => ev.rule === "listener_opened" && ev.target === "tcp:0.0.0.0:8188");
+    expect(openedEvent).toBeDefined();
+    expect(openedEvent?.severity).toBe("critical");
+
+    expect(publishedAlerts.some((a) => a.severity === "critical" && a.fingerprint.includes("unexpected_workload:comfy"))).toBe(true);
+    expect(drainCount).toBeGreaterThan(drainBefore);
+
+    // Verify unexpected_workload corroboration was fed into lockdown.consider.
+    const corroboration = considerCalls[0]!.corroboration;
+    const workloadCorr = corroboration.find((c) => c.rule === "unexpected_workload");
+    expect(workloadCorr).toBeDefined();
+    expect(workloadCorr?.target).toMatchObject({
+      kind: "pause_workload",
+      workloadId: "comfy",
+      pid: 4242,
+    });
+  } finally {
+    await runtime.stop();
+    if (store.calls.close === 0) store.close();
+  }
+});
+
+test("handleMonitorResult publishes and drains alerts on scheduled journal and socket ticks", async () => {
+  const clock = fakeClock();
+  const scheduler = fakeScheduler();
+  const store = new SpyStore(":memory:");
+  const settings = settingsFixture();
+
+  const publishedAlerts: SecurityAlert[] = [];
+  let drainCalls = 0;
+  let journalAlert: SecurityAlert | null = null;
+  let socketAlert: SecurityAlert | null = null;
+
+  const runtime = createSecurityRuntime({
+    store,
+    collector: {
+      async collect(scanId) {
+        return postureResult(scanId, clock.now());
+      },
+    },
+    monitor: {
+      async pollJournal(): Promise<MonitorResult> {
+        const next = journalAlert;
+        journalAlert = null;
+        return next
+          ? { alerts: [next], corroboration: [], coverage: "complete" }
+          : emptyMonitorResult();
+      },
+      async pollSockets(): Promise<MonitorResult> {
+        const next = socketAlert;
+        socketAlert = null;
+        return next
+          ? { alerts: [next], corroboration: [], coverage: "complete" }
+          : emptyMonitorResult();
+      },
+    },
+    analyst: {
+      async investigate() {
+        return unconfiguredInvestigation();
+      },
+    },
+    lockdown: {
+      async consider() { return { proposals: [], actions: [], alerts: [] }; },
+      async approve() { return true; },
+      reject() { return true; },
+      async unlock() { return true; },
+      async reconcile() {},
+    },
+    dispatcher: {
+      publish(alert) {
+        publishedAlerts.push(alert);
+        return true;
+      },
+      sendTestAlert() { return "test"; },
+      async drain() { drainCalls += 1; },
+      health() { return {}; },
+    },
+    clock,
+    scheduler,
+    settings,
+  });
+
+  const updates: unknown[] = [];
+  const unsub = runtime.subscribe((u) => updates.push(u));
+  try {
+    runtime.start();
+    await flushMicrotasks();
+
+    const journalTick = scheduler.ticks.find((t) => t.ms === 5_000)!;
+    const socketTick = scheduler.ticks.find((t) => t.ms === 30_000)!;
+
+    const drainBeforeJournal = drainCalls;
+    journalAlert = {
+      id: "alert-journal-tick",
+      fingerprint: "ssh_burst:198.51.100.42",
+      severity: "critical",
+      summary: "Journal SSH burst",
+      createdAt: clock.now(),
+    };
+    journalTick.run();
+    await flushUntil(() => publishedAlerts.some((a) => a.id === "alert-journal-tick"), "journal alert publish");
+    await flushMicrotasks();
+    expect(drainCalls).toBeGreaterThan(drainBeforeJournal);
+    expect(updates).toContainEqual({ kind: "alert" });
+    expect(updates).toContainEqual({ kind: "events" });
+
+    const drainBeforeSocket = drainCalls;
+    socketAlert = {
+      id: "alert-socket-tick",
+      fingerprint: "unexpected_listener:tcp:0.0.0.0:8188",
+      severity: "critical",
+      summary: "Socket exposed listener",
+      createdAt: clock.now(),
+    };
+    socketTick.run();
+    await flushUntil(() => publishedAlerts.some((a) => a.id === "alert-socket-tick"), "socket alert publish");
+    await flushMicrotasks();
+    expect(drainCalls).toBeGreaterThan(drainBeforeSocket);
+  } finally {
+    unsub();
+    await runtime.stop();
+    if (store.calls.close === 0) store.close();
+  }
+});
+
+test("createLiveSecurityRuntime boots with a temp DB and falls back safely on corrupt persisted overrides", async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), "basho-live-runtime-"));
+  const dbPath = join(tempDir, "security.db");
+  try {
+    const { settings, secrets } = loadSecurityConfig({ env: {}, fileConfig: {} });
+    settings.process.securityDbPath = dbPath;
+    settings.mode = "approve";
+    settings.scanIntervalMinutes = 45;
+
+    // 1. Smoke test: live runtime constructs, serves view, stops cleanly, and view remains safe after stop.
+    const smokeRuntime = createLiveSecurityRuntime({
+      settings,
+      secrets,
+      scheduler: fakeScheduler(),
+      hostLabel: "live-smoke-host",
+    });
+    const liveView = smokeRuntime.view();
+    expect(liveView.hostLabel).toBe("live-smoke-host");
+    expect(liveView.settings.mode).toBe("approve");
+    expect(liveView.settings.scanIntervalMinutes).toBe(45);
+    await smokeRuntime.stop();
+    const stoppedView = smokeRuntime.view();
+    expect(stoppedView.hostLabel).toBe("live-smoke-host");
+    expect(stoppedView.scanRunning).toBe(false);
+    expect(stoppedView.nextScanAt).toBeNull();
+
+    // 2. Corrupt JSON in runtime_settings overrides must fall back safely without crashing startup.
+    const rawDb = new Database(dbPath);
+    try {
+      rawDb
+        .query(
+          `INSERT INTO runtime_settings (key, value_json, updated_at)
+           VALUES ('overrides', ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+        )
+        .run("{corrupt-json", Date.now());
+    } finally {
+      rawDb.close();
+    }
+
+    const corruptJsonRuntime = createLiveSecurityRuntime({
+      settings,
+      secrets,
+      scheduler: fakeScheduler(),
+    });
+    expect(corruptJsonRuntime.view().settings.mode).toBe("approve");
+    expect(corruptJsonRuntime.view().settings.scanIntervalMinutes).toBe(45);
+    await corruptJsonRuntime.stop();
+
+    // 3. Semantically invalid override fields must also fall back safely without crashing startup.
+    const invalidDb = new Database(dbPath);
+    try {
+      invalidDb
+        .query(
+          `UPDATE runtime_settings SET value_json = ? WHERE key = 'overrides'`,
+        )
+        .run(JSON.stringify({ mode: "nonexistent-mode", scanIntervalMinutes: -1 }));
+    } finally {
+      invalidDb.close();
+    }
+
+    const invalidOverrideRuntime = createLiveSecurityRuntime({
+      settings,
+      secrets,
+      scheduler: fakeScheduler(),
+    });
+    expect(invalidOverrideRuntime.view().settings.mode).toBe("approve");
+    expect(invalidOverrideRuntime.view().settings.scanIntervalMinutes).toBe(45);
+    await invalidOverrideRuntime.stop();
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("view() remains safe after stop() on both real and demo runtimes", async () => {
+  // Real runtime: with prior scan and with/without prior view() call.
+  const harness = createHarness();
+  try {
+    await harness.runtime.requestScan("manual");
+    await harness.runtime.stop();
+    expect(harness.store.calls.close).toBe(1);
+
+    const frozen = harness.runtime.view();
+    expect(frozen.scanRunning).toBe(false);
+    expect(frozen.nextScanAt).toBeNull();
+    expect(frozen.latestScan?.trigger).toBe("manual");
+  } finally {
+    if (harness.store.calls.close === 0) harness.store.close();
+  }
+
+  // Demo runtime: stop() without ever calling view() beforehand, then call view().
+  const demo = createDemoSecurityRuntime();
+  await demo.stop();
+  const demoFrozen = demo.view();
+  expect(demoFrozen.hostLabel).toBe("lab-node-01");
+  expect(demoFrozen.scanRunning).toBe(false);
+  expect(demoFrozen.nextScanAt).toBeNull();
+  expect(demoFrozen.latestScan).not.toBeNull();
+});
+
+test("stop() resolves within bounded stopTimeoutMs when an in-flight task hangs and catches late closed-DB errors", async () => {
+  const clock = fakeClock();
+  const scheduler = fakeScheduler();
+  const store = new SpyStore(":memory:");
+  const settings = settingsFixture();
+
+  const hungCollect = deferred<PostureResult>();
+  const hungApprove = deferred<boolean>();
+
+  const runtime = createSecurityRuntime({
+    store,
+    collector: {
+      async collect() {
+        return hungCollect.promise;
+      },
+    },
+    monitor: {
+      async pollJournal() { return emptyMonitorResult(); },
+      async pollSockets() { return emptyMonitorResult(); },
+    },
+    analyst: {
+      async investigate() { return unconfiguredInvestigation(); },
+    },
+    lockdown: {
+      async consider() { return { proposals: [], actions: [], alerts: [] }; },
+      async approve() { return hungApprove.promise; },
+      reject() { return true; },
+      async unlock() { return true; },
+      async reconcile() {},
+    },
+    dispatcher: {
+      publish() { return true; },
+      sendTestAlert() { return "test"; },
+      async drain() {},
+      health() { return {}; },
+    },
+    clock,
+    scheduler,
+    settings,
+    stopTimeoutMs: 40,
+  });
+
+  const warnings: unknown[][] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args);
+  };
+
+  try {
+    const scanPromise = runtime.requestScan("manual").catch(() => undefined);
+    const approvePromise = runtime.approve("prop-hung", 1);
+    await flushMicrotasks();
+
+    const t0 = Date.now();
+    await runtime.stop();
+    const elapsed = Date.now() - t0;
+
+    expect(elapsed).toBeLessThan(1_000);
+    expect(store.calls.close).toBe(1);
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(runtime.view().scanRunning).toBe(false);
+    expect(runtime.view().nextScanAt).toBeNull();
+
+    // Late settlement after SQLite is already closed must not produce unhandled rejections.
+    hungCollect.resolve(postureResult("late-scan", clock.now()));
+    hungApprove.reject(new Error("SQLite database is closed"));
+    await scanPromise;
+    await expect(approvePromise).resolves.toBe(false);
+    await flushMicrotasks();
+  } finally {
+    console.warn = origWarn;
+    if (store.calls.close === 0) store.close();
+  }
+});
+
+test("breach verdict alert is still published and drained when lockdown.consider throws", async () => {
+  const clock = fakeClock();
+  const scheduler = fakeScheduler();
+  const store = new SpyStore(":memory:");
+  const settings = settingsFixture();
+
+  const publishedAlerts: SecurityAlert[] = [];
+  let drainCount = 0;
+
+  const runtime = createSecurityRuntime({
+    store,
+    collector: {
+      async collect(scanId) {
+        return postureResult(scanId, clock.now());
+      },
+    },
+    monitor: {
+      async pollJournal() { return emptyMonitorResult(); },
+      async pollSockets() { return emptyMonitorResult(); },
+    },
+    analyst: {
+      async investigate() {
+        return {
+          status: "ready",
+          verdict: {
+            kind: "breach",
+            confidence: 0.96,
+            summary: "Confirmed host breach from active intrusion",
+          },
+          findings: [
+            {
+              id: "finding-breach-1",
+              source: "ai",
+              severity: "breach",
+              summary: "Active intrusion detected",
+              evidenceIds: [POSTURE_EVIDENCE_ID],
+            },
+          ],
+          proposals: [
+            {
+              target: { kind: "deny_peer_ip", ip: "198.51.100.42" },
+              evidenceIds: [POSTURE_EVIDENCE_ID],
+            },
+          ],
+          trail: { steps: [] },
+        };
+      },
+    },
+    lockdown: {
+      async consider() {
+        throw new Error("preflight containment check failed");
+      },
+      async approve() { return true; },
+      reject() { return true; },
+      async unlock() { return true; },
+      async reconcile() {},
+    },
+    dispatcher: {
+      publish(alert) {
+        publishedAlerts.push(alert);
+        return true;
+      },
+      sendTestAlert() { return "test"; },
+      async drain() { drainCount += 1; },
+      health() { return {}; },
+    },
+    clock,
+    scheduler,
+    settings,
+  });
+
+  const updates: unknown[] = [];
+  const unsub = runtime.subscribe((u) => updates.push(u));
+  const origWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const scan = await runtime.requestScan("manual");
+    await flushMicrotasks();
+
+    expect(scan.verdict?.kind).toBe("breach");
+    expect(store.latestScan()?.verdict?.kind).toBe("breach");
+
+    const breachAlert = publishedAlerts.find((a) => a.fingerprint === "ai:verdict:breach");
+    expect(breachAlert).toBeDefined();
+    expect(breachAlert?.severity).toBe("breach");
+    expect(breachAlert?.summary).toBe("Confirmed host breach from active intrusion");
+    expect(breachAlert?.proposalId).toBeUndefined();
+    expect(drainCount).toBeGreaterThanOrEqual(1);
+    expect(updates).toContainEqual({ kind: "alert" });
+  } finally {
+    console.warn = origWarn;
+    unsub();
+    await runtime.stop();
+    if (store.calls.close === 0) store.close();
+  }
 });

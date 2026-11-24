@@ -2567,4 +2567,38 @@ describe("PostureCollector Stage 2 code quality regressions", () => {
     expect(procEv?.facts.comm).toBe("weird-daemon");
     expect(procEv?.facts.pid).toBe(5150);
   });
+
+  test("classifySockets falls back safely before collect and reuses cached UFW and Tailscale state after collect", async () => {
+    const h = harness({
+      files: {
+        "ufw-v4": "-A ufw-user-input -p tcp --dport 8188 -j ACCEPT",
+        "ufw-v6": "-A ufw6-user-input -j RETURN",
+      },
+      commands: {
+        tailscale_serve: okResult("{}"),
+        tailscale_funnel: okResult("{}"),
+      },
+    });
+    const listeners = parseListeners(
+      ss(
+        'tcp   LISTEN 0      128    0.0.0.0:8188    0.0.0.0:*    users:(("comfy",pid=4242,fd=7))',
+        'tcp   LISTEN 0      128    0.0.0.0:22      0.0.0.0:*    users:(("sshd",pid=100,fd=3))',
+      ),
+    );
+
+    const beforeCollect = h.collector.classifySockets(listeners, [22, 6969]);
+    const before8188 = beforeCollect.find((entry) => entry.listener.port === 8188);
+    expect(before8188?.reachability).toBe("unknown");
+    expect(before8188?.expected).toBe(false);
+
+    await h.collector.collect("scan-cache-context", settings({ expectedPorts: [22, 6969] }));
+
+    const afterCollect = h.collector.classifySockets(listeners, [22, 6969]);
+    const after8188 = afterCollect.find((entry) => entry.listener.port === 8188);
+    const after22 = afterCollect.find((entry) => entry.listener.port === 22);
+    expect(after8188?.reachability).toBe("exposed_lan");
+    expect(after8188?.expected).toBe(false);
+    expect(after22?.expected).toBe(true);
+    expect(after22?.reachability).toBe("blocked_by_ufw");
+  });
 });

@@ -57,6 +57,7 @@ const PRUNE_INTERVAL_MS = 6 * 60 * MINUTE_MS;
 const RECENT_EVENTS_WINDOW_MS = DAY_MS;
 const RECENT_EVENTS_LIMIT = 100;
 const RECENT_ALERTS_WINDOW_MS = 7 * DAY_MS;
+const DEFAULT_STOP_TIMEOUT_MS = 10_000;
 const DEFAULT_HELPER_PATH = "/usr/local/libexec/basho-lockdown-helper";
 
 const CRITERION_SET = new Set<string>(criterionIds);
@@ -161,6 +162,7 @@ export interface SecurityRuntimeOptions {
   helperReady?: boolean | (() => boolean);
   runner?: CommandRunner;
   classifySockets?: (listeners: Listener[]) => Promise<ExposureEntry[]> | ExposureEntry[];
+  stopTimeoutMs?: number;
 }
 
 export function createSystemScheduler(): Scheduler {
@@ -327,11 +329,6 @@ function fallbackClassifySockets(
   settings: SecuritySettings,
 ): ExposureEntry[] {
   const expectedPorts = new Set<number>(settings.expectedPorts);
-  for (const workload of settings.workloads) {
-    for (const port of workload.ports ?? []) {
-      expectedPorts.add(port);
-    }
-  }
   return classifyListeners({
     listeners,
     firewall: { active: null },
@@ -358,6 +355,12 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
   const lockdown = options.lockdown;
   const dispatcher = options.dispatcher;
   const hostLabel = options.hostLabel?.trim() || defaultHostLabel();
+  const stopTimeoutMs =
+    options.stopTimeoutMs !== undefined &&
+    Number.isFinite(options.stopTimeoutMs) &&
+    options.stopTimeoutMs >= 0
+      ? options.stopTimeoutMs
+      : DEFAULT_STOP_TIMEOUT_MS;
 
   let currentOverrides: RuntimeOverrides = {};
   let currentSettings: SecuritySettings = cloneSettings(options.settings);
@@ -378,7 +381,9 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
 
   let started = false;
   let stopped = false;
+  let storeClosed = false;
   let stopPromise: Promise<void> | null = null;
+  let cachedView: SecurityView | null = null;
   let runtimeAbort = new AbortController();
 
   let scanRunning = false;
@@ -416,12 +421,75 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
     }
   };
 
+  const resolveHelperReady = (): boolean =>
+    typeof options.helperReady === "function"
+      ? options.helperReady()
+      : (options.helperReady ?? currentSettings.lockdown.helperEnabled);
+
+  const readLiveView = (): SecurityView => {
+    const now = clock.now();
+    const latestScan = store.latestScan();
+    return {
+      hostLabel,
+      latestScan,
+      events: store.recentEvents(now - RECENT_EVENTS_WINDOW_MS, RECENT_EVENTS_LIMIT),
+      hourly: store.hourlyEvents(now),
+      proposals: store.listProposals(),
+      actions: store.listActions(),
+      alerts: store.recentAlerts(now - RECENT_ALERTS_WINDOW_MS),
+      channelHealth: dispatcher.health(),
+      settings: {
+        mode: currentSettings.mode,
+        criteria: { ...currentSettings.criteria },
+        scanIntervalMinutes: currentSettings.scanIntervalMinutes,
+      },
+      aiStatus: latestScan?.aiStatus ?? lastAiStatus,
+      scanRunning,
+      nextScanAt,
+      helperReady: resolveHelperReady(),
+    };
+  };
+
+  const freezeViewForStop = (base: SecurityView): SecurityView => ({
+    ...base,
+    settings: {
+      ...base.settings,
+      criteria: { ...base.settings.criteria },
+    },
+    scanRunning: false,
+    nextScanAt: null,
+  });
+
+  const buildFallbackStoppedView = (): SecurityView => ({
+    hostLabel,
+    latestScan: null,
+    events: [],
+    hourly: [],
+    proposals: [],
+    actions: [],
+    alerts: [],
+    channelHealth: {},
+    settings: {
+      mode: currentSettings.mode,
+      criteria: { ...currentSettings.criteria },
+      scanIntervalMinutes: currentSettings.scanIntervalMinutes,
+    },
+    aiStatus: lastAiStatus,
+    scanRunning: false,
+    nextScanAt: null,
+    helperReady: resolveHelperReady(),
+  });
+
   const trackTask = <T>(promise: Promise<T>): Promise<T> => {
-    const tracked = promise.finally(() => {
+    const watcher = promise.then(
+      () => undefined,
+      () => undefined,
+    );
+    const tracked = watcher.finally(() => {
       inFlightTasks.delete(tracked);
     });
     inFlightTasks.add(tracked);
-    return tracked;
+    return promise;
   };
 
   const recordCorroborations = (entries: readonly Corroboration[]): void => {
@@ -539,8 +607,10 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
       const broker = new EvidenceBroker({
         scanId,
         evidence: posture.snapshot.evidence,
-        recentEvents: (category, windowMinutes, limit) =>
-          store.recentEvents(clock.now() - windowMinutes * MINUTE_MS, limit, category),
+        recentEvents: (category, windowMinutes, limit) => {
+          if (stopped || storeClosed) return [];
+          return store.recentEvents(clock.now() - windowMinutes * MINUTE_MS, limit, category);
+        },
         ...(options.runner
           ? { unitStatus: createUnitStatusReader(options.runner, scanAbort.signal) }
           : {}),
@@ -567,19 +637,30 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
 
       let linkedProposalId: string | undefined;
       if (investigation.proposals.length > 0 && !stopped) {
-        const considerResult = await lockdown.consider(
-          completedScan,
-          investigation.proposals,
-          getActiveCorroborations(),
-          scanSettings,
-        );
-        if (considerResult.proposals.length > 0 || considerResult.actions.length > 0) {
-          linkedProposalId = considerResult.proposals[0]?.id;
-          emit({ kind: "containment" });
-        }
-        if (considerResult.alerts.length > 0) {
-          emit({ kind: "alert" });
-          void trackTask(dispatcher.drain().catch(() => {}));
+        try {
+          const considerResult = await lockdown.consider(
+            completedScan,
+            investigation.proposals,
+            getActiveCorroborations(),
+            scanSettings,
+          );
+          if (!stopped) {
+            if (considerResult.proposals.length > 0 || considerResult.actions.length > 0) {
+              linkedProposalId = considerResult.proposals[0]?.id;
+              emit({ kind: "containment" });
+            }
+            if (considerResult.alerts.length > 0) {
+              emit({ kind: "alert" });
+              void trackTask(dispatcher.drain().catch(() => {}));
+            }
+          }
+        } catch (error) {
+          if (!stopped && !storeClosed) {
+            console.warn(
+              `[security] lockdown.consider failed for scan ${scanId}:`,
+              error instanceof Error ? error.message : String(error),
+            );
+          }
         }
       }
 
@@ -721,10 +802,12 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
       // Independent non-overlapping periodic schedules.
       fixedUnsubs.push(
         scheduleNonOverlapping(JOURNAL_POLL_MS, async (signal) => {
+          if (stopped || storeClosed) return;
           const beforeLast = store.recentEvents(0, 1)[0]?.lastAt ?? 0;
           const result = await monitor.pollJournal(signal);
+          if (stopped || storeClosed) return;
           const afterLast = store.recentEvents(0, 1)[0]?.lastAt ?? 0;
-          if (!stopped && afterLast > beforeLast) {
+          if (afterLast > beforeLast) {
             lastEvidenceAt = Math.max(lastEvidenceAt, afterLast, clock.now());
             evidenceVersion += 1;
             if (result.alerts.length === 0 && result.corroboration.length === 0) {
@@ -737,10 +820,12 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
 
       fixedUnsubs.push(
         scheduleNonOverlapping(SOCKET_POLL_MS, async (signal) => {
+          if (stopped || storeClosed) return;
           const beforeLast = store.recentEvents(0, 1)[0]?.lastAt ?? 0;
           const result = await invokeSocketPoll(signal);
+          if (stopped || storeClosed) return;
           const afterLast = store.recentEvents(0, 1)[0]?.lastAt ?? 0;
-          if (!stopped && afterLast > beforeLast) {
+          if (afterLast > beforeLast) {
             lastEvidenceAt = Math.max(lastEvidenceAt, afterLast, clock.now());
             evidenceVersion += 1;
             if (result.alerts.length === 0 && result.corroboration.length === 0) {
@@ -811,44 +896,77 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
         followUp.reject(new Error("SecurityRuntime has been stopped"));
       }
 
-      stopPromise = (async () => {
-        while (inFlightTasks.size > 0) {
-          const pending = [...inFlightTasks];
-          await Promise.allSettled(pending);
+      // Snapshot a frozen view before waiting so view() stays safe during shutdown.
+      try {
+        cachedView = freezeViewForStop(readLiveView());
+      } catch {
+        if (cachedView) {
+          cachedView = freezeViewForStop(cachedView);
         }
-        store.close();
+      }
+
+      stopPromise = (async () => {
+        if (inFlightTasks.size > 0) {
+          let timedOut = false;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const drainAll = (async () => {
+            while (!timedOut && inFlightTasks.size > 0) {
+              const pending = [...inFlightTasks];
+              await Promise.allSettled(pending);
+            }
+          })();
+
+          const timeout = new Promise<"timeout">((resolve) => {
+            timer = setTimeout(() => {
+              timedOut = true;
+              resolve("timeout");
+            }, stopTimeoutMs);
+            if (typeof timer === "object" && timer !== null && "unref" in timer) {
+              (timer as { unref?: () => void }).unref?.();
+            }
+          });
+
+          const outcome = await Promise.race([
+            drainAll.then(() => "drained" as const),
+            timeout,
+          ]);
+          if (timer !== undefined) {
+            clearTimeout(timer);
+          }
+
+          if (outcome === "timeout" && inFlightTasks.size > 0) {
+            console.warn(
+              `[security] SecurityRuntime.stop() timed out after ${stopTimeoutMs}ms with ${inFlightTasks.size} in-flight task(s) still running; closing store`,
+            );
+          }
+        }
+
+        try {
+          cachedView = freezeViewForStop(readLiveView());
+        } catch {
+          if (cachedView) {
+            cachedView = freezeViewForStop(cachedView);
+          }
+        }
+
+        storeClosed = true;
+        try {
+          store.close();
+        } catch {
+          // Ignore close errors if store was already closed.
+        }
       })();
 
       return stopPromise;
     },
 
     view(): SecurityView {
-      const now = clock.now();
-      const latestScan = store.latestScan();
-      const helperReady =
-        typeof options.helperReady === "function"
-          ? options.helperReady()
-          : (options.helperReady ?? currentSettings.lockdown.helperEnabled);
-
-      return {
-        hostLabel,
-        latestScan,
-        events: store.recentEvents(now - RECENT_EVENTS_WINDOW_MS, RECENT_EVENTS_LIMIT),
-        hourly: store.hourlyEvents(now),
-        proposals: store.listProposals(),
-        actions: store.listActions(),
-        alerts: store.recentAlerts(now - RECENT_ALERTS_WINDOW_MS),
-        channelHealth: dispatcher.health(),
-        settings: {
-          mode: currentSettings.mode,
-          criteria: { ...currentSettings.criteria },
-          scanIntervalMinutes: currentSettings.scanIntervalMinutes,
-        },
-        aiStatus: latestScan?.aiStatus ?? lastAiStatus,
-        scanRunning,
-        nextScanAt,
-        helperReady,
-      };
+      if (stopped || storeClosed) {
+        return cachedView ? freezeViewForStop(cachedView) : buildFallbackStoppedView();
+      }
+      const current = readLiveView();
+      cachedView = current;
+      return current;
     },
 
     subscribe(listener: (update: SecurityUpdate) => void): () => void {
@@ -890,11 +1008,18 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
       if (stopped) return Promise.resolve(false);
       return trackTask(
         (async () => {
-          const ok = await lockdown.approve(id, revision, cloneSettings(currentSettings));
-          if (ok) {
-            emit({ kind: "containment" });
+          try {
+            const ok = await lockdown.approve(id, revision, cloneSettings(currentSettings));
+            if (ok && !stopped) {
+              emit({ kind: "containment" });
+            }
+            return ok;
+          } catch (error) {
+            if (stopped || storeClosed) {
+              return false;
+            }
+            throw error;
           }
-          return ok;
         })(),
       );
     },
@@ -912,11 +1037,18 @@ export function createSecurityRuntime(options: SecurityRuntimeOptions): Security
       if (stopped) return Promise.resolve(false);
       return trackTask(
         (async () => {
-          const ok = await lockdown.unlock(id);
-          if (ok) {
-            emit({ kind: "containment" });
+          try {
+            const ok = await lockdown.unlock(id);
+            if (ok && !stopped) {
+              emit({ kind: "containment" });
+            }
+            return ok;
+          } catch (error) {
+            if (stopped || storeClosed) {
+              return false;
+            }
+            throw error;
           }
-          return ok;
         })(),
       );
     },
@@ -949,6 +1081,7 @@ export interface LiveSecurityRuntimeOptions {
   scheduler?: Scheduler;
   hostLabel?: string;
   helperPath?: string;
+  stopTimeoutMs?: number;
 }
 
 function isHelperBinaryExecutable(path: string): boolean {
@@ -969,78 +1102,98 @@ export function createLiveSecurityRuntime(
       : loadSecurityConfig();
   const clock: Clock = options.clock ?? { now: () => Date.now() };
   const store = new SecurityStore(loaded.settings.process.securityDbPath);
-  const storedOverrides = store.readOverrides();
-  const { nextSettings: effectiveSettings } = validateAndMergeOverrides(
-    loaded.settings,
-    {},
-    storedOverrides,
-  );
+  try {
+    let effectiveSettings = cloneSettings(loaded.settings);
+    try {
+      const storedOverrides = store.readOverrides();
+      if (Object.keys(storedOverrides).length > 0) {
+        effectiveSettings = validateAndMergeOverrides(
+          effectiveSettings,
+          {},
+          storedOverrides,
+        ).nextSettings;
+      }
+    } catch {
+      // Keep validated config settings when persisted overrides are corrupt or invalid.
+      effectiveSettings = cloneSettings(loaded.settings);
+    }
 
-  const runner = createCommandRunner();
-  const collector = new PostureCollector({
-    runner,
-    files: createPostureFiles(),
-    clock,
-  });
-  const monitor = new EventMonitor({
-    store,
-    runner,
-    clock,
-    workloads: effectiveSettings.workloads,
-  });
+    const runner = createCommandRunner();
+    const collector = new PostureCollector({
+      runner,
+      files: createPostureFiles(),
+      clock,
+    });
+    const monitor = new EventMonitor({
+      store,
+      runner,
+      clock,
+      workloads: effectiveSettings.workloads,
+    });
 
-  const aiClient = createAiProviderClient(effectiveSettings, loaded.secrets);
-  const analyst = new AiAnalyst({
-    client: aiClient,
-    clock,
-  });
+    const aiClient = createAiProviderClient(effectiveSettings, loaded.secrets);
+    const analyst = new AiAnalyst({
+      client: aiClient,
+      clock,
+    });
 
-  const resolveProcess = createProcProcessResolver();
-  const adapter = createCompositeLockdownAdapter({
-    getWorkloads: () => effectiveSettings.workloads,
-    clock,
-    resolveProcess,
-  });
-  const lockdown = new LockdownEngine({
-    store,
-    clock,
-    guard: new DeadMansSwitch(),
-    adapter,
-    resolveProcess,
-  });
+    const resolveProcess = createProcProcessResolver();
+    const adapter = createCompositeLockdownAdapter({
+      getWorkloads: () => effectiveSettings.workloads,
+      clock,
+      resolveProcess,
+    });
+    const lockdown = new LockdownEngine({
+      store,
+      clock,
+      guard: new DeadMansSwitch(),
+      adapter,
+      resolveProcess,
+    });
 
-  let emitInApp: (() => void) | null = null;
-  const dispatcher = new NotificationDispatcher({
-    store,
-    clock,
-    config: effectiveSettings.notifications,
-    secrets: loaded.secrets,
-    runner,
-    onInApp: () => {
-      emitInApp?.();
-    },
-  });
+    let emitInApp: (() => void) | null = null;
+    const dispatcher = new NotificationDispatcher({
+      store,
+      clock,
+      config: effectiveSettings.notifications,
+      secrets: loaded.secrets,
+      runner,
+      onInApp: () => {
+        emitInApp?.();
+      },
+    });
 
-  const helperPath = options.helperPath ?? DEFAULT_HELPER_PATH;
-  const runtime = createSecurityRuntime({
-    store,
-    collector,
-    monitor,
-    analyst,
-    lockdown,
-    dispatcher,
-    clock,
-    scheduler: options.scheduler ?? createSystemScheduler(),
-    settings: effectiveSettings,
-    hostLabel: options.hostLabel,
-    helperReady: () =>
-      effectiveSettings.lockdown.helperEnabled && isHelperBinaryExecutable(helperPath),
-    runner,
-  });
+    const helperPath = options.helperPath ?? DEFAULT_HELPER_PATH;
+    const runtime = createSecurityRuntime({
+      store,
+      collector,
+      monitor,
+      analyst,
+      lockdown,
+      dispatcher,
+      clock,
+      scheduler: options.scheduler ?? createSystemScheduler(),
+      settings: effectiveSettings,
+      hostLabel: options.hostLabel,
+      helperReady: () =>
+        effectiveSettings.lockdown.helperEnabled && isHelperBinaryExecutable(helperPath),
+      runner,
+      classifySockets: (listeners) =>
+        collector.classifySockets(listeners, effectiveSettings.expectedPorts),
+      stopTimeoutMs: options.stopTimeoutMs,
+    });
 
-  emitInApp = () => {
-    // In-app alerts are persisted in SQLite before delivery; runtime already emits on publish.
-  };
+    emitInApp = () => {
+      // In-app alerts are persisted in SQLite before delivery; runtime already emits on publish.
+    };
 
-  return runtime;
+    return runtime;
+  } catch (error) {
+    try {
+      store.close();
+    } catch {
+      // Preserve the original startup failure.
+    }
+    throw error;
+  }
 }

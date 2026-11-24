@@ -695,6 +695,7 @@ export function createDemoSecurityRuntime(): SecurityRuntime {
   let nextScanAt: number | null = now + currentSettings.scanIntervalMinutes * MINUTE_MS;
 
   const listeners = new Set<(update: SecurityUpdate) => void>();
+  let cachedView: SecurityView | null = null;
 
   const emit = (update: SecurityUpdate): void => {
     if (stopped) return;
@@ -706,6 +707,59 @@ export function createDemoSecurityRuntime(): SecurityRuntime {
       }
     }
   };
+
+  const readLiveView = (): SecurityView => {
+    const latestScan = store.latestScan();
+    return {
+      hostLabel: DEMO_HOST_LABEL,
+      latestScan,
+      events: store.recentEvents(now - DAY_MS, 100),
+      hourly: store.hourlyEvents(now),
+      proposals: store.listProposals(),
+      actions: store.listActions(),
+      alerts: store.recentAlerts(now - 7 * DAY_MS),
+      channelHealth: store.channelHealth(),
+      settings: {
+        mode: currentSettings.mode,
+        criteria: { ...currentSettings.criteria },
+        scanIntervalMinutes: currentSettings.scanIntervalMinutes,
+      },
+      aiStatus: latestScan?.aiStatus ?? "ready",
+      scanRunning: false,
+      nextScanAt,
+      helperReady: true,
+    };
+  };
+
+  const freezeViewForStop = (base: SecurityView): SecurityView => ({
+    ...base,
+    settings: {
+      ...base.settings,
+      criteria: { ...base.settings.criteria },
+    },
+    scanRunning: false,
+    nextScanAt: null,
+  });
+
+  const buildFallbackStoppedView = (): SecurityView => ({
+    hostLabel: DEMO_HOST_LABEL,
+    latestScan: null,
+    events: [],
+    hourly: [],
+    proposals: [],
+    actions: [],
+    alerts: [],
+    channelHealth: {},
+    settings: {
+      mode: currentSettings.mode,
+      criteria: { ...currentSettings.criteria },
+      scanIntervalMinutes: currentSettings.scanIntervalMinutes,
+    },
+    aiStatus: "ready",
+    scanRunning: false,
+    nextScanAt: null,
+    helperReady: true,
+  });
 
   // Seed fictional state in the isolated in-memory SQLite store.
   const initialScan = buildDemoScan("demo-scan-1", "scheduled", now, currentSettings);
@@ -724,30 +778,23 @@ export function createDemoSecurityRuntime(): SecurityRuntime {
       stopped = true;
       nextScanAt = null;
       listeners.clear();
+      try {
+        cachedView = freezeViewForStop(readLiveView());
+      } catch {
+        if (cachedView) {
+          cachedView = freezeViewForStop(cachedView);
+        }
+      }
       store.close();
     },
 
     view(): SecurityView {
-      const latestScan = store.latestScan();
-      return {
-        hostLabel: DEMO_HOST_LABEL,
-        latestScan,
-        events: store.recentEvents(now - DAY_MS, 100),
-        hourly: store.hourlyEvents(now),
-        proposals: store.listProposals(),
-        actions: store.listActions(),
-        alerts: store.recentAlerts(now - 7 * DAY_MS),
-        channelHealth: store.channelHealth(),
-        settings: {
-          mode: currentSettings.mode,
-          criteria: { ...currentSettings.criteria },
-          scanIntervalMinutes: currentSettings.scanIntervalMinutes,
-        },
-        aiStatus: latestScan?.aiStatus ?? "ready",
-        scanRunning: false,
-        nextScanAt,
-        helperReady: true,
-      };
+      if (stopped) {
+        return cachedView ? freezeViewForStop(cachedView) : buildFallbackStoppedView();
+      }
+      const current = readLiveView();
+      cachedView = current;
+      return current;
     },
 
     subscribe(listener: (update: SecurityUpdate) => void): () => void {
