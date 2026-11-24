@@ -123,3 +123,7 @@ _Avoid_: Firewall controller, remediation runner, auto-blocker
 **LockdownAdapter**:
 The typed containment execution seam (`preflight`, `apply`, `inspect`, `rollback`) separating `LockdownEngine` policy from host enforcement backends such as the privileged helper (`basho-lockdown-helper`) and user-space `systemctl --user` workload freeze/thaw.
 _Avoid_: Shell executor, sudo wrapper, ufw client
+
+**NotificationDispatcher**:
+The alert outbox orchestrator that persists deduplicated `SecurityAlert` notices via `SecurityStore`, claims bounded `AlertDelivery` batches under timed leases, dispatches per-`AlertChannel` adapters (`in-app`, `desktop`, `ntfy`, `discord`, `telegram`) with strict origin, redirect, and secret controls and bounded retries, and projects secret-free channel health.
+_Avoid_: Webhook sender, alert mailer, raw notifier
