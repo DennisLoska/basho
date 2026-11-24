@@ -8,6 +8,21 @@
   var diskIOData = [];
   var diskIOMax = 1;
 
+  // Security tab state (SSE lifecycle + client filters preserved across swaps)
+  var securityEventSource = null;
+  var securityRefreshTimer = null;
+  var securityRefreshInFlight = false;
+  var securityRefreshQueued = false;
+  var securityAuthStopped = false;
+  var securityState = {
+    reachability: 'all',
+    exposureSearch: '',
+    eventCategory: 'all',
+    hideNoise: true,
+    openDetails: {},
+  };
+  var pendingFocusSnapshot = null;
+
   function normalizeTheme(theme) {
     if (theme === 'bumblebee' || theme === 'opencode-light' || theme === 'light') {
       return 'opencode-light';
@@ -54,6 +69,307 @@
     }
   }
 
+  function announceSecurityStatus(message, isError) {
+    var el = document.getElementById('security-status-announcer');
+    if (!el) return;
+    el.textContent = message;
+    el.className = isError
+      ? 'oc-panel px-3.5 py-2.5 font-mono text-xs flex items-center justify-between gap-2 border-error/45 bg-error/10 text-error'
+      : 'oc-panel px-3.5 py-2.5 font-mono text-xs flex items-center justify-between gap-2 border-info/45 bg-info/10 text-info';
+  }
+
+  function captureSecurityState() {
+    var panel = document.getElementById('security-panel');
+    if (!panel) return null;
+
+    var reachEl = panel.querySelector('[data-exposure-reachability]');
+    if (reachEl) securityState.reachability = reachEl.value || 'all';
+
+    var searchEl = panel.querySelector('[data-exposure-search]');
+    if (searchEl) securityState.exposureSearch = searchEl.value || '';
+
+    var hideNoiseEl = panel.querySelector('[data-hide-noise]');
+    if (hideNoiseEl) securityState.hideNoise = !!hideNoiseEl.checked;
+
+    var openMap = {};
+    var details = panel.querySelectorAll('details[data-detail-id]');
+    for (var i = 0; i < details.length; i++) {
+      var id = details[i].getAttribute('data-detail-id');
+      if (id && details[i].open) openMap[id] = true;
+    }
+    securityState.openDetails = openMap;
+
+    var active = document.activeElement;
+    var focusInfo = null;
+    if (active && panel.contains(active)) {
+      focusInfo = {
+        id: active.id || null,
+        name: active.getAttribute('name') || null,
+        tagName: active.tagName || null,
+        selectionStart: typeof active.selectionStart === 'number' ? active.selectionStart : null,
+        selectionEnd: typeof active.selectionEnd === 'number' ? active.selectionEnd : null,
+      };
+    }
+    return focusInfo;
+  }
+
+  function applySecurityFilters() {
+    var panel = document.getElementById('security-panel');
+    if (!panel) return;
+
+    var reachFilter = (securityState.reachability || 'all').toLowerCase();
+    var query = (securityState.exposureSearch || '').trim().toLowerCase();
+    var exposureRows = panel.querySelectorAll('[data-exposure-row]');
+    for (var i = 0; i < exposureRows.length; i++) {
+      var row = exposureRows[i];
+      var rowReach = (row.getAttribute('data-reachability') || '').toLowerCase();
+      var rowSearch = (row.getAttribute('data-search') || '').toLowerCase();
+      var reachOk = reachFilter === 'all' || rowReach === reachFilter;
+      var queryOk = !query || rowSearch.indexOf(query) !== -1;
+      row.style.display = (reachOk && queryOk) ? '' : 'none';
+    }
+
+    var activeCategory = (securityState.eventCategory || 'all').toLowerCase();
+    var hideNoise = !!securityState.hideNoise;
+    var chips = panel.querySelectorAll('[data-event-category]');
+    for (var c = 0; c < chips.length; c++) {
+      var chip = chips[c];
+      var isSelected = (chip.getAttribute('data-event-category') || '').toLowerCase() === activeCategory;
+      chip.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+      chip.className = isSelected
+        ? 'h-7 px-2.5 rounded border font-mono text-[11px] font-semibold bg-primary/15 border-primary/45 text-primary cursor-pointer'
+        : 'h-7 px-2.5 rounded border font-mono text-[11px] bg-base-100 border-base-300 text-base-content/70 hover:text-base-content cursor-pointer';
+    }
+
+    var eventRows = panel.querySelectorAll('[data-event-row]');
+    for (var j = 0; j < eventRows.length; j++) {
+      var evRow = eventRows[j];
+      var evCat = (evRow.getAttribute('data-category') || '').toLowerCase();
+      var isNoise = evRow.getAttribute('data-noise') === 'true';
+      var catOk = activeCategory === 'all' || evCat === activeCategory;
+      var noiseOk = !hideNoise || !isNoise;
+      if (catOk && noiseOk) {
+        evRow.classList.remove('hidden');
+      } else {
+        evRow.classList.add('hidden');
+      }
+    }
+  }
+
+  function restoreSecurityState(focusInfo) {
+    var panel = document.getElementById('security-panel');
+    if (!panel) return;
+
+    var reachEl = panel.querySelector('[data-exposure-reachability]');
+    if (reachEl) reachEl.value = securityState.reachability || 'all';
+
+    var searchEl = panel.querySelector('[data-exposure-search]');
+    if (searchEl) searchEl.value = securityState.exposureSearch || '';
+
+    var hideNoiseEl = panel.querySelector('[data-hide-noise]');
+    if (hideNoiseEl) hideNoiseEl.checked = !!securityState.hideNoise;
+
+    var details = panel.querySelectorAll('details[data-detail-id]');
+    for (var i = 0; i < details.length; i++) {
+      var id = details[i].getAttribute('data-detail-id');
+      if (id && securityState.openDetails[id]) {
+        details[i].open = true;
+      }
+    }
+
+    applySecurityFilters();
+
+    if (focusInfo) {
+      var target = null;
+      if (focusInfo.id) {
+        target = document.getElementById(focusInfo.id);
+      }
+      if (!target && focusInfo.name && focusInfo.tagName) {
+        var candidates = panel.querySelectorAll(focusInfo.tagName.toLowerCase() + '[name]');
+        for (var k = 0; k < candidates.length; k++) {
+          if (candidates[k].getAttribute('name') === focusInfo.name) {
+            target = candidates[k];
+            break;
+          }
+        }
+      }
+      if (target && panel.contains(target) && typeof target.focus === 'function') {
+        try {
+          target.focus({ preventScroll: true });
+          if (
+            focusInfo.selectionStart !== null &&
+            focusInfo.selectionEnd !== null &&
+            typeof target.setSelectionRange === 'function'
+          ) {
+            target.setSelectionRange(focusInfo.selectionStart, focusInfo.selectionEnd);
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  function closeSecurityStream() {
+    if (securityRefreshTimer !== null) {
+      clearTimeout(securityRefreshTimer);
+      securityRefreshTimer = null;
+    }
+    securityRefreshQueued = false;
+    if (securityEventSource) {
+      try {
+        securityEventSource.close();
+      } catch (e) {}
+      securityEventSource = null;
+    }
+  }
+
+  function refreshSecurityFragment() {
+    if (!document.querySelector('[data-security-stream]')) {
+      closeSecurityStream();
+      return;
+    }
+    if (securityAuthStopped) return;
+    if (securityRefreshInFlight) {
+      securityRefreshQueued = true;
+      return;
+    }
+
+    securityRefreshInFlight = true;
+    securityRefreshQueued = false;
+
+    fetch('/security/fragment', {
+      credentials: 'same-origin',
+      headers: { 'HX-Request': 'true' },
+      redirect: 'manual',
+    })
+      .then(function(response) {
+        if (
+          response.type === 'opaqueredirect' ||
+          response.status === 401 ||
+          response.status === 403 ||
+          response.status === 302 ||
+          response.status === 303
+        ) {
+          securityAuthStopped = true;
+          closeSecurityStream();
+          announceSecurityStatus('Security session expired. Sign in again to resume live updates.', true);
+          return null;
+        }
+        if (!response.ok) {
+          announceSecurityStatus('Unable to refresh security view (HTTP ' + response.status + ').', true);
+          return null;
+        }
+        return response.text();
+      })
+      .then(function(htmlText) {
+        if (htmlText === null) return;
+        var currentPanel = document.getElementById('security-panel');
+        if (!currentPanel) {
+          closeSecurityStream();
+          return;
+        }
+
+        var focusInfo = captureSecurityState();
+        var tpl = document.createElement('template');
+        tpl.innerHTML = htmlText;
+
+        var nextPanel = tpl.content.querySelector('#security-panel');
+        var nextDot = tpl.content.querySelector('#security-nav-dot');
+
+        if (nextPanel && currentPanel.parentNode) {
+          currentPanel.parentNode.replaceChild(nextPanel, currentPanel);
+          if (window.htmx && typeof window.htmx.process === 'function') {
+            window.htmx.process(nextPanel);
+          }
+        }
+        if (nextDot) {
+          nextDot.removeAttribute('hx-swap-oob');
+          var existingDot = document.getElementById('security-nav-dot');
+          if (existingDot && existingDot.parentNode) {
+            existingDot.parentNode.replaceChild(nextDot, existingDot);
+          }
+        }
+
+        restoreSecurityState(focusInfo);
+      })
+      .catch(function() {
+        announceSecurityStatus('Unable to reach Basho Security service for live update.', true);
+      })
+      .finally(function() {
+        securityRefreshInFlight = false;
+        if (securityRefreshQueued && !securityAuthStopped) {
+          scheduleSecurityRefresh();
+        }
+      });
+  }
+
+  function scheduleSecurityRefresh() {
+    if (securityAuthStopped || !document.querySelector('[data-security-stream]')) {
+      return;
+    }
+    if (securityRefreshTimer !== null) return;
+    securityRefreshTimer = setTimeout(function() {
+      securityRefreshTimer = null;
+      refreshSecurityFragment();
+    }, 150);
+  }
+
+  function syncSecurityStream() {
+    var host = document.querySelector('[data-security-stream]');
+    if (!host) {
+      closeSecurityStream();
+      securityAuthStopped = false;
+      return;
+    }
+
+    applySecurityFilters();
+
+    if (securityAuthStopped) return;
+    if (securityEventSource && securityEventSource.readyState !== 2) {
+      return;
+    }
+
+    var streamUrl = host.getAttribute('data-security-stream') || '/sse/security';
+    try {
+      var es = new EventSource(streamUrl);
+      securityEventSource = es;
+
+      es.addEventListener('security', function() {
+        scheduleSecurityRefresh();
+      });
+
+      es.addEventListener('error', function() {
+        if (!document.querySelector('[data-security-stream]')) {
+          closeSecurityStream();
+          return;
+        }
+        if (es.readyState === 2) {
+          closeSecurityStream();
+          // Verify whether auth expired; stop reconnecting if login is required.
+          fetch('/security/fragment', {
+            credentials: 'same-origin',
+            headers: { 'HX-Request': 'true' },
+            redirect: 'manual',
+          })
+            .then(function(res) {
+              if (
+                res.type === 'opaqueredirect' ||
+                res.status === 401 ||
+                res.status === 403 ||
+                res.status === 302 ||
+                res.status === 303
+              ) {
+                securityAuthStopped = true;
+                announceSecurityStatus('Security session expired. Sign in again to resume live updates.', true);
+              }
+            })
+            .catch(function() {
+              announceSecurityStatus('Security live stream disconnected.', true);
+            });
+        }
+      });
+    } catch (e) {}
+  }
+
   function init() {
     var html = document.documentElement;
     var savedTheme = null;
@@ -63,6 +379,7 @@
 
     applyTheme(savedTheme || html.getAttribute('data-theme') || 'opencode');
     syncActiveNav();
+    syncSecurityStream();
 
     window.toggleTheme = function() {
       var current = normalizeTheme(html.getAttribute('data-theme'));
@@ -195,7 +512,40 @@
     return card;
   }
 
-  document.addEventListener('htmx:beforeSwap', function() {
+  document.addEventListener('change', function(evt) {
+    var target = evt.target;
+    if (!target) return;
+    if (target.matches && target.matches('[data-exposure-reachability]')) {
+      securityState.reachability = target.value || 'all';
+      applySecurityFilters();
+    } else if (target.matches && target.matches('[data-hide-noise]')) {
+      securityState.hideNoise = !!target.checked;
+      applySecurityFilters();
+    }
+  });
+
+  document.addEventListener('input', function(evt) {
+    var target = evt.target;
+    if (!target || !target.matches) return;
+    if (target.matches('[data-exposure-search]')) {
+      securityState.exposureSearch = target.value || '';
+      applySecurityFilters();
+    }
+  });
+
+  document.addEventListener('click', function(evt) {
+    var target = evt.target && evt.target.closest ? evt.target.closest('[data-event-category]') : null;
+    if (!target) return;
+    securityState.eventCategory = target.getAttribute('data-event-category') || 'all';
+    applySecurityFilters();
+  });
+
+  document.addEventListener('htmx:beforeSwap', function(evt) {
+    var target = evt.detail && evt.detail.target;
+    if (target && target.id === 'security-panel') {
+      pendingFocusSnapshot = captureSecurityState();
+      return;
+    }
     cpuData = [];
     ramData = [];
     gpuData = [];
@@ -205,13 +555,50 @@
     gpuTotal = 0;
   });
 
+  document.addEventListener('htmx:afterSwap', function(evt) {
+    var target = evt.detail && evt.detail.target;
+    if (target && target.id === 'security-panel') {
+      restoreSecurityState(pendingFocusSnapshot);
+      pendingFocusSnapshot = null;
+    }
+    syncSecurityStream();
+  });
+
   document.addEventListener('htmx:afterSettle', function() {
     syncActiveNav();
+    syncSecurityStream();
+  });
+
+  document.addEventListener('htmx:responseError', function(evt) {
+    var xhr = evt.detail && evt.detail.xhr;
+    var path = (evt.detail && evt.detail.requestConfig && evt.detail.requestConfig.path) || '';
+    if (path.indexOf('/security') !== 0) return;
+    var status = xhr ? xhr.status : 0;
+    if (status === 401 || status === 403) {
+      securityAuthStopped = true;
+      closeSecurityStream();
+      announceSecurityStatus('Security action rejected (HTTP ' + status + '). Sign in or reload to continue.', true);
+      return;
+    }
+    var msg = (xhr && xhr.responseText && xhr.responseText.length < 200)
+      ? xhr.responseText
+      : 'Security request failed (HTTP ' + status + ').';
+    announceSecurityStatus(msg, true);
+  });
+
+  document.addEventListener('htmx:sendError', function(evt) {
+    var path = (evt.detail && evt.detail.requestConfig && evt.detail.requestConfig.path) || '';
+    if (path.indexOf('/security') !== 0) return;
+    announceSecurityStatus('Network error while contacting Basho Security.', true);
   });
 
   window.addEventListener('popstate', function() {
     syncActiveNav();
+    syncSecurityStream();
   });
+
+  window.addEventListener('pagehide', closeSecurityStream);
+  window.addEventListener('beforeunload', closeSecurityStream);
 
   document.addEventListener('htmx:sseBeforeMessage', function(evt) {
     evt.preventDefault();

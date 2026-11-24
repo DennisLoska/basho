@@ -1,0 +1,926 @@
+import { expect, test } from "bun:test";
+import { createApp } from "../../src/main";
+import { createDemoSecurityRuntime } from "../../src/security/demo";
+import { createSecurityAuth } from "../../src/security/auth";
+
+const LOCAL_ORIGIN = "http://localhost";
+const LOOPBACK = "127.0.0.1";
+const REMOTE_PEER = "198.51.100.42";
+const TOKEN = "secret-fixture";
+
+type RequestApp = { request(input: string, init?: RequestInit): Promise<Response> };
+type DemoRuntime = ReturnType<typeof createDemoSecurityRuntime>;
+type Auth = ReturnType<typeof createSecurityAuth>;
+type CsrfField = { name: string; value: string };
+
+// ---------------------------------------------------------------------------
+// Request / response helpers
+// ---------------------------------------------------------------------------
+
+function setCookieHeaders(response: Response): string[] {
+  const headers = response.headers as Headers & { getSetCookie?: () => string[] };
+  if (typeof headers.getSetCookie === "function") {
+    const list = headers.getSetCookie();
+    if (list.length > 0) return list;
+  }
+  const raw = response.headers.get("set-cookie");
+  return raw ? [raw] : [];
+}
+
+function cookieHeader(response: Response): string {
+  return setCookieHeaders(response)
+    .map((value) => value.split(";")[0]?.trim() ?? "")
+    .filter((value) => value.length > 0)
+    .join("; ");
+}
+
+function attribute(tag: string, name: string): string | null {
+  const match = new RegExp(`\\b${name}\\s*=\\s*"([^"]*)"`, "i").exec(tag);
+  return match?.[1] ?? null;
+}
+
+function extractCsrf(html: string): CsrfField | null {
+  for (const tag of html.match(/<input\b[^>]*>/gi) ?? []) {
+    const name = attribute(tag, "name");
+    if (!name || !/^(?:_?csrf|csrfToken)$/i.test(name)) continue;
+    const value = attribute(tag, "value");
+    if (value) return { name, value };
+  }
+  return null;
+}
+
+function navTag(html: string, path: string): string | null {
+  for (const tag of html.match(/<a\b[^>]*>/gi) ?? []) {
+    if (tag.includes(`data-nav-path="${path}"`)) return tag;
+  }
+  return null;
+}
+
+function isActiveNav(tag: string | null): boolean {
+  return tag !== null && /\bactive\b/.test(tag);
+}
+
+interface MutationOptions {
+  cookie?: string | null;
+  origin?: string | null;
+  csrf?: CsrfField | null;
+  contentType?: string;
+  htmx?: boolean;
+  headers?: Record<string, string>;
+}
+
+function mutation(
+  body: Record<string, string> | string,
+  options: MutationOptions = {},
+): RequestInit {
+  const csrf = options.csrf ?? null;
+  const encoded =
+    typeof body === "string"
+      ? body
+      : new URLSearchParams({
+          ...body,
+          ...(csrf ? { [csrf.name]: csrf.value } : {}),
+        }).toString();
+  const origin = options.origin === undefined ? LOCAL_ORIGIN : options.origin;
+  const headers: Record<string, string> = {
+    "content-type": options.contentType ?? "application/x-www-form-urlencoded",
+    ...(options.cookie ? { cookie: options.cookie } : {}),
+    ...(origin === null ? {} : { origin }),
+    ...(options.htmx ? { "HX-Request": "true" } : {}),
+    ...(options.headers ?? {}),
+  };
+  return { method: "POST", headers, body: encoded };
+}
+
+type StreamReader = {
+  read(): Promise<{ done: boolean; value?: Uint8Array }>;
+};
+
+async function readText(
+  reader: StreamReader,
+  timeoutMs = 1_000,
+): Promise<string | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  const read = reader
+    .read()
+    .then(({ done, value }) => (done ? "" : new TextDecoder().decode(value)))
+    .catch(() => "");
+  const result = await Promise.race([read, timeout]);
+  if (timer !== undefined) clearTimeout(timer);
+  return result;
+}
+
+async function closesWithin(
+  reader: StreamReader,
+  timeoutMs: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+  });
+  const drained = (async () => {
+    try {
+      while (true) {
+        const { done } = await reader.read();
+        if (done) return true;
+      }
+    } catch {
+      return true;
+    }
+  })();
+  const result = await Promise.race([drained, timeout]);
+  if (timer !== undefined) clearTimeout(timer);
+  return result === true;
+}
+
+async function expectStatus(response: Response, allowed: readonly number[]): Promise<void> {
+  if (!allowed.includes(response.status)) {
+    const text = await response.text();
+    throw new Error(
+      `Expected status ${allowed.join("/")} but received ${response.status}: ${text.slice(0, 200)}`,
+    );
+  }
+}
+
+interface DemoContext {
+  app: RequestApp;
+  runtime: DemoRuntime;
+  auth: Auth;
+}
+
+async function withDemoApp(
+  run: (context: DemoContext) => Promise<void>,
+  config: {
+    token?: string;
+    clock?: { now: () => number };
+    peer?: string;
+    auth?: Auth;
+  } = {},
+): Promise<void> {
+  const runtime = createDemoSecurityRuntime();
+  const auth =
+    config.auth ??
+    createSecurityAuth({
+      ...(config.token ? { token: config.token } : {}),
+      ...(config.clock ? { clock: config.clock } : {}),
+    });
+  const app = createApp({
+    runtime,
+    peer: () => config.peer ?? LOOPBACK,
+    demo: true,
+    auth,
+  });
+  try {
+    await run({ app, runtime, auth });
+  } finally {
+    await runtime.stop();
+  }
+}
+
+async function localSession(
+  app: RequestApp,
+): Promise<{ cookie: string; csrf: CsrfField }> {
+  const page = await app.request(`${LOCAL_ORIGIN}/security`);
+  expect(page.status).toBe(200);
+  const html = await page.text();
+  const csrf = extractCsrf(html);
+  expect(csrf).not.toBeNull();
+  const cookie = cookieHeader(page);
+  expect(cookie.length).toBeGreaterThan(0);
+  return { cookie, csrf: csrf as CsrfField };
+}
+
+// ---------------------------------------------------------------------------
+// Required verbatim Step 1 tests from the plan
+// ---------------------------------------------------------------------------
+
+test("Security uses the existing shell and HTMX partial convention", async () => {
+  const runtime = createDemoSecurityRuntime();
+  const app = createApp({
+    runtime, peer: () => "127.0.0.1", demo: true,
+    auth: createSecurityAuth({ clock: { now: () => Date.now() } }),
+  });
+  try {
+    const full = await (await app.request("http://localhost/security")).text();
+    expect(full).toContain("grid-cols-3");
+    expect(full).toContain("lab-node-01");
+    expect(full).toContain("data-security-stream");
+    const partial = await (await app.request("http://localhost/security", {
+      headers: { "HX-Request": "true" },
+    })).text();
+    expect(partial).toContain('hx-swap-oob="innerHTML"');
+    expect(partial).not.toContain('id="bottom-nav"');
+    expect((await app.request("http://localhost/security/mode", {
+      method: "POST", body: new URLSearchParams({ mode: "monitor" }),
+    })).status).toBe(403);
+  } finally { await runtime.stop(); }
+});
+
+test("Security SSE publishes readiness and removes its subscription on cancellation", async () => {
+  const runtime = createDemoSecurityRuntime();
+  let subscriptions = 0;
+  const subscribe = runtime.subscribe.bind(runtime);
+  runtime.subscribe = (listener) => {
+    subscriptions++;
+    const unsubscribe = subscribe(listener);
+    return () => { subscriptions--; unsubscribe(); };
+  };
+  const app = createApp({
+    runtime, peer: () => "127.0.0.1", demo: true,
+    auth: createSecurityAuth({ clock: { now: () => Date.now() } }),
+  });
+  try {
+    const response = await app.request("http://localhost/sse/security");
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    expect(response.headers.has("access-control-allow-origin")).toBe(false);
+    const reader = response.body!.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain("event: security");
+    await reader.cancel();
+    expect(subscriptions).toBe(0);
+  } finally { await runtime.stop(); }
+});
+
+// ---------------------------------------------------------------------------
+// Navigation, existing tabs, and demo isolation
+// ---------------------------------------------------------------------------
+
+test("Resources and Services keep the three-tab shell with an active tab", async () => {
+  await withDemoApp(async ({ app }) => {
+    const resources = await app.request(`${LOCAL_ORIGIN}/`);
+    expect(resources.status).toBe(200);
+    expect(resources.headers.get("cache-control")).toContain("no-store");
+    const resourcesHtml = await resources.text();
+    expect(resourcesHtml).toContain("grid-cols-3");
+    expect(resourcesHtml).toContain('href="/security"');
+    expect(navTag(resourcesHtml, "/security")).not.toBeNull();
+    expect(isActiveNav(navTag(resourcesHtml, "/"))).toBe(true);
+    expect(isActiveNav(navTag(resourcesHtml, "/services"))).toBe(false);
+
+    const services = await app.request(`${LOCAL_ORIGIN}/services`);
+    expect(services.status).toBe(200);
+    const servicesHtml = await services.text();
+    expect(servicesHtml).toContain("grid-cols-3");
+    expect(isActiveNav(navTag(servicesHtml, "/services"))).toBe(true);
+    expect(isActiveNav(navTag(servicesHtml, "/"))).toBe(false);
+    expect(navTag(servicesHtml, "/security")).not.toBeNull();
+  });
+});
+
+test("demo mode serves fixture Services without probing the host", async () => {
+  await withDemoApp(async ({ app }) => {
+    const response = await app.request(`${LOCAL_ORIGIN}/services`);
+    const html = await response.text();
+    expect(html).toContain("192.0.2.12");
+    expect(html).toContain("ComfyUI");
+    expect(html).toContain("Synthetic image workflow service");
+    expect(html).not.toContain("198.51.100.42");
+  });
+});
+
+test("demo mode streams fixture system stats over SSE", async () => {
+  await withDemoApp(async ({ app }) => {
+    const response = await app.request(`${LOCAL_ORIGIN}/sse/system-stats`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    const reader = response.body!.getReader();
+    try {
+      const chunk = await readText(reader, 2_000);
+      expect(chunk).not.toBeNull();
+      const payload = (chunk ?? "").split("data: ")[1] ?? "";
+      const stats = JSON.parse(payload);
+      expect(stats.type).toBe("system");
+      expect(stats.cpu.count).toBe(8);
+      expect(stats.ram.total).toBe(32);
+      expect(stats.gpu.memoryTotal).toBe(16384);
+    } finally {
+      await reader.cancel();
+    }
+  });
+});
+
+test("Security HTMX partial returns the panel plus out-of-band header and dot", async () => {
+  await withDemoApp(async ({ app }) => {
+    const response = await app.request(`${LOCAL_ORIGIN}/security`, {
+      headers: { "HX-Request": "true" },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    const html = await response.text();
+    expect(html).toContain("lab-node-01");
+    expect(html).toContain('id="header-title"');
+    expect(html).toContain('hx-swap-oob="innerHTML"');
+    expect((html.match(/hx-swap-oob/g) ?? []).length).toBeGreaterThanOrEqual(2);
+    expect(html).not.toContain('id="bottom-nav"');
+  });
+});
+
+test("fragment and status API are uncached and never wildcard-CORS", async () => {
+  await withDemoApp(async ({ app }) => {
+    const fragment = await app.request(`${LOCAL_ORIGIN}/security/fragment`);
+    expect(fragment.status).toBe(200);
+    expect(fragment.headers.get("cache-control")).toContain("no-store");
+    expect(fragment.headers.get("access-control-allow-origin")).toBeNull();
+    const fragmentHtml = await fragment.text();
+    expect(fragmentHtml).toContain("demo-proposal-pending-1");
+    expect(fragmentHtml).not.toContain('id="bottom-nav"');
+
+    const status = await app.request(`${LOCAL_ORIGIN}/api/security/status`);
+    expect(status.status).toBe(200);
+    expect(status.headers.get("content-type")).toContain("application/json");
+    expect(status.headers.get("cache-control")).toContain("no-store");
+    expect(status.headers.get("access-control-allow-origin")).toBeNull();
+    const body = await status.text();
+    expect(body).toContain("lab-node-01");
+    expect(body).not.toMatch(/api[_-]?key|authorization|bearer/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// UI content and escaping
+// ---------------------------------------------------------------------------
+
+test("Security renders the KPIs, controls, containment, exposure, audit, and activity", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const response = await app.request(`${LOCAL_ORIGIN}/security`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    const html = await response.text();
+    const lower = html.toLowerCase();
+
+    for (const kpi of ["posture", "exposure", "updates", "alerts 24h"]) {
+      expect(lower).toContain(kpi);
+    }
+    expect(lower).toContain("breach");
+    expect(lower).toContain("scan now");
+    expect(lower).toContain("test alert");
+    expect(lower).toContain("ready");
+    expect(lower).toMatch(/next (scan|run)/);
+    expect(html).toContain('name="mode"');
+    expect(html).toContain('value="auto-lockdown"');
+    expect(html).toContain("firewall_ufw");
+    expect(lower).toContain("protected");
+    expect(lower).toContain("helper");
+    expect(html).toMatch(/role="status"|aria-live/);
+    expect(html).toContain("sticky");
+    expect(html).toContain("demo-alert-breach-1");
+    expect(html).toContain("/security/alerts/demo-alert-breach-1/dismiss");
+
+    expect(html).toContain("demo-proposal-pending-1");
+    expect(html).toContain('name="revision"');
+    expect(html).toContain("/security/proposals/demo-proposal-pending-1/approve");
+    expect(html).toContain("/security/proposals/demo-proposal-pending-1/reject");
+    expect(html).toMatch(/\bev:[a-z0-9-]+/i);
+    expect(html).toMatch(/evidence/i);
+
+    const action = runtime.view().actions.find((entry) => entry.state === "active");
+    expect(action).toBeDefined();
+    expect(html).toContain(`/security/actions/${action?.id}/unlock`);
+
+    expect(lower).toContain("reachability");
+    expect(html).toMatch(/type="search"|name="search"|name="q"/);
+    expect(html).toContain("firewall");
+    expect(html).toContain("<svg");
+    expect(html).toMatch(/24h/i);
+    expect(html).toContain("<details");
+    expect(lower).toContain("investigation trail");
+    expect(lower).toContain("hide noise");
+    expect(lower).toContain("benign multicast");
+    expect(html).toContain("data-security-stream");
+  });
+});
+
+test("Security escapes hostile fixture text instead of rendering markup", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const script = "<script>alert(1)</script>";
+    const image = '"><img src=x onerror=alert(1)>';
+    const baseView = runtime.view.bind(runtime);
+    runtime.view = () => {
+      const view = baseView();
+      const alert = view.alerts[0];
+      const event = view.events[0];
+      return {
+        ...view,
+        hostLabel: script,
+        alerts: alert ? [{ ...alert, summary: `${script} ${image}` }, ...view.alerts.slice(1)] : view.alerts,
+        events: event ? [{ ...event, summary: `${image} ${script}` }, ...view.events.slice(1)] : view.events,
+      };
+    };
+
+    const response = await app.request(`${LOCAL_ORIGIN}/security`);
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).not.toContain(script);
+    expect(html).not.toContain("<img src=x onerror=alert(1)>");
+    expect(html).toContain("&lt;script&gt;");
+    expect(html).toContain("&lt;img");
+    expect(html).toContain("&quot;");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Auth, login, CSRF, origin, content type, size, duplicate fields
+// ---------------------------------------------------------------------------
+
+test("token auth redirects anonymous page reads and rejects anonymous API and SSE", async () => {
+  await withDemoApp(
+    async ({ app, runtime }) => {
+      const page = await app.request(`${LOCAL_ORIGIN}/security`);
+      await expectStatus(page, [302, 303]);
+      expect(page.headers.get("location") ?? "").toContain("/security/login");
+      expect(page.headers.get("cache-control")).toContain("no-store");
+
+      const api = await app.request(`${LOCAL_ORIGIN}/api/security/status`);
+      await expectStatus(api, [401, 403]);
+      expect(api.headers.get("cache-control")).toContain("no-store");
+      expect(api.headers.get("access-control-allow-origin")).toBeNull();
+
+      let subscriptions = 0;
+      const subscribe = runtime.subscribe.bind(runtime);
+      runtime.subscribe = (listener) => {
+        subscriptions++;
+        const unsubscribe = subscribe(listener);
+        return () => {
+          subscriptions--;
+          unsubscribe();
+        };
+      };
+      const sse = await app.request(`${LOCAL_ORIGIN}/sse/security`);
+      await expectStatus(sse, [401, 403]);
+      expect(sse.headers.get("cache-control")).toContain("no-store");
+      expect(subscriptions).toBe(0);
+    },
+    { token: TOKEN },
+  );
+});
+
+test("login page renders and login rejects wrong origin and wrong token", async () => {
+  await withDemoApp(
+    async ({ app }) => {
+      const page = await app.request(`${LOCAL_ORIGIN}/security/login`);
+      expect(page.status).toBe(200);
+      expect(page.headers.get("cache-control")).toContain("no-store");
+      const html = await page.text();
+      expect(html).toContain('name="token"');
+      expect(html.toLowerCase()).toContain("password");
+
+      const badOrigin = await app.request(
+        `${LOCAL_ORIGIN}/security/login`,
+        mutation({ token: TOKEN }, { origin: "http://evil.example" }),
+      );
+      await expectStatus(badOrigin, [403]);
+
+      const badToken = await app.request(
+        `${LOCAL_ORIGIN}/security/login`,
+        mutation({ token: "wrong-token" }),
+      );
+      await expectStatus(badToken, [401, 403]);
+      expect(badToken.headers.get("cache-control")).toContain("no-store");
+      expect(cookieHeader(badToken)).not.toContain("basho_session=");
+    },
+    { token: TOKEN },
+  );
+});
+
+test("login issues an HttpOnly session accepted by page, API, SSE, and mutations", async () => {
+  await withDemoApp(
+    async ({ app, runtime }) => {
+      const login = await app.request(
+        `${LOCAL_ORIGIN}/security/login`,
+        mutation({ token: TOKEN }),
+      );
+      expect(login.status).toBe(303);
+      expect(login.headers.get("location") ?? "").toContain("/security");
+      expect(login.headers.get("cache-control")).toContain("no-store");
+      const setCookies = setCookieHeaders(login);
+      const session = setCookies.find((value) => value.includes("basho_session=")) ?? "";
+      expect(session).toContain("HttpOnly");
+      expect(session).toContain("SameSite=Lax");
+      expect(session).toContain("Path=/");
+      const cookie = cookieHeader(login);
+      expect(cookie).toContain("basho_session=");
+
+      const page = await app.request(`${LOCAL_ORIGIN}/security`, { headers: { cookie } });
+      expect(page.status).toBe(200);
+      const html = await page.text();
+      const csrf = extractCsrf(html);
+      expect(csrf).not.toBeNull();
+
+      const api = await app.request(`${LOCAL_ORIGIN}/api/security/status`, {
+        headers: { cookie },
+      });
+      expect(api.status).toBe(200);
+
+      const sse = await app.request(`${LOCAL_ORIGIN}/sse/security`, { headers: { cookie } });
+      expect(sse.status).toBe(200);
+      expect(sse.headers.get("content-type")).toContain("text/event-stream");
+      const reader = sse.body!.getReader();
+      expect((await readText(reader)) ?? "").toContain("event: security");
+      await reader.cancel();
+
+      const mutate = await app.request(
+        `${LOCAL_ORIGIN}/security/mode`,
+        mutation({ mode: "auto-lockdown" }, { cookie, csrf }),
+      );
+      expect(mutate.status).toBe(303);
+      expect(runtime.view().settings.mode).toBe("auto-lockdown");
+    },
+    { token: TOKEN },
+  );
+});
+
+test("bearer clients read and mutate without CSRF but cannot smuggle a foreign origin", async () => {
+  await withDemoApp(
+    async ({ app, runtime }) => {
+      const authHeader = { authorization: `Bearer ${TOKEN}` };
+
+      const api = await app.request(`${LOCAL_ORIGIN}/api/security/status`, {
+        headers: authHeader,
+      });
+      expect(api.status).toBe(200);
+
+      const originless = await app.request(
+        `${LOCAL_ORIGIN}/security/mode`,
+        mutation({ mode: "monitor" }, { origin: null, headers: authHeader }),
+      );
+      expect(originless.status).toBe(303);
+      expect(runtime.view().settings.mode).toBe("monitor");
+
+      const conflicting = await app.request(
+        `${LOCAL_ORIGIN}/security/mode`,
+        mutation({ mode: "approve" }, { origin: "http://evil.example", headers: authHeader }),
+      );
+      await expectStatus(conflicting, [403]);
+      expect(runtime.view().settings.mode).toBe("monitor");
+
+      const sameOrigin = await app.request(
+        `${LOCAL_ORIGIN}/security/mode`,
+        mutation({ mode: "approve" }, { headers: authHeader }),
+      );
+      expect(sameOrigin.status).toBe(303);
+      expect(runtime.view().settings.mode).toBe("approve");
+    },
+    { token: TOKEN },
+  );
+});
+
+test("local rendered form supplies the cookie and CSRF token used by mutations", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const { cookie, csrf } = await localSession(app);
+
+    const response = await app.request(
+      `${LOCAL_ORIGIN}/security/mode`,
+      mutation({ mode: "auto-lockdown" }, { cookie, csrf }),
+    );
+    expect(response.status).toBe(303);
+    expect(runtime.view().settings.mode).toBe("auto-lockdown");
+  });
+});
+
+test("local mutations reject missing CSRF, foreign origin, and remote peers", async () => {
+  const runtime = createDemoSecurityRuntime();
+  const auth = createSecurityAuth({ clock: { now: () => Date.now() } });
+  const localApp = createApp({ runtime, peer: () => LOOPBACK, demo: true, auth });
+  const remoteApp = createApp({ runtime, peer: () => REMOTE_PEER, demo: true, auth });
+  try {
+    const page = await localApp.request(`${LOCAL_ORIGIN}/security`);
+    const csrf = extractCsrf(await page.text());
+    expect(csrf).not.toBeNull();
+    const cookie = cookieHeader(page);
+    expect(cookie.length).toBeGreaterThan(0);
+
+    const missingCsrf = await localApp.request(
+      `${LOCAL_ORIGIN}/security/mode`,
+      mutation({ mode: "approve" }, { cookie, csrf: null }),
+    );
+    await expectStatus(missingCsrf, [403]);
+
+    const foreignOrigin = await localApp.request(
+      `${LOCAL_ORIGIN}/security/mode`,
+      mutation({ mode: "approve" }, { cookie, csrf, origin: "http://evil.example" }),
+    );
+    await expectStatus(foreignOrigin, [403]);
+
+    const remote = await remoteApp.request(
+      `${LOCAL_ORIGIN}/security/mode`,
+      mutation({ mode: "approve" }, { cookie, csrf }),
+    );
+    await expectStatus(remote, [403]);
+    expect(runtime.view().settings.mode).toBe("approve");
+  } finally {
+    await runtime.stop();
+  }
+});
+
+test("mutations reject malformed content type, oversized bodies, and duplicate fields", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const { cookie, csrf } = await localSession(app);
+
+    const json = await app.request(
+      `${LOCAL_ORIGIN}/security/mode`,
+      mutation(JSON.stringify({ mode: "monitor" }), {
+        contentType: "application/json",
+        cookie,
+      }),
+    );
+    await expectStatus(json, [400, 415]);
+
+    const oversized = await app.request(
+      `${LOCAL_ORIGIN}/security/mode`,
+      mutation(`mode=monitor&${csrf.name}=${csrf.value}&pad=${"x".repeat(70 * 1024)}`, {
+        cookie,
+      }),
+    );
+    await expectStatus(oversized, [400, 413]);
+
+    const duplicate = await app.request(
+      `${LOCAL_ORIGIN}/security/mode`,
+      mutation(`mode=monitor&mode=approve&${csrf.name}=${csrf.value}`, { cookie }),
+    );
+    expect(duplicate.status).toBe(400);
+
+    const empty = await app.request(
+      `${LOCAL_ORIGIN}/security/mode`,
+      mutation("", { cookie }),
+    );
+    await expectStatus(empty, [400, 403]);
+    expect(runtime.view().settings.mode).toBe("approve");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mutation routes
+// ---------------------------------------------------------------------------
+
+test("scan queues on form and HTMX requests and mode rejects unknown values", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const { cookie, csrf } = await localSession(app);
+
+    const htmxScan = await app.request(
+      `${LOCAL_ORIGIN}/security/scan`,
+      mutation({}, { cookie, csrf, htmx: true }),
+    );
+    expect(htmxScan.status).toBe(200);
+
+    const formScan = await app.request(
+      `${LOCAL_ORIGIN}/security/scan`,
+      mutation({}, { cookie, csrf }),
+    );
+    expect(formScan.status).toBe(303);
+
+    const validMode = await app.request(
+      `${LOCAL_ORIGIN}/security/mode`,
+      mutation({ mode: "monitor" }, { cookie, csrf }),
+    );
+    expect(validMode.status).toBe(303);
+    expect(runtime.view().settings.mode).toBe("monitor");
+
+    const invalidMode = await app.request(
+      `${LOCAL_ORIGIN}/security/mode`,
+      mutation({ mode: "bogus-mode" }, { cookie, csrf }),
+    );
+    expect(invalidMode.status).toBe(400);
+    expect(runtime.view().settings.mode).toBe("monitor");
+  });
+});
+
+test("settings updates the interval and criteria and rejects invalid fields", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const { cookie, csrf } = await localSession(app);
+
+    const interval = await app.request(
+      `${LOCAL_ORIGIN}/security/settings`,
+      mutation({ scanIntervalMinutes: "15" }, { cookie, csrf }),
+    );
+    expect(interval.status).toBe(303);
+    expect(runtime.view().settings.scanIntervalMinutes).toBe(15);
+
+    for (const invalid of ["0", "-4", "1441", "abc"]) {
+      const response = await app.request(
+        `${LOCAL_ORIGIN}/security/settings`,
+        mutation({ scanIntervalMinutes: invalid }, { cookie, csrf }),
+      );
+      expect(response.status).toBe(400);
+    }
+
+    const criteria = await app.request(
+      `${LOCAL_ORIGIN}/security/settings`,
+      mutation({ "criteria.firewall_ufw": "off" }, { cookie, csrf }),
+    );
+    expect(criteria.status).toBe(303);
+    expect(runtime.view().settings.criteria.firewall_ufw).toBe(false);
+
+    const unknown = await app.request(
+      `${LOCAL_ORIGIN}/security/settings`,
+      mutation({ "criteria.not_a_real_criterion": "on" }, { cookie, csrf }),
+    );
+    expect(unknown.status).toBe(400);
+  });
+});
+
+test("proposal approval requires a positive revision and conflicts when stale", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const { cookie, csrf } = await localSession(app);
+    const pending = runtime
+      .view()
+      .proposals.find((proposal) => proposal.status === "pending" && proposal.revision === 1);
+    expect(pending).toBeDefined();
+    const id = pending?.id as string;
+
+    for (const revision of ["0", "-1", "abc"]) {
+      const malformed = await app.request(
+        `${LOCAL_ORIGIN}/security/proposals/${id}/approve`,
+        mutation({ revision }, { cookie, csrf }),
+      );
+      expect(malformed.status).toBe(400);
+    }
+
+    const approved = await app.request(
+      `${LOCAL_ORIGIN}/security/proposals/${id}/approve`,
+      mutation({ revision: "1" }, { cookie, csrf }),
+    );
+    expect(approved.status).toBe(303);
+    const after = runtime.view();
+    expect(after.proposals.find((proposal) => proposal.id === id)?.status).not.toBe("pending");
+    expect(after.actions.some((action) => action.proposalId === id)).toBe(true);
+
+    const stale = await app.request(
+      `${LOCAL_ORIGIN}/security/proposals/${id}/approve`,
+      mutation({ revision: "1" }, { cookie, csrf }),
+    );
+    expect(stale.status).toBe(409);
+
+    const unknown = await app.request(
+      `${LOCAL_ORIGIN}/security/proposals/does-not-exist/approve`,
+      mutation({ revision: "1" }, { cookie, csrf }),
+    );
+    expect(unknown.status).toBe(409);
+  });
+});
+
+test("proposal rejection transitions the proposal and rejects unknown revisions", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const { cookie, csrf } = await localSession(app);
+    const pending = runtime
+      .view()
+      .proposals.find((proposal) => proposal.status === "pending" && proposal.revision === 1);
+    expect(pending).toBeDefined();
+    const id = pending?.id as string;
+
+    const missingRevision = await app.request(
+      `${LOCAL_ORIGIN}/security/proposals/${id}/reject`,
+      mutation({}, { cookie, csrf }),
+    );
+    expect(missingRevision.status).toBe(400);
+
+    const rejected = await app.request(
+      `${LOCAL_ORIGIN}/security/proposals/${id}/reject`,
+      mutation({ revision: "1" }, { cookie, csrf }),
+    );
+    expect(rejected.status).toBe(303);
+    expect(runtime.view().proposals.find((proposal) => proposal.id === id)?.status).toBe(
+      "rejected",
+    );
+
+    const stale = await app.request(
+      `${LOCAL_ORIGIN}/security/proposals/${id}/reject`,
+      mutation({ revision: "1" }, { cookie, csrf }),
+    );
+    expect(stale.status).toBe(409);
+  });
+});
+
+test("unlock rolls back idempotently and dismiss removes the alert", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const { cookie, csrf } = await localSession(app);
+    const action = runtime.view().actions.find((entry) => entry.state === "active");
+    expect(action).toBeDefined();
+    const actionId = action?.id as string;
+
+    const htmxUnlock = await app.request(
+      `${LOCAL_ORIGIN}/security/actions/${actionId}/unlock`,
+      mutation({}, { cookie, csrf, htmx: true }),
+    );
+    expect(htmxUnlock.status).toBe(200);
+    expect(runtime.view().actions.find((entry) => entry.id === actionId)?.state).toBe(
+      "rolled_back",
+    );
+
+    const formUnlock = await app.request(
+      `${LOCAL_ORIGIN}/security/actions/${actionId}/unlock`,
+      mutation({}, { cookie, csrf }),
+    );
+    expect(formUnlock.status).toBe(303);
+    expect(runtime.view().actions.find((entry) => entry.id === actionId)?.state).toBe(
+      "rolled_back",
+    );
+
+    const alert = runtime.view().alerts[0];
+    expect(alert).toBeDefined();
+    const alertId = alert?.id as string;
+
+    const dismissed = await app.request(
+      `${LOCAL_ORIGIN}/security/alerts/${alertId}/dismiss`,
+      mutation({}, { cookie, csrf }),
+    );
+    expect(dismissed.status).toBe(303);
+    expect(runtime.view().alerts.some((entry) => entry.id === alertId)).toBe(false);
+  });
+});
+
+test("test alert queues an eligible channel and rejects an ineligible one", async () => {
+  await withDemoApp(async ({ app }) => {
+    const { cookie, csrf } = await localSession(app);
+
+    const delivered = await app.request(
+      `${LOCAL_ORIGIN}/security/test-alert`,
+      mutation({ channel: "in-app" }, { cookie, csrf }),
+    );
+    expect(delivered.status).toBe(303);
+    const deliveredText = await delivered.text();
+    expect(deliveredText).not.toContain(TOKEN);
+
+    const ineligible = await app.request(
+      `${LOCAL_ORIGIN}/security/test-alert`,
+      mutation({ channel: "pager" }, { cookie, csrf }),
+    );
+    expect(ineligible.status).toBe(400);
+    const ineligibleText = await ineligible.text();
+    expect(ineligibleText).not.toContain(TOKEN);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SSE live updates and lifecycle
+// ---------------------------------------------------------------------------
+
+test("SSE publishes runtime updates to an open security client", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const response = await app.request(`${LOCAL_ORIGIN}/sse/security`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    expect(response.headers.get("access-control-allow-origin")).toBeNull();
+    const reader = response.body!.getReader();
+    try {
+      expect((await readText(reader, 2_000)) ?? "").toContain("event: security");
+
+      runtime.updateSettings({ scanIntervalMinutes: 45 });
+      const update = await readText(reader, 2_000);
+      expect(update ?? "").toContain("event: security");
+      expect(update ?? "").toContain('"kind":"settings"');
+    } finally {
+      await reader.cancel();
+    }
+  });
+});
+
+test("SSE closes and unsubscribes when the authenticated session expires", async () => {
+  let now = 1_800_000_000_000;
+  const clock = { now: () => now };
+  const auth = createSecurityAuth({ token: TOKEN, clock, sessionTtlMs: 5 * 60 * 1_000 });
+
+  await withDemoApp(
+    async ({ app, runtime }) => {
+      const login = await app.request(
+        `${LOCAL_ORIGIN}/security/login`,
+        mutation({ token: TOKEN }),
+      );
+      expect(login.status).toBe(303);
+      const cookie = cookieHeader(login);
+      expect(cookie).toContain("basho_session=");
+
+      let subscriptions = 0;
+      const subscribe = runtime.subscribe.bind(runtime);
+      runtime.subscribe = (listener) => {
+        subscriptions++;
+        const unsubscribe = subscribe(listener);
+        return () => {
+          subscriptions--;
+          unsubscribe();
+        };
+      };
+
+      const response = await app.request(`${LOCAL_ORIGIN}/sse/security`, {
+        headers: { cookie },
+      });
+      expect(response.status).toBe(200);
+      const reader = response.body!.getReader();
+      try {
+        expect((await readText(reader, 2_000)) ?? "").toContain("event: security");
+        expect(subscriptions).toBe(1);
+
+        now += 10 * 60 * 1_000;
+        runtime.updateSettings({ scanIntervalMinutes: 30 });
+
+        const closed = await closesWithin(reader, 2_000);
+        expect(closed).toBe(true);
+        expect(subscriptions).toBe(0);
+      } finally {
+        await reader.cancel();
+      }
+    },
+    { auth },
+  );
+});
