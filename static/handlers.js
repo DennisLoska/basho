@@ -14,6 +14,15 @@
   var securityRefreshInFlight = false;
   var securityRefreshQueued = false;
   var securityAuthStopped = false;
+  var securityReconnectTimer = null;
+  var securityReconnectAttempt = 0;
+  var SECURITY_RECONNECT_BASE_MS = 1000;
+  var SECURITY_RECONNECT_MAX_MS = 30000;
+  var securityCountdownInterval = null;
+  var securityFlashState = null;
+  var SECURITY_FLASH_TTL_MS = 4000;
+  var DIRTY_CONTROL_SELECTOR = '#security-mode-select, #scan-interval-input, [name^="criteria."], #security-test-channel';
+  var securityDirtyControls = {};
   var securityState = {
     reachability: 'all',
     exposureSearch: '',
@@ -72,10 +81,113 @@
   function announceSecurityStatus(message, isError) {
     var el = document.getElementById('security-status-announcer');
     if (!el) return;
-    el.textContent = message;
-    el.className = isError
+    var cls = isError
       ? 'oc-panel px-3.5 py-2.5 font-mono text-xs flex items-center justify-between gap-2 border-error/45 bg-error/10 text-error'
       : 'oc-panel px-3.5 py-2.5 font-mono text-xs flex items-center justify-between gap-2 border-info/45 bg-info/10 text-info';
+    el.textContent = message;
+    el.className = cls;
+    if (message && message.trim()) {
+      securityFlashState = {
+        text: message.trim(),
+        className: cls,
+        expiresAt: Date.now() + SECURITY_FLASH_TTL_MS,
+      };
+    }
+  }
+
+  function recordVisibleFlashFromPanel(panel) {
+    if (!panel) return;
+    var el = panel.querySelector('#security-status-announcer');
+    if (!el) return;
+    var text = (el.textContent || '').trim();
+    if (text && el.className.indexOf('sr-only') === -1) {
+      securityFlashState = {
+        text: text,
+        className: el.className,
+        expiresAt: Date.now() + SECURITY_FLASH_TTL_MS,
+      };
+    }
+  }
+
+  function controlDirtyKey(el) {
+    return (el && (el.id || el.getAttribute('name'))) || '';
+  }
+
+  function markControlDirty(el) {
+    if (!el || !el.matches || !el.matches(DIRTY_CONTROL_SELECTOR)) return;
+    var key = controlDirtyKey(el);
+    if (!key) return;
+    securityDirtyControls[key] = {
+      id: el.id || null,
+      name: el.getAttribute('name') || null,
+      value: el.value,
+    };
+  }
+
+  function clearFormDirtyControls(form) {
+    if (!form) {
+      securityDirtyControls = {};
+      return;
+    }
+    var controls = form.querySelectorAll(DIRTY_CONTROL_SELECTOR);
+    for (var i = 0; i < controls.length; i++) {
+      var key = controlDirtyKey(controls[i]);
+      if (key) delete securityDirtyControls[key];
+    }
+  }
+
+  function formatCountdownDuration(deltaMs) {
+    if (!isFinite(deltaMs) || deltaMs <= 0) return 'due now';
+    var totalSec = Math.ceil(deltaMs / 1000);
+    var hours = Math.floor(totalSec / 3600);
+    var mins = Math.floor((totalSec % 3600) / 60);
+    var secs = totalSec % 60;
+    if (hours > 0) return hours + 'h ' + mins + 'm';
+    if (mins > 0) return mins + 'm ' + secs + 's';
+    return secs + 's';
+  }
+
+  function stopSecurityCountdown() {
+    if (securityCountdownInterval !== null) {
+      clearInterval(securityCountdownInterval);
+      securityCountdownInterval = null;
+    }
+  }
+
+  function updateSecurityNextScanCountdown() {
+    var panel = document.getElementById('security-panel');
+    if (!panel) {
+      stopSecurityCountdown();
+      return;
+    }
+    var el = panel.querySelector('[data-next-scan-at]');
+    if (!el) return;
+    if (el.getAttribute('data-scan-running') === 'true') {
+      el.textContent = 'Scan running...';
+      return;
+    }
+    var raw = el.getAttribute('data-next-scan-at');
+    if (!raw) {
+      el.textContent = 'Next scan: paused';
+      return;
+    }
+    var targetMs = Number(raw);
+    if (!isFinite(targetMs) || targetMs <= 0) {
+      el.textContent = 'Next scan: paused';
+      return;
+    }
+    el.textContent = 'Next scan: ' + formatCountdownDuration(targetMs - Date.now());
+  }
+
+  function startSecurityCountdown() {
+    if (!document.getElementById('security-panel')) {
+      stopSecurityCountdown();
+      return;
+    }
+    updateSecurityNextScanCountdown();
+    if (securityCountdownInterval === null) {
+      securityCountdownInterval = setInterval(updateSecurityNextScanCountdown, 1000);
+    }
   }
 
   function captureSecurityState() {
@@ -156,9 +268,10 @@
     }
   }
 
-  function restoreSecurityState(focusInfo) {
+  function restoreSecurityState(focusInfo, options) {
     var panel = document.getElementById('security-panel');
     if (!panel) return;
+    var preserveFlash = !!(options && options.preserveFlash);
 
     var reachEl = panel.querySelector('[data-exposure-reachability]');
     if (reachEl) reachEl.value = securityState.reachability || 'all';
@@ -177,7 +290,39 @@
       }
     }
 
+    var dirtyKeys = Object.keys(securityDirtyControls);
+    for (var d = 0; d < dirtyKeys.length; d++) {
+      var dirty = securityDirtyControls[dirtyKeys[d]];
+      if (!dirty) continue;
+      var ctrl = dirty.id ? document.getElementById(dirty.id) : null;
+      if (!ctrl && dirty.name) {
+        var named = panel.querySelectorAll('[name]');
+        for (var n = 0; n < named.length; n++) {
+          if (named[n].getAttribute('name') === dirty.name) {
+            ctrl = named[n];
+            break;
+          }
+        }
+      }
+      if (ctrl && panel.contains(ctrl)) {
+        ctrl.value = dirty.value;
+      }
+    }
+
+    if (preserveFlash && securityFlashState) {
+      if (Date.now() < securityFlashState.expiresAt) {
+        var announcer = panel.querySelector('#security-status-announcer');
+        if (announcer && !(announcer.textContent || '').trim()) {
+          announcer.textContent = securityFlashState.text;
+          announcer.className = securityFlashState.className;
+        }
+      } else {
+        securityFlashState = null;
+      }
+    }
+
     applySecurityFilters();
+    updateSecurityNextScanCountdown();
 
     if (focusInfo) {
       var target = null;
@@ -213,6 +358,10 @@
       clearTimeout(securityRefreshTimer);
       securityRefreshTimer = null;
     }
+    if (securityReconnectTimer !== null) {
+      clearTimeout(securityReconnectTimer);
+      securityReconnectTimer = null;
+    }
     securityRefreshQueued = false;
     if (securityEventSource) {
       try {
@@ -220,6 +369,22 @@
       } catch (e) {}
       securityEventSource = null;
     }
+  }
+
+  function scheduleSecurityReconnect() {
+    if (securityAuthStopped || !document.querySelector('[data-security-stream]')) {
+      return;
+    }
+    if (securityReconnectTimer !== null) return;
+    var delay = Math.min(
+      SECURITY_RECONNECT_MAX_MS,
+      SECURITY_RECONNECT_BASE_MS * Math.pow(2, securityReconnectAttempt),
+    );
+    securityReconnectAttempt = Math.min(securityReconnectAttempt + 1, 10);
+    securityReconnectTimer = setTimeout(function() {
+      securityReconnectTimer = null;
+      syncSecurityStream();
+    }, delay);
   }
 
   function refreshSecurityFragment() {
@@ -289,7 +454,7 @@
           }
         }
 
-        restoreSecurityState(focusInfo);
+        restoreSecurityState(focusInfo, { preserveFlash: true });
       })
       .catch(function() {
         announceSecurityStatus('Unable to reach Basho Security service for live update.', true);
@@ -317,11 +482,16 @@
     var host = document.querySelector('[data-security-stream]');
     if (!host) {
       closeSecurityStream();
+      stopSecurityCountdown();
       securityAuthStopped = false;
+      securityReconnectAttempt = 0;
+      securityFlashState = null;
+      securityDirtyControls = {};
       return;
     }
 
     applySecurityFilters();
+    startSecurityCountdown();
 
     if (securityAuthStopped) return;
     if (securityEventSource && securityEventSource.readyState !== 2) {
@@ -333,13 +503,22 @@
       var es = new EventSource(streamUrl);
       securityEventSource = es;
 
+      es.addEventListener('open', function() {
+        if (securityEventSource !== es) return;
+        securityReconnectAttempt = 0;
+      });
+
       es.addEventListener('security', function() {
+        if (securityEventSource !== es) return;
+        securityReconnectAttempt = 0;
         scheduleSecurityRefresh();
       });
 
       es.addEventListener('error', function() {
+        if (securityEventSource !== es) return;
         if (!document.querySelector('[data-security-stream]')) {
           closeSecurityStream();
+          stopSecurityCountdown();
           return;
         }
         if (es.readyState === 2) {
@@ -360,10 +539,19 @@
               ) {
                 securityAuthStopped = true;
                 announceSecurityStatus('Security session expired. Sign in again to resume live updates.', true);
+                return;
               }
+              if (res.status === 200) {
+                announceSecurityStatus('Security live stream interrupted. Reconnecting...', true);
+                scheduleSecurityReconnect();
+                return;
+              }
+              announceSecurityStatus('Security live stream disconnected (HTTP ' + res.status + '). Reconnecting...', true);
+              scheduleSecurityReconnect();
             })
             .catch(function() {
-              announceSecurityStatus('Security live stream disconnected.', true);
+              announceSecurityStatus('Security live stream disconnected. Reconnecting...', true);
+              scheduleSecurityReconnect();
             });
         }
       });
@@ -521,6 +709,8 @@
     } else if (target.matches && target.matches('[data-hide-noise]')) {
       securityState.hideNoise = !!target.checked;
       applySecurityFilters();
+    } else if (target.matches && target.matches(DIRTY_CONTROL_SELECTOR)) {
+      markControlDirty(target);
     }
   });
 
@@ -530,6 +720,15 @@
     if (target.matches('[data-exposure-search]')) {
       securityState.exposureSearch = target.value || '';
       applySecurityFilters();
+    } else if (target.matches(DIRTY_CONTROL_SELECTOR)) {
+      markControlDirty(target);
+    }
+  });
+
+  document.addEventListener('submit', function(evt) {
+    var form = evt.target;
+    if (form && form.closest && form.closest('#security-panel')) {
+      clearFormDirtyControls(form);
     }
   });
 
@@ -540,8 +739,37 @@
     applySecurityFilters();
   });
 
+  document.addEventListener('htmx:beforeRequest', function(evt) {
+    var detail = evt.detail || {};
+    var path = (detail.requestConfig && detail.requestConfig.path) || '';
+    var verb = (detail.requestConfig && detail.requestConfig.verb) || '';
+    if (path.indexOf('/security/') === 0 && verb.toLowerCase() === 'post') {
+      var form = detail.elt && detail.elt.closest ? detail.elt.closest('form') : null;
+      if (form) clearFormDirtyControls(form);
+    }
+  });
+
   document.addEventListener('htmx:beforeSwap', function(evt) {
-    var target = evt.detail && evt.detail.target;
+    var detail = evt.detail || {};
+    var xhr = detail.xhr;
+    var reqPath = (detail.requestConfig && detail.requestConfig.path)
+      || (detail.pathInfo && detail.pathInfo.requestPath)
+      || '';
+    if (
+      xhr &&
+      (xhr.status === 400 || xhr.status === 404 || xhr.status === 409) &&
+      (reqPath.indexOf('/security/') === 0 || reqPath === '/security')
+    ) {
+      var body = typeof detail.serverResponse === 'string'
+        ? detail.serverResponse
+        : (xhr.responseText || '');
+      if (body.indexOf('id="security-panel"') !== -1) {
+        detail.shouldSwap = true;
+        detail.isError = false;
+      }
+    }
+
+    var target = detail.target;
     if (target && target.id === 'security-panel') {
       pendingFocusSnapshot = captureSecurityState();
       return;
@@ -556,12 +784,25 @@
   });
 
   document.addEventListener('htmx:afterSwap', function(evt) {
-    var target = evt.detail && evt.detail.target;
-    if (target && target.id === 'security-panel') {
-      restoreSecurityState(pendingFocusSnapshot);
+    var detail = evt.detail || {};
+    var target = detail.target;
+    var panel = document.getElementById('security-panel');
+    if ((target && target.id === 'security-panel') || (panel && detail.elt && detail.elt.id === 'security-panel')) {
+      recordVisibleFlashFromPanel(panel);
+      restoreSecurityState(pendingFocusSnapshot, { preserveFlash: false });
       pendingFocusSnapshot = null;
     }
     syncSecurityStream();
+  });
+
+  document.addEventListener('htmx:afterRequest', function(evt) {
+    var detail = evt.detail || {};
+    var path = (detail.requestConfig && detail.requestConfig.path) || '';
+    var verb = (detail.requestConfig && detail.requestConfig.verb) || '';
+    if (detail.successful && path.indexOf('/security/') === 0 && verb.toLowerCase() === 'post') {
+      var form = detail.elt && detail.elt.closest ? detail.elt.closest('form') : null;
+      if (form) clearFormDirtyControls(form);
+    }
   });
 
   document.addEventListener('htmx:afterSettle', function() {
@@ -597,8 +838,13 @@
     syncSecurityStream();
   });
 
-  window.addEventListener('pagehide', closeSecurityStream);
-  window.addEventListener('beforeunload', closeSecurityStream);
+  function teardownSecurityPage() {
+    closeSecurityStream();
+    stopSecurityCountdown();
+  }
+
+  window.addEventListener('pagehide', teardownSecurityPage);
+  window.addEventListener('beforeunload', teardownSecurityPage);
 
   document.addEventListener('htmx:sseBeforeMessage', function(evt) {
     evt.preventDefault();

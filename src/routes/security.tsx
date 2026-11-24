@@ -20,6 +20,9 @@ import { deriveSecurityDot, renderPage } from "./pages";
 
 const MAX_FORM_BYTES = 16 * 1024;
 const MAX_FORM_FIELDS = 64;
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_WINDOW_MS = 5 * 60 * 1_000;
+const LOGIN_TRACKER_MAX_PEERS = 512;
 
 const MODE_SET = new Set<string>(lockdownModes);
 const CRITERION_SET = new Set<string>(criterionIds);
@@ -199,10 +202,55 @@ function parseBooleanChoice(raw: string): boolean | null {
 export function createSecurityRouter(options: SecurityRouterOptions): Hono {
   const { runtime, auth, peer, publicOrigin } = options;
   const app = new Hono();
+  const loginFailures = new Map<string, { count: number; resetAt: number }>();
+
+  const nowMs = (): number => (typeof auth.now === "function" ? auth.now() : Date.now());
+
+  const normalizePeerKey = (rawPeer: string | null | undefined): string => {
+    const trimmed = typeof rawPeer === "string" ? rawPeer.trim() : "";
+    return trimmed.length > 0 ? trimmed : "unknown";
+  };
+
+  const getActiveLoginFailure = (
+    key: string,
+    now: number,
+  ): { count: number; resetAt: number } | undefined => {
+    const entry = loginFailures.get(key);
+    if (!entry) return undefined;
+    if (now >= entry.resetAt) {
+      loginFailures.delete(key);
+      return undefined;
+    }
+    return entry;
+  };
+
+  const recordLoginFailure = (key: string, now: number): void => {
+    const existing = getActiveLoginFailure(key, now);
+    if (existing) {
+      loginFailures.delete(key);
+      loginFailures.set(key, { count: existing.count + 1, resetAt: existing.resetAt });
+      return;
+    }
+
+    if (loginFailures.size >= LOGIN_TRACKER_MAX_PEERS) {
+      for (const [k, entry] of loginFailures) {
+        if (now >= entry.resetAt) {
+          loginFailures.delete(k);
+        }
+      }
+      while (loginFailures.size >= LOGIN_TRACKER_MAX_PEERS) {
+        const oldestKey = loginFailures.keys().next().value;
+        if (oldestKey === undefined) break;
+        loginFailures.delete(oldestKey);
+      }
+    }
+
+    loginFailures.set(key, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+  };
 
   const renderFragment = (
     c: Context,
-    status: 200 | 400 | 409,
+    status: 200 | 400 | 404 | 409,
     flash?: SecurityFlash,
   ) => {
     c.header("Cache-Control", "no-store");
@@ -231,11 +279,16 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
 
   const respondError = (
     c: Context,
-    status: 400 | 403 | 409 | 413 | 415,
+    status: 400 | 403 | 404 | 409 | 413 | 415,
     message: string,
+    opts: { authenticated?: boolean } = {},
   ) => {
     c.header("Cache-Control", "no-store");
-    if (c.req.header("HX-Request") && (status === 400 || status === 409)) {
+    if (
+      opts.authenticated === true &&
+      c.req.header("HX-Request") &&
+      (status === 400 || status === 404 || status === 409)
+    ) {
       return renderFragment(c, status, { kind: "error", message });
     }
     return c.text(message, status);
@@ -248,16 +301,31 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
   > => {
     c.header("Cache-Control", "no-store");
 
+    const peerIp = peer(c.req.raw);
+    if (!auth.authorizeRead(c.req.raw, peerIp)) {
+      return {
+        ok: false,
+        response: respondError(c, 403, "Forbidden: authorization required.", {
+          authenticated: false,
+        }),
+      };
+    }
+
     const parsed = await parseUrlEncodedForm(c.req.raw);
     if (!parsed.ok) {
-      return { ok: false, response: respondError(c, parsed.status, parsed.message) };
+      return {
+        ok: false,
+        response: respondError(c, parsed.status, parsed.message, { authenticated: false }),
+      };
     }
 
     const csrf = extractSubmittedCsrf(parsed.fields, c.req.raw);
-    if (!auth.authorizeMutation(c.req.raw, peer(c.req.raw), csrf)) {
+    if (!auth.authorizeMutation(c.req.raw, peerIp, csrf)) {
       return {
         ok: false,
-        response: respondError(c, 403, "Forbidden: authorization or CSRF check failed."),
+        response: respondError(c, 403, "Forbidden: authorization or CSRF check failed.", {
+          authenticated: false,
+        }),
       };
     }
 
@@ -287,6 +355,15 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
       return c.redirect("/security", 303);
     }
 
+    const key = normalizePeerKey(peer(c.req.raw));
+    const now = nowMs();
+    const activeFailure = getActiveLoginFailure(key, now);
+    if (activeFailure && activeFailure.count >= LOGIN_MAX_FAILURES) {
+      const retryAfterSec = Math.max(1, Math.ceil((activeFailure.resetAt - now) / 1_000));
+      c.header("Retry-After", String(retryAfterSec));
+      return c.text("Too many failed login attempts. Try again later.", 429);
+    }
+
     const parsed = await parseUrlEncodedForm(c.req.raw);
     if (!parsed.ok) {
       return c.text(parsed.message, parsed.status);
@@ -299,6 +376,7 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
     const token = parsed.fields.get("token") ?? "";
     const result = auth.login(c.req.raw, token);
     if (!result.ok || !result.cookie) {
+      recordLoginFailure(key, now);
       return renderPage(
         c,
         () => <SecurityLogin error="Invalid access token." />,
@@ -307,6 +385,7 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
       );
     }
 
+    loginFailures.delete(key);
     c.header("Set-Cookie", result.cookie);
     return c.redirect("/security", 303);
   });
@@ -319,8 +398,9 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
     c.header("Cache-Control", "no-store");
     const peerIp = peer(c.req.raw);
     if (!auth.authorizeRead(c.req.raw, peerIp)) {
-      if (c.req.header("HX-Request")) {
+      if (c.req.header("HX-Request") === "true") {
         c.header("HX-Redirect", "/security/login");
+        return c.text("", 200);
       }
       return c.redirect("/security/login", 303);
     }
@@ -374,19 +454,19 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
 
     for (const key of guarded.fields.keys()) {
       if (!CSRF_FIELD_NAMES.has(key) && key !== "mode") {
-        return respondError(c, 400, "Unexpected form field.");
+        return respondError(c, 400, "Unexpected form field.", { authenticated: true });
       }
     }
 
     const mode = guarded.fields.get("mode");
     if (!mode || !MODE_SET.has(mode)) {
-      return respondError(c, 400, "Invalid lockdown mode.");
+      return respondError(c, 400, "Invalid lockdown mode.", { authenticated: true });
     }
 
     try {
       runtime.updateSettings({ mode: mode as LockdownMode });
     } catch {
-      return respondError(c, 400, "Unable to update lockdown mode.");
+      return respondError(c, 400, "Unable to update lockdown mode.", { authenticated: true });
     }
     return respondSuccess(c, `Lockdown mode updated to ${mode}.`);
   });
@@ -410,6 +490,7 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
             c,
             400,
             "Scan interval must be an integer between 1 and 1440 minutes.",
+            { authenticated: true },
           );
         }
         overrides.scanIntervalMinutes = minutes;
@@ -420,11 +501,11 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
       if (key.startsWith("criteria.")) {
         const criterionId = key.slice("criteria.".length);
         if (!CRITERION_SET.has(criterionId)) {
-          return respondError(c, 400, "Unknown security criterion.");
+          return respondError(c, 400, "Unknown security criterion.", { authenticated: true });
         }
         const parsedBool = parseBooleanChoice(value);
         if (parsedBool === null) {
-          return respondError(c, 400, "Invalid criterion toggle value.");
+          return respondError(c, 400, "Invalid criterion toggle value.", { authenticated: true });
         }
         criteriaUpdates[criterionId as CriterionId] = parsedBool;
         hasCriteria = true;
@@ -432,11 +513,11 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
         continue;
       }
 
-      return respondError(c, 400, "Unknown settings field.");
+      return respondError(c, 400, "Unknown settings field.", { authenticated: true });
     }
 
     if (!hasAnyField) {
-      return respondError(c, 400, "No settings fields submitted.");
+      return respondError(c, 400, "No settings fields submitted.", { authenticated: true });
     }
     if (hasCriteria) {
       overrides.criteria = criteriaUpdates;
@@ -445,7 +526,7 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
     try {
       runtime.updateSettings(overrides);
     } catch {
-      return respondError(c, 400, "Invalid security settings.");
+      return respondError(c, 400, "Invalid security settings.", { authenticated: true });
     }
     return respondSuccess(c, "Security settings saved.");
   });
@@ -456,16 +537,26 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
 
     const revision = parsePositiveInt(guarded.fields.get("revision"));
     if (revision === null) {
-      return respondError(c, 400, "A positive integer proposal revision is required.");
+      return respondError(c, 400, "A positive integer proposal revision is required.", {
+        authenticated: true,
+      });
     }
 
     const id = c.req.param("id");
-    const approved = await runtime.approve(id, revision);
+    let approved: boolean;
+    try {
+      approved = await runtime.approve(id, revision);
+    } catch {
+      return respondError(c, 409, "Unable to approve containment proposal.", {
+        authenticated: true,
+      });
+    }
     if (!approved) {
       return respondError(
         c,
         409,
         "Proposal is stale, already settled, or ineligible in the current mode.",
+        { authenticated: true },
       );
     }
     return respondSuccess(c, "Containment proposal approved.");
@@ -477,13 +568,24 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
 
     const revision = parsePositiveInt(guarded.fields.get("revision"));
     if (revision === null) {
-      return respondError(c, 400, "A positive integer proposal revision is required.");
+      return respondError(c, 400, "A positive integer proposal revision is required.", {
+        authenticated: true,
+      });
     }
 
     const id = c.req.param("id");
-    const rejected = runtime.reject(id, revision);
+    let rejected: boolean;
+    try {
+      rejected = runtime.reject(id, revision);
+    } catch {
+      return respondError(c, 409, "Unable to reject containment proposal.", {
+        authenticated: true,
+      });
+    }
     if (!rejected) {
-      return respondError(c, 409, "Proposal is stale or already settled.");
+      return respondError(c, 409, "Proposal is stale or already settled.", {
+        authenticated: true,
+      });
     }
     return respondSuccess(c, "Containment proposal rejected.");
   });
@@ -493,9 +595,18 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
     if (!guarded.ok) return guarded.response;
 
     const id = c.req.param("id");
-    const unlocked = await runtime.unlock(id);
+    let unlocked: boolean;
+    try {
+      unlocked = await runtime.unlock(id);
+    } catch {
+      return respondError(c, 409, "Containment action rollback failed.", {
+        authenticated: true,
+      });
+    }
     if (!unlocked) {
-      return respondError(c, 409, "Containment action could not be rolled back.");
+      return respondError(c, 409, "Containment action could not be rolled back.", {
+        authenticated: true,
+      });
     }
     return respondSuccess(c, "Containment action rolled back.");
   });
@@ -506,7 +617,7 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
 
     for (const key of guarded.fields.keys()) {
       if (!CSRF_FIELD_NAMES.has(key) && key !== "channel") {
-        return respondError(c, 400, "Unexpected form field.");
+        return respondError(c, 400, "Unexpected form field.", { authenticated: true });
       }
     }
 
@@ -514,7 +625,7 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
     let channel: AlertChannel | undefined;
     if (channelRaw !== undefined && channelRaw !== "") {
       if (!CHANNEL_SET.has(channelRaw)) {
-        return respondError(c, 400, "Alert channel is not eligible.");
+        return respondError(c, 400, "Alert channel is not eligible.", { authenticated: true });
       }
       channel = channelRaw as AlertChannel;
     }
@@ -522,7 +633,9 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
     try {
       runtime.sendTestAlert(channel);
     } catch {
-      return respondError(c, 400, "Selected alert channel is not ready for delivery.");
+      return respondError(c, 400, "Selected alert channel is not ready for delivery.", {
+        authenticated: true,
+      });
     }
     return respondSuccess(
       c,
@@ -535,7 +648,19 @@ export function createSecurityRouter(options: SecurityRouterOptions): Hono {
     if (!guarded.ok) return guarded.response;
 
     const id = c.req.param("id");
-    runtime.dismissAlert(id);
+    let dismissed: boolean;
+    try {
+      dismissed = runtime.dismissAlert(id);
+    } catch {
+      return respondError(c, 409, "Unable to dismiss security alert.", {
+        authenticated: true,
+      });
+    }
+    if (!dismissed) {
+      return respondError(c, 404, "Alert not found or already dismissed.", {
+        authenticated: true,
+      });
+    }
     return respondSuccess(c, "Security alert dismissed.");
   });
 

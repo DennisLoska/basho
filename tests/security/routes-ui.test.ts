@@ -389,6 +389,10 @@ test("Security renders the KPIs, controls, containment, exposure, audit, and act
     expect(lower).toContain("hide noise");
     expect(lower).toContain("benign multicast");
     expect(html).toContain("data-security-stream");
+    expect(html).toContain('hx-history="false"');
+    expect(html).toContain("2 UFW-OPEN");
+    expect(html).toContain("3 LAN-bound");
+    expect(html).toContain(`data-next-scan-at="${runtime.view().nextScanAt}"`);
   });
 });
 
@@ -432,6 +436,17 @@ test("token auth redirects anonymous page reads and rejects anonymous API and SS
       expect(page.headers.get("location") ?? "").toContain("/security/login");
       expect(page.headers.get("cache-control")).toContain("no-store");
 
+      const htmxPage = await app.request(`${LOCAL_ORIGIN}/security`, {
+        headers: { "HX-Request": "true" },
+      });
+      await expectStatus(htmxPage, [200, 204]);
+      expect(htmxPage.headers.get("hx-redirect")).toBe("/security/login");
+      expect(htmxPage.headers.get("location")).toBeNull();
+      expect(htmxPage.headers.get("cache-control")).toContain("no-store");
+      const htmxBody = await htmxPage.text();
+      expect(htmxBody).not.toContain('id="security-panel"');
+      expect(htmxBody).not.toContain("lab-node-01");
+
       const api = await app.request(`${LOCAL_ORIGIN}/api/security/status`);
       await expectStatus(api, [401, 403]);
       expect(api.headers.get("cache-control")).toContain("no-store");
@@ -465,6 +480,7 @@ test("login page renders and login rejects wrong origin and wrong token", async 
       const html = await page.text();
       expect(html).toContain('name="token"');
       expect(html.toLowerCase()).toContain("password");
+      expect(html).toContain('hx-history="false"');
 
       const badOrigin = await app.request(
         `${LOCAL_ORIGIN}/security/login`,
@@ -923,4 +939,255 @@ test("SSE closes and unsubscribes when the authenticated session expires", async
     },
     { auth },
   );
+});
+
+// ---------------------------------------------------------------------------
+// Security hardening regression tests (Stage 1 & Stage 2 review findings)
+// ---------------------------------------------------------------------------
+
+test("token-mode anonymous HTMX mutations with malformed bodies never leak SecurityPanel", async () => {
+  await withDemoApp(
+    async ({ app }) => {
+      const duplicate = await app.request(
+        `${LOCAL_ORIGIN}/security/scan`,
+        mutation("a=1&a=2", { htmx: true }),
+      );
+      await expectStatus(duplicate, [401, 403]);
+      expect(duplicate.headers.get("cache-control")).toContain("no-store");
+      const duplicateBody = await duplicate.text();
+      expect(duplicateBody).not.toContain('id="security-panel"');
+      expect(duplicateBody).not.toContain("lab-node-01");
+      expect(duplicateBody).not.toContain("demo-alert-breach-1");
+
+      const manyFields = Array.from({ length: 66 }, (_, i) => `f${i}=1`).join("&");
+      const tooMany = await app.request(
+        `${LOCAL_ORIGIN}/security/scan`,
+        mutation(manyFields, { htmx: true }),
+      );
+      await expectStatus(tooMany, [401, 403]);
+      expect(tooMany.headers.get("cache-control")).toContain("no-store");
+      const tooManyBody = await tooMany.text();
+      expect(tooManyBody).not.toContain('id="security-panel"');
+      expect(tooManyBody).not.toContain("lab-node-01");
+      expect(tooManyBody).not.toContain("demo-alert-breach-1");
+
+      const invalidUtf8 = await app.request(`${LOCAL_ORIGIN}/security/scan`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: LOCAL_ORIGIN,
+          "HX-Request": "true",
+        },
+        body: new Uint8Array([0xff, 0xfe, 0xfd]),
+      });
+      await expectStatus(invalidUtf8, [401, 403]);
+      expect(invalidUtf8.headers.get("cache-control")).toContain("no-store");
+      const invalidUtf8Body = await invalidUtf8.text();
+      expect(invalidUtf8Body).not.toContain('id="security-panel"');
+      expect(invalidUtf8Body).not.toContain("lab-node-01");
+      expect(invalidUtf8Body).not.toContain("demo-alert-breach-1");
+    },
+    { token: TOKEN },
+  );
+});
+
+test("dismissAlert returns 404 for unknown or already-dismissed alerts and catches runtime throws", async () => {
+  await withDemoApp(async ({ app, runtime }) => {
+    const { cookie, csrf } = await localSession(app);
+
+    const unknown = await app.request(
+      `${LOCAL_ORIGIN}/security/alerts/does-not-exist/dismiss`,
+      mutation({}, { cookie, csrf }),
+    );
+    expect(unknown.status).toBe(404);
+
+    const unknownHtmx = await app.request(
+      `${LOCAL_ORIGIN}/security/alerts/does-not-exist/dismiss`,
+      mutation({}, { cookie, csrf, htmx: true }),
+    );
+    expect(unknownHtmx.status).toBe(404);
+    expect(await unknownHtmx.text()).toContain('id="security-panel"');
+
+    const alertId = runtime.view().alerts[0]?.id as string;
+    const first = await app.request(
+      `${LOCAL_ORIGIN}/security/alerts/${alertId}/dismiss`,
+      mutation({}, { cookie, csrf }),
+    );
+    expect(first.status).toBe(303);
+
+    const second = await app.request(
+      `${LOCAL_ORIGIN}/security/alerts/${alertId}/dismiss`,
+      mutation({}, { cookie, csrf }),
+    );
+    expect(second.status).toBe(404);
+
+    // Runtime throwing internal errors must return sanitized 409, never 500 or secret text
+    const leakedSecret = "internal-helper-secret-9911";
+    runtime.approve = async () => {
+      throw new Error(leakedSecret);
+    };
+    runtime.reject = () => {
+      throw new Error(leakedSecret);
+    };
+    runtime.unlock = async () => {
+      throw new Error(leakedSecret);
+    };
+    runtime.dismissAlert = () => {
+      throw new Error(leakedSecret);
+    };
+
+    const approveErr = await app.request(
+      `${LOCAL_ORIGIN}/security/proposals/p1/approve`,
+      mutation({ revision: "1" }, { cookie, csrf }),
+    );
+    expect(approveErr.status).toBe(409);
+    expect(await approveErr.text()).not.toContain(leakedSecret);
+
+    const rejectErr = await app.request(
+      `${LOCAL_ORIGIN}/security/proposals/p1/reject`,
+      mutation({ revision: "1" }, { cookie, csrf }),
+    );
+    expect(rejectErr.status).toBe(409);
+    expect(await rejectErr.text()).not.toContain(leakedSecret);
+
+    const unlockErr = await app.request(
+      `${LOCAL_ORIGIN}/security/actions/a1/unlock`,
+      mutation({}, { cookie, csrf }),
+    );
+    expect(unlockErr.status).toBe(409);
+    expect(await unlockErr.text()).not.toContain(leakedSecret);
+
+    const dismissErr = await app.request(
+      `${LOCAL_ORIGIN}/security/alerts/al1/dismiss`,
+      mutation({}, { cookie, csrf }),
+    );
+    expect(dismissErr.status).toBe(409);
+    expect(await dismissErr.text()).not.toContain(leakedSecret);
+  });
+});
+
+test("POST /security/login rate-limits repeated failed attempts per peer and resets on success or window expiry", async () => {
+  let now = 1_800_000_000_000;
+  let currentPeer = "198.51.100.10";
+  const clock = { now: () => now };
+  const runtime = createDemoSecurityRuntime();
+  const auth = createSecurityAuth({ token: TOKEN, clock });
+  const app = createApp({
+    runtime,
+    auth,
+    demo: true,
+    peer: () => currentPeer,
+  });
+
+  try {
+    for (let i = 0; i < 5; i++) {
+      const fail = await app.request(
+        `${LOCAL_ORIGIN}/security/login`,
+        mutation({ token: "wrong-token" }),
+      );
+      expect(fail.status).toBe(401);
+      expect(fail.headers.get("cache-control")).toContain("no-store");
+    }
+
+    const blocked = await app.request(
+      `${LOCAL_ORIGIN}/security/login`,
+      mutation({ token: "wrong-token" }),
+    );
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers.get("cache-control")).toContain("no-store");
+    const retryAfter = Number(blocked.headers.get("retry-after"));
+    expect(Number.isFinite(retryAfter) && retryAfter > 0).toBe(true);
+
+    // Different peer is unaffected and successful login resets its own counter
+    currentPeer = "198.51.100.11";
+    const otherFail = await app.request(
+      `${LOCAL_ORIGIN}/security/login`,
+      mutation({ token: "wrong-token" }),
+    );
+    expect(otherFail.status).toBe(401);
+    const otherOk = await app.request(
+      `${LOCAL_ORIGIN}/security/login`,
+      mutation({ token: TOKEN }),
+    );
+    expect(otherOk.status).toBe(303);
+
+    // After the 5-minute window expires, original peer can authenticate again
+    currentPeer = "198.51.100.10";
+    now += 5 * 60 * 1_000 + 1_000;
+    const recovered = await app.request(
+      `${LOCAL_ORIGIN}/security/login`,
+      mutation({ token: TOKEN }),
+    );
+    expect(recovered.status).toBe(303);
+  } finally {
+    await runtime.stop();
+  }
+});
+
+test("SSE closes proactively on session expiry timer without waiting for keep-alive or runtime updates", async () => {
+  const auth = createSecurityAuth({ token: TOKEN, sessionTtlMs: 80 });
+
+  await withDemoApp(
+    async ({ app, runtime }) => {
+      const login = await app.request(
+        `${LOCAL_ORIGIN}/security/login`,
+        mutation({ token: TOKEN }),
+      );
+      expect(login.status).toBe(303);
+      const cookie = cookieHeader(login);
+
+      let subscriptions = 0;
+      const subscribe = runtime.subscribe.bind(runtime);
+      runtime.subscribe = (listener) => {
+        subscriptions++;
+        const unsubscribe = subscribe(listener);
+        return () => {
+          subscriptions--;
+          unsubscribe();
+        };
+      };
+
+      const response = await app.request(`${LOCAL_ORIGIN}/sse/security`, {
+        headers: { cookie },
+      });
+      expect(response.status).toBe(200);
+      const reader = response.body!.getReader();
+      try {
+        expect((await readText(reader, 1_000)) ?? "").toContain("event: security");
+        expect(subscriptions).toBe(1);
+
+        // No runtime update emitted — timer alone must close the stream promptly
+        const closed = await closesWithin(reader, 1_500);
+        expect(closed).toBe(true);
+        expect(subscriptions).toBe(0);
+      } finally {
+        await reader.cancel();
+      }
+    },
+    { auth },
+  );
+});
+
+test("static/handlers.js supports 400/409 swaps, live countdown, flash/dirty preservation, and SSE backoff", async () => {
+  const source = await Bun.file("static/handlers.js").text();
+  // Ensure handlers.js parses cleanly as valid JavaScript
+  expect(() => new Function(source)).not.toThrow();
+
+  // Verify htmx:beforeSwap enables swapping 400/404/409 #security-panel fragments
+  expect(source).toContain("detail.shouldSwap = true");
+  expect(source).toContain("detail.isError = false");
+  expect(source).toContain('id="security-panel"');
+
+  // Verify live next-scan countdown interval + cleanup
+  expect(source).toContain("data-next-scan-at");
+  expect(source).toContain("stopSecurityCountdown");
+
+  // Verify flash preservation, dirty control tracking, and bounded reconnect backoff
+  expect(source).toContain("SECURITY_FLASH_TTL_MS");
+  expect(source).toContain("#security-mode-select");
+  expect(source).toContain("#scan-interval-input");
+  expect(source).toContain('[name^="criteria."]');
+  expect(source).toContain("#security-test-channel");
+  expect(source).toContain("scheduleSecurityReconnect");
+  expect(source).toContain("SECURITY_RECONNECT_MAX_MS");
 });

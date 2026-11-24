@@ -131,3 +131,11 @@ _Avoid_: Webhook sender, alert mailer, raw notifier
 **SecurityRuntime**:
 The in-process security coordinator that schedules independent non-overlapping collection, monitoring, reconciliation, delivery, and retention loops, coalesces scans with bounded event-triage cooldowns, persists validated runtime overrides, and fans out committed state updates to subscribers.
 _Avoid_: Background worker, daemon manager, global singleton
+
+**SecurityView**:
+The secret-free, read-only projection returned by `SecurityRuntime.view()` summarizing host posture (`latestScan`), recent `SecurityEvent` records and 24-hour buckets, `LockdownProposal` and `LockdownAction` lists, active `SecurityAlert` items, `AlertChannel` delivery health, editable runtime settings, AI status, scan schedule state, and helper readiness for HTML templates and `/api/security/status`.
+_Avoid_: Raw store dump, dashboard payload, runtime state blob
+
+**SecurityUpdate**:
+A lightweight typed invalidation notification (`{ kind: "scan" | "events" | "alert" | "containment" | "settings" | "status" }`) emitted by `SecurityRuntime` to subscribers and streamed over `/sse/security` to signal clients to refresh the security fragment without embedding sensitive payloads on the event stream.
+_Avoid_: Full state push, raw SSE message, websocket frame

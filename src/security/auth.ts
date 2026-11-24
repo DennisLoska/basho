@@ -37,6 +37,7 @@ export interface CsrfIssue {
 
 export interface SecurityAuth {
   readonly tokenConfigured: boolean;
+  now(): number;
   authorizeRead(request: Request, peer: string | null | undefined): boolean;
   authorizeMutation(
     request: Request,
@@ -393,6 +394,10 @@ export function createSecurityAuth(options: SecurityAuthOptions = {}): SecurityA
   return {
     get tokenConfigured(): boolean {
       return configuredToken !== undefined;
+    },
+
+    now(): number {
+      return clock.now();
     },
 
     authorizeRead(request: Request, _peer: string | null | undefined): boolean {

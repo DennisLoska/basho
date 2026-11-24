@@ -433,6 +433,31 @@ function ActivitySvg({ hourly }: { hourly: SecurityView["hourly"] }) {
   );
 }
 
+function isLoopbackBindAddress(address: string): boolean {
+  const normalized = address.trim().toLowerCase();
+  if (
+    normalized === "::1" ||
+    normalized === "0:0:0:0:0:0:0:1" ||
+    normalized === "localhost"
+  ) {
+    return true;
+  }
+  if (normalized.startsWith("127.")) return true;
+  if (normalized.startsWith("::ffff:127.")) return true;
+  return false;
+}
+
+function isLanBoundExposure(entry: ExposureEntry): boolean {
+  if (entry.reachability === "local_only" || entry.reachability === "tailnet") {
+    return false;
+  }
+  const iface = entry.listener.interfaceName?.toLowerCase();
+  if (iface === "lo" || iface === "tailscale0") {
+    return false;
+  }
+  return !isLoopbackBindAddress(entry.listener.address);
+}
+
 export const SecurityPanel = ({ view, csrfToken, flash }: SecurityPanelProps) => {
   const refNow = deriveReferenceNow(view);
   const posture = derivePostureSummary(view);
@@ -443,9 +468,7 @@ export const SecurityPanel = ({ view, csrfToken, flash }: SecurityPanelProps) =>
   const ufwOpenCount = exposure.filter(
     (e) => e.reachability === "exposed_v4_v6" || e.reachability === "exposed_lan",
   ).length;
-  const lanBoundCount = exposure.filter(
-    (e) => e.reachability === "exposed_lan" || e.reachability === "exposed_v4_v6",
-  ).length;
+  const lanBoundCount = exposure.filter((e) => isLanBoundExposure(e)).length;
 
   const checks = view.latestScan?.snapshot.checks ?? [];
   const findings = view.latestScan?.findings ?? [];
@@ -499,6 +522,7 @@ export const SecurityPanel = ({ view, csrfToken, flash }: SecurityPanelProps) =>
   return (
     <div
       id="security-panel"
+      hx-history="false"
       data-security-stream="/sse/security"
       class="space-y-4 sm:space-y-5 min-w-0"
     >
@@ -681,7 +705,12 @@ export const SecurityPanel = ({ view, csrfToken, flash }: SecurityPanelProps) =>
               <span class={`w-1.5 h-1.5 rounded-full ${aiInfo.dot}`} />
               AI: {aiInfo.label}
             </span>
-            <span class="px-2 py-0.5 rounded bg-base-300/70 border border-base-300 text-[11px] text-base-content/75 tabular-nums">
+            <span
+              id="security-next-scan"
+              data-next-scan-at={view.nextScanAt !== null ? String(view.nextScanAt) : ""}
+              data-scan-running={view.scanRunning ? "true" : "false"}
+              class="px-2 py-0.5 rounded bg-base-300/70 border border-base-300 text-[11px] text-base-content/75 tabular-nums"
+            >
               {view.scanRunning ? "Scan running..." : `Next scan: ${nextScanText}`}
             </span>
           </div>
@@ -1613,7 +1642,7 @@ export const SecurityPanel = ({ view, csrfToken, flash }: SecurityPanelProps) =>
 };
 
 export const SecurityLogin = ({ error }: SecurityLoginProps) => (
-  <div class="max-w-md mx-auto py-8 sm:py-14">
+  <div id="security-login" hx-history="false" class="max-w-md mx-auto py-8 sm:py-14">
     <section class="oc-panel p-5 sm:p-6 space-y-5">
       <div class="space-y-1.5 pb-3 border-b border-base-300/80">
         <div class="flex items-center gap-2 font-mono text-xs uppercase tracking-wider text-primary font-semibold">

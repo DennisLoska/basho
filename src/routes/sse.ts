@@ -7,6 +7,7 @@ import type { SecurityRuntime, SecurityUpdate } from "../security/runtime";
 const encoder = new TextEncoder();
 const KEEP_ALIVE_MS = 15_000;
 const SYSTEM_STATS_INTERVAL_MS = 2_000;
+const MAX_TIMEOUT_MS = 2_147_483_647;
 
 export interface SseRouterOptions {
   runtime?: SecurityRuntime;
@@ -152,6 +153,14 @@ export function createSseRouter(options: SseRouterOptions = {}): Hono {
         let closed = false;
         let unsubscribe: (() => void) | null = null;
         let keepAliveInterval: ReturnType<typeof setInterval> | null = null;
+        let expiryTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const clearExpiryTimer = () => {
+          if (expiryTimer !== null) {
+            clearTimeout(expiryTimer);
+            expiryTimer = null;
+          }
+        };
 
         const onAbort = () => {
           cleanup();
@@ -160,6 +169,7 @@ export function createSseRouter(options: SseRouterOptions = {}): Hono {
         const cleanup = () => {
           if (closed) return;
           closed = true;
+          clearExpiryTimer();
           if (keepAliveInterval !== null) {
             clearInterval(keepAliveInterval);
             keepAliveInterval = null;
@@ -188,10 +198,52 @@ export function createSseRouter(options: SseRouterOptions = {}): Hono {
           return true;
         };
 
+        const armExpiryTimer = () => {
+          clearExpiryTimer();
+          if (closed) return;
+          const expiresAt =
+            typeof auth.sessionExpiresAt === "function"
+              ? auth.sessionExpiresAt(request, peerIp)
+              : null;
+          if (expiresAt === null) return;
+
+          const currentNow = typeof auth.now === "function" ? auth.now() : Date.now();
+          const remainingMs = expiresAt - currentNow;
+          if (remainingMs <= 0) {
+            cleanup();
+            return;
+          }
+
+          const delayMs = Math.min(remainingMs, MAX_TIMEOUT_MS);
+          expiryTimer = setTimeout(() => {
+            expiryTimer = null;
+            if (closed) return;
+            const nowAfter = typeof auth.now === "function" ? auth.now() : Date.now();
+            if (nowAfter >= expiresAt) {
+              if (ensureAuthorized()) {
+                cleanup();
+              }
+              return;
+            }
+            armExpiryTimer();
+          }, delayMs);
+
+          if (
+            typeof expiryTimer === "object" &&
+            expiryTimer !== null &&
+            "unref" in expiryTimer
+          ) {
+            (expiryTimer as { unref?: () => void }).unref?.();
+          }
+        };
+
         if (request.signal.aborted || options.shutdownSignal?.aborted) {
           cleanup();
           return;
         }
+
+        armExpiryTimer();
+        if (closed) return;
 
         unsubscribe = runtime.subscribe((update) => {
           if (!ensureAuthorized()) return;
