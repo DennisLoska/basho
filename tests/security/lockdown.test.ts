@@ -2514,3 +2514,278 @@ describe("Council round 1 regressions (F01, F10)", () => {
     expect(stopIdx).toBeGreaterThan(checkIdx);
   });
 });
+
+describe("Council round 2 regressions (R2-F01, R2-F06)", () => {
+  test("R2-F01: user workload rollback settles to rolled_back and frees future claims when unit becomes inactive before rollback", async () => {
+    const store = new SecurityStore(":memory:");
+    const clock = createClock();
+    const workloads: EnrolledWorkload[] = [ENROLLED_WORKLOAD];
+    let unitInactive = false;
+    const execCalls: string[][] = [];
+
+    const adapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => workloads,
+      clock: clock.clock,
+      currentUid: CURRENT_UID,
+      resolveProcess: async (pid) => ({
+        pid,
+        uid: CURRENT_UID,
+        startedAt: ENROLLED_STARTED_AT,
+        comm: "ollama",
+        uunit: ENROLLED_UNIT,
+      }),
+      exec: async (argv) => {
+        execCalls.push([...argv]);
+        if (argv.includes("--version")) {
+          return { exitCode: 0, stdout: "systemd 256\n", stderr: "" };
+        }
+        if (argv.includes("freeze")) {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (argv.includes("thaw")) {
+          if (unitInactive) {
+            return {
+              exitCode: 1,
+              stdout: "",
+              stderr: `Unit ${ENROLLED_UNIT} is not active.`,
+            };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (argv.some((arg) => arg.includes("FreezerState,ActiveState,LoadState"))) {
+          return {
+            exitCode: 0,
+            stdout: unitInactive
+              ? "FreezerState=\nActiveState=inactive\nLoadState=loaded\n"
+              : "FreezerState=frozen\nActiveState=active\nLoadState=loaded\n",
+            stderr: "",
+          };
+        }
+        if (argv.includes("FreezerState")) {
+          return {
+            exitCode: 0,
+            stdout: unitInactive ? "\n" : "running\n",
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    const engine = new LockdownEngine({
+      store,
+      clock: clock.clock,
+      adapter,
+      currentUid: CURRENT_UID,
+      resolveProcess: async (pid) => ({
+        pid,
+        uid: CURRENT_UID,
+        startedAt: ENROLLED_STARTED_AT,
+        comm: "ollama",
+        uunit: ENROLLED_UNIT,
+      }),
+    });
+
+    const settings = makeSettings({
+      mode: "approve",
+      workloads,
+      lockdown: { proposalMinutes: 30, leaseSeconds: 120, helperEnabled: false },
+    });
+    const scan: SecurityScan = {
+      id: "scan-r2-f01",
+      trigger: "event",
+      startedAt: NOW,
+      finishedAt: NOW,
+      snapshot: { id: "snap-r2-f01", capturedAt: NOW, checks: [], evidence: [] },
+      exposure: [],
+      findings: [],
+      trail: { steps: [] },
+      aiStatus: "ready",
+      verdict: { kind: "breach", confidence: 0.95, summary: "Unexpected workload port" },
+    };
+    const draft: ProposalDraft = {
+      target: WORKLOAD_TARGET,
+      evidenceIds: ["ev-r2-f01"],
+    };
+    const corroboration: Corroboration[] = [
+      {
+        rule: "unexpected_workload",
+        eventIds: ["ev-r2-f01"],
+        expiresAt: NOW + 5 * MINUTE,
+        target: WORKLOAD_TARGET,
+      },
+    ];
+
+    try {
+      const first = await engine.consider(scan, [draft], corroboration, settings);
+      expect(first.proposals).toHaveLength(1);
+      expect(await engine.approve(first.proposals[0]!.id, 1, settings)).toBe(true);
+
+      const activeAction = store.listActions()[0]!;
+      expect(activeAction.state).toBe("active");
+
+      // Unit crashes/stops before lease expiry; thaw now exits non-zero.
+      unitInactive = true;
+      clock.advance(121 * SECOND);
+
+      const changed = await engine.reconcile();
+      expect(changed).toBe(true);
+
+      const settled = store.listActions().find((a) => a.id === activeAction.id)!;
+      expect(settled.state).toBe("rolled_back");
+      expect(
+        execCalls.some(
+          (argv) =>
+            argv.includes("stop") &&
+            argv.some((arg) => arg.startsWith("basho-thaw-") && arg.endsWith(".timer")),
+        ),
+      ).toBe(true);
+
+      // A subsequent pause_workload proposal for the same workload must be claimable.
+      unitInactive = false;
+      const second = await engine.consider(
+        { ...scan, id: "scan-r2-f01-2" },
+        [draft],
+        [
+          {
+            rule: "unexpected_workload",
+            eventIds: ["ev-r2-f01-2"],
+            expiresAt: clock.clock.now() + 5 * MINUTE,
+            target: WORKLOAD_TARGET,
+          },
+        ],
+        settings,
+      );
+      expect(second.proposals).toHaveLength(1);
+      expect(await engine.approve(second.proposals[0]!.id, 1, settings)).toBe(true);
+      expect(store.listActions().filter((a) => a.state === "active")).toHaveLength(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("R2-F01: rollback still keeps thaw timer armed when unit remains FreezerState=frozen after non-zero thaw", async () => {
+    const calls: string[][] = [];
+    const adapter = createUserWorkloadLockdownAdapter({
+      getWorkloads: () => [ENROLLED_WORKLOAD],
+      clock: createClock().clock,
+      exec: async (argv) => {
+        calls.push([...argv]);
+        if (argv.includes("thaw")) {
+          return { exitCode: 1, stdout: "", stderr: "transient dbus failure" };
+        }
+        if (argv.some((arg) => arg.includes("FreezerState,ActiveState,LoadState"))) {
+          return {
+            exitCode: 0,
+            stdout: "FreezerState=frozen\nActiveState=active\nLoadState=loaded\n",
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    const action: LockdownAction = {
+      id: "act-still-frozen-r2",
+      proposalId: "prop-still-frozen-r2",
+      idempotencyKey: "prop-still-frozen-r2:1",
+      target: WORKLOAD_TARGET,
+      state: "rolling_back",
+      createdAt: NOW,
+      expiresAt: NOW + 120 * SECOND,
+      updatedAt: NOW,
+      rollbackHandle: `user-unit:${ENROLLED_UNIT}:basho-thaw-act-still-frozen-r2`,
+    };
+    expect(await adapter.rollback(action)).toEqual({ state: "unknown" });
+    expect(calls.some((argv) => argv.includes("stop"))).toBe(false);
+  });
+
+  test("R2-F06: two workload IDs mapped to the same systemd unit cannot hold overlapping live freeze leases", async () => {
+    const sharedUnit = "shared-ai.service";
+    const workloads: EnrolledWorkload[] = [
+      { id: "worker-alpha", unit: sharedUnit, name: "Alpha" },
+      { id: "worker-beta", unit: sharedUnit, name: "Beta" },
+    ];
+    const harness = createEngine({
+      settings: {
+        mode: "approve",
+        workloads,
+      },
+      resolveProcess: async (pid) => ({
+        pid,
+        uid: CURRENT_UID,
+        startedAt: ENROLLED_STARTED_AT,
+        comm: "python3",
+        uunit: sharedUnit,
+      }),
+    });
+
+    const scan: SecurityScan = {
+      id: "scan-r2-f06",
+      trigger: "event",
+      startedAt: NOW,
+      finishedAt: NOW,
+      snapshot: { id: "snap-r2-f06", capturedAt: NOW, checks: [], evidence: [] },
+      exposure: [],
+      findings: [],
+      trail: { steps: [] },
+      aiStatus: "ready",
+      verdict: { kind: "breach", confidence: 0.95, summary: "Unexpected port" },
+    };
+    const targetAlpha: ContainmentTarget = {
+      kind: "pause_workload",
+      workloadId: "worker-alpha",
+      pid: 4242,
+      startedAt: ENROLLED_STARTED_AT,
+    };
+    const targetBeta: ContainmentTarget = {
+      kind: "pause_workload",
+      workloadId: "worker-beta",
+      pid: 4242,
+      startedAt: ENROLLED_STARTED_AT,
+    };
+
+    try {
+      const considered = await harness.engine.consider(
+        scan,
+        [
+          { target: targetAlpha, evidenceIds: ["ev-alpha"] },
+          { target: targetBeta, evidenceIds: ["ev-beta"] },
+        ],
+        [
+          {
+            rule: "unexpected_workload",
+            eventIds: ["ev-alpha"],
+            expiresAt: NOW + 5 * MINUTE,
+            target: targetAlpha,
+          },
+          {
+            rule: "unexpected_workload",
+            eventIds: ["ev-beta"],
+            expiresAt: NOW + 5 * MINUTE,
+            target: targetBeta,
+          },
+        ],
+        harness.settings,
+      );
+      expect(considered.proposals).toHaveLength(2);
+      const propAlpha = considered.proposals[0]!;
+      const propBeta = considered.proposals[1]!;
+
+      // First workload claims the shared unit.
+      expect(await harness.engine.approve(propAlpha.id, 1, harness.settings)).toBe(true);
+      expect(harness.calls.apply).toHaveLength(1);
+
+      // Second workload ID referencing the same systemd unit must be refused while first is live.
+      expect(await harness.engine.approve(propBeta.id, 1, harness.settings)).toBe(false);
+      expect(harness.calls.apply).toHaveLength(1);
+
+      // Once the first action rolls back, the second workload proposal can be claimed.
+      const firstAction = harness.store.listActions()[0]!;
+      expect(await harness.engine.unlock(firstAction.id)).toBe(true);
+      expect(await harness.engine.approve(propBeta.id, 1, harness.settings)).toBe(true);
+      expect(harness.calls.apply).toHaveLength(2);
+    } finally {
+      harness.store.close();
+    }
+  });
+});

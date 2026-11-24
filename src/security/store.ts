@@ -73,6 +73,21 @@ function canonicalContainmentTargetKey(target: ContainmentTarget): string {
   }
 }
 
+function extractUnitExclusivityKeyFromHandle(handle: string | null): string | null {
+  if (!handle) return null;
+  const prefix = handle.startsWith("user-unit:")
+    ? "user-unit:"
+    : handle.startsWith("workload:")
+      ? "workload:"
+      : null;
+  if (!prefix) return null;
+  const rest = handle.slice(prefix.length);
+  if (!rest) return null;
+  const timerSep = rest.lastIndexOf(":basho-thaw-");
+  const unit = (timerSep !== -1 ? rest.slice(0, timerSep) : rest).trim();
+  return unit.length > 0 ? `pause_workload_unit:${unit}` : null;
+}
+
 function validateNonEmptyString(value: unknown, field: string): void {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new TypeError(`SecurityEvent ${field} must be a non-empty string`);
@@ -170,7 +185,12 @@ export interface SecurityStoreContract {
   hourlyEvents(now: number): { hour: number; signal: number; noise: number }[];
   insertProposal(proposal: LockdownProposal): void;
   listProposals(): LockdownProposal[];
-  claimProposal(id: string, revision: number, now: number): LockdownAction | null;
+  claimProposal(
+    id: string,
+    revision: number,
+    now: number,
+    exclusivityKey?: string,
+  ): LockdownAction | null;
   rejectProposal(id: string, revision: number, now: number): boolean;
   expireProposals(now: number): void;
   listActions(): LockdownAction[];
@@ -698,6 +718,21 @@ export class SecurityStore implements SecurityStoreContract {
         `);
         this.db
           .query("INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)")
+          .run(Date.now());
+      }
+
+      const hasV3 = this.db
+        .query("SELECT version FROM schema_migrations WHERE version = 3")
+        .get() as { version: number } | null;
+      if (!hasV3) {
+        const columns = this.db
+          .query("PRAGMA table_info(lockdown_actions)")
+          .all() as { name: string }[];
+        if (!columns.some((col) => col.name === "exclusivity_key")) {
+          this.db.run("ALTER TABLE lockdown_actions ADD COLUMN exclusivity_key TEXT");
+        }
+        this.db
+          .query("INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)")
           .run(Date.now());
       }
     });
@@ -1381,7 +1416,12 @@ export class SecurityStore implements SecurityStoreContract {
     }));
   }
 
-  claimProposal(id: string, revision: number, now: number): LockdownAction | null {
+  claimProposal(
+    id: string,
+    revision: number,
+    now: number,
+    exclusivityKey?: string,
+  ): LockdownAction | null {
     return this.inImmediateTransaction(() => {
       const candidate = this.db
         .query(
@@ -1401,18 +1441,33 @@ export class SecurityStore implements SecurityStoreContract {
 
       const candidateTarget = JSON.parse(candidate.target_json) as ContainmentTarget;
       const candidateKey = canonicalContainmentTargetKey(candidateTarget);
+      const candidateExclusivityKey =
+        typeof exclusivityKey === "string" && exclusivityKey.trim().length > 0
+          ? exclusivityKey.trim()
+          : null;
       const liveRows = this.db
         .query(
-          `SELECT target_json
+          `SELECT target_json, exclusivity_key, rollback_handle
            FROM lockdown_actions
            WHERE state IN ('pending', 'active', 'rolling_back')`,
         )
-        .all() as { target_json: string }[];
+        .all() as {
+        target_json: string;
+        exclusivity_key: string | null;
+        rollback_handle: string | null;
+      }[];
 
       for (const row of liveRows) {
         const liveTarget = JSON.parse(row.target_json) as ContainmentTarget;
         if (canonicalContainmentTargetKey(liveTarget) === candidateKey) {
           return null;
+        }
+        if (candidateExclusivityKey !== null) {
+          const liveExclusivityKey =
+            row.exclusivity_key ?? extractUnitExclusivityKeyFromHandle(row.rollback_handle);
+          if (liveExclusivityKey === candidateExclusivityKey) {
+            return null;
+          }
         }
       }
 
@@ -1448,8 +1503,8 @@ export class SecurityStore implements SecurityStoreContract {
         .query(
           `INSERT INTO lockdown_actions (
             id, proposal_id, idempotency_key, target_json, state,
-            created_at, expires_at, updated_at, rollback_handle
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+            created_at, expires_at, updated_at, rollback_handle, exclusivity_key
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
         )
         .run(
           action.id,
@@ -1460,6 +1515,7 @@ export class SecurityStore implements SecurityStoreContract {
           action.createdAt,
           action.expiresAt,
           action.updatedAt,
+          candidateExclusivityKey,
         );
 
       return action;

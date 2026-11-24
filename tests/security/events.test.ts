@@ -2045,4 +2045,70 @@ describe("EventMonitor edge cases", () => {
       store.close();
     }
   });
+
+  test("R2-F03: pollSockets matches enrolled workload by systemd uunit/unit before comm (generic runtime and truncated comm)", async () => {
+    const cases = [
+      {
+        label: "generic python3 runtime",
+        workload: { id: "comfy", unit: "comfyui.service", ports: [8188] } satisfies EnrolledWorkload,
+        ssLine:
+          'tcp   LISTEN 0      128    0.0.0.0:8189     0.0.0.0:*    users:(("python3",pid=5151,fd=9))',
+        psLine: "  5151     1  1000   120 user@1000.service comfyui.service python3\n",
+        expectedPid: 5151,
+      },
+      {
+        label: "truncated 15-char comm",
+        workload: {
+          id: "comfy",
+          unit: "comfyui.service",
+          ports: [8188],
+        } satisfies EnrolledWorkload,
+        ssLine:
+          'tcp   LISTEN 0      128    0.0.0.0:8189     0.0.0.0:*    users:(("comfyui-inferen",pid=5152,fd=9))',
+        psLine: "  5152     1  1000   120 user@1000.service comfyui.service comfyui-inferen\n",
+        expectedPid: 5152,
+      },
+    ] as const;
+
+    for (const tc of cases) {
+      const store = memoryStore();
+      const workloads: EnrolledWorkload[] = [tc.workload];
+      let socketPoll = 0;
+      const runner = runnerStub((request) => {
+        if (request.kind === "processes") {
+          return ok(tc.psLine);
+        }
+        socketPoll += 1;
+        return socketPoll === 1
+          ? ssOutput(SS_LOOPBACK)
+          : ssOutput(SS_LOOPBACK, tc.ssLine);
+      });
+      const monitor = new EventMonitor({ store, runner, clock: clockAt(NOW), workloads });
+
+      try {
+        await monitor.pollSockets(async (listeners) => benignEntries(listeners));
+        const result = await monitor.pollSockets(async (listeners) =>
+          unexpectedEntries(listeners),
+        );
+
+        const corr = result.corroboration.find(
+          (entry) => entry.rule === "unexpected_workload",
+        );
+        expect(corr, tc.label).toBeDefined();
+        expect(corr?.target).toEqual({
+          kind: "pause_workload",
+          workloadId: "comfy",
+          pid: tc.expectedPid,
+          startedAt: NOW - 120 * 1000,
+        });
+        expect(
+          result.alerts.some((alert) =>
+            alert.fingerprint.includes("unexpected_workload:comfy"),
+          ),
+        ).toBe(true);
+      } finally {
+        store.close();
+      }
+    }
+  });
 });

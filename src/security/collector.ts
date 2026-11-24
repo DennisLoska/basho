@@ -1105,6 +1105,47 @@ export function parseUfwConf(text: string): { active: boolean | null } {
   return { active };
 }
 
+function parseSystemdUnitActiveState(stdout: string): string | null {
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const match = /^ActiveState=(.+)$/i.exec(line);
+    if (match) {
+      const value = match[1]!.trim().toLowerCase();
+      return value.length > 0 ? value : null;
+    }
+  }
+  return null;
+}
+
+function resolveUfwActiveState(
+  ufwStatusParsed: ParsedUfwStatus | null,
+  ufwConfParsed: { active: boolean | null } | null,
+  ufwUnitRes: CommandResult | undefined,
+): boolean | null {
+  if (ufwStatusParsed && ufwStatusParsed.active !== null) {
+    return ufwStatusParsed.active;
+  }
+
+  const confActive = ufwConfParsed?.active ?? null;
+  const unitActiveState =
+    ufwUnitRes?.status === "ok" ? parseSystemdUnitActiveState(ufwUnitRes.stdout) : null;
+
+  if (
+    confActive === false ||
+    unitActiveState === "inactive" ||
+    unitActiveState === "failed" ||
+    unitActiveState === "deactivating"
+  ) {
+    return false;
+  }
+
+  if (unitActiveState === "active" && confActive === true) {
+    return true;
+  }
+
+  return null;
+}
+
 function listenerMatchesAllowRule(
   listener: Listener,
   rule: ParsedUfwRule,
@@ -3530,10 +3571,22 @@ export class PostureCollector {
     const ufwV4Text = fileResults.get("ufw-v4") ?? null;
     const ufwV6Text = fileResults.get("ufw-v6") ?? null;
 
-    const effectiveUfwActive: boolean | null =
-      ufwStatusParsed && ufwStatusParsed.active !== null
-        ? ufwStatusParsed.active
-        : (ufwConfParsed?.active ?? null);
+    let ufwUnitRes: CommandResult | undefined;
+    if (!(ufwStatusParsed && ufwStatusParsed.active !== null) && !signal?.aborted) {
+      ufwUnitRes = await this.runner.run(
+        { kind: "unit", name: "ufw.service", scope: "system" },
+        signal,
+      );
+      if (signal?.aborted) {
+        return;
+      }
+    }
+
+    const effectiveUfwActive: boolean | null = resolveUfwActiveState(
+      ufwStatusParsed,
+      ufwConfParsed,
+      ufwUnitRes,
+    );
     const effectiveDefaultInput: "allow" | "deny" | "unknown" =
       ufwStatusParsed && ufwStatusParsed.defaultInput !== "unknown"
         ? ufwStatusParsed.defaultInput
@@ -3728,10 +3781,23 @@ export class PostureCollector {
     const ufwV4Text = fileResults.get("ufw-v4") ?? null;
     const ufwV6Text = fileResults.get("ufw-v6") ?? null;
 
-    const effectiveUfwActive: boolean | null =
-      ufwStatusParsed && ufwStatusParsed.active !== null
-        ? ufwStatusParsed.active
-        : (ufwConfParsed?.active ?? null);
+    let ufwUnitRes: CommandResult | undefined;
+    if (
+      neededCommands.has("ufw_status") &&
+      !(ufwStatusParsed && ufwStatusParsed.active !== null) &&
+      !signal?.aborted
+    ) {
+      ufwUnitRes = await this.runner.run(
+        { kind: "unit", name: "ufw.service", scope: "system" },
+        signal,
+      );
+    }
+
+    const effectiveUfwActive: boolean | null = resolveUfwActiveState(
+      ufwStatusParsed,
+      ufwConfParsed,
+      ufwUnitRes,
+    );
 
     const effectiveDefaultInput: "allow" | "deny" | "unknown" =
       ufwStatusParsed && ufwStatusParsed.defaultInput !== "unknown"

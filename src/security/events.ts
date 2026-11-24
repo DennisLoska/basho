@@ -829,6 +829,7 @@ function unitStem(unit: string): string {
 
 function matchEnrolledWorkload(
   listener: Listener,
+  candidate: ParsedProcessRow | undefined,
   workloads: readonly EnrolledWorkload[],
 ): EnrolledWorkload | null {
   if (
@@ -836,12 +837,23 @@ function matchEnrolledWorkload(
     listener.pid === undefined ||
     !Number.isInteger(listener.pid) ||
     listener.pid <= 0 ||
-    !listener.process
+    !candidate
   ) {
     return null;
   }
 
-  const proc = listener.process.trim().toLowerCase();
+  if (candidate.hasUnitMetadata) {
+    const unitMatches = workloads.filter((workload) => {
+      const expectedUnit = workload.unit.trim();
+      return candidate.uunit === expectedUnit || candidate.unit === expectedUnit;
+    });
+    if (unitMatches.length === 1) {
+      return unitMatches[0]!;
+    }
+    return null;
+  }
+
+  const proc = (listener.process ?? candidate.comm).trim().toLowerCase();
   if (!proc) return null;
 
   const matches: EnrolledWorkload[] = [];
@@ -1401,21 +1413,25 @@ export class EventMonitor {
 
       if (unexpectedExposed) {
         const matchedListener = unexpectedExposed.listener;
-        const workload = matchEnrolledWorkload(matchedListener, this.workloads);
-
+        let workload: EnrolledWorkload | null = null;
         let verifiedProcess: ParsedProcessRow | null = null;
-        if (workload && matchedListener.pid !== undefined && matchedListener.process) {
+        if (
+          this.workloads.length > 0 &&
+          matchedListener.pid !== undefined &&
+          Number.isInteger(matchedListener.pid) &&
+          matchedListener.pid > 0 &&
+          matchedListener.process
+        ) {
           const table = await getProcessTable();
           const candidate = table?.get(matchedListener.pid);
-          const expectedUnit = workload.unit.trim();
           if (
             candidate &&
-            candidate.comm.toLowerCase() === matchedListener.process.trim().toLowerCase() &&
-            (!candidate.hasUnitMetadata ||
-              candidate.unit === expectedUnit ||
-              candidate.uunit === expectedUnit)
+            candidate.comm.toLowerCase() === matchedListener.process.trim().toLowerCase()
           ) {
-            verifiedProcess = candidate;
+            workload = matchEnrolledWorkload(matchedListener, candidate, this.workloads);
+            if (workload) {
+              verifiedProcess = candidate;
+            }
           }
         }
 

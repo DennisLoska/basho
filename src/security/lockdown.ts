@@ -704,6 +704,52 @@ export class LockdownEngine {
     this.getMode = options.getMode;
   }
 
+  private resolveExclusivityKey(
+    target: ContainmentTarget,
+    settings: SecuritySettings,
+  ): string | undefined {
+    if (target.kind !== "pause_workload") {
+      return undefined;
+    }
+    const workload = settings.workloads.find(
+      (entry) => entry.id === target.workloadId,
+    );
+    const unit = workload?.unit.trim();
+    if (!unit) {
+      return undefined;
+    }
+    return `pause_workload_unit:${unit}`;
+  }
+
+  private hasConflictingUnitAction(
+    exclusivityKey: string | undefined,
+    settings: SecuritySettings,
+  ): boolean {
+    if (!exclusivityKey) {
+      return false;
+    }
+    for (const action of this.store.listActions()) {
+      if (
+        action.state !== "pending" &&
+        action.state !== "active" &&
+        action.state !== "rolling_back"
+      ) {
+        continue;
+      }
+      if (this.resolveExclusivityKey(action.target, settings) === exclusivityKey) {
+        return true;
+      }
+      const parsedHandle = parseWorkloadHandle(action.rollbackHandle);
+      if (
+        parsedHandle &&
+        `pause_workload_unit:${parsedHandle.unit}` === exclusivityKey
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private resolveLiveMode(settings: SecuritySettings): LockdownMode {
     if (!this.getMode) return settings.mode;
     try {
@@ -867,10 +913,15 @@ export class LockdownEngine {
       proposals.push(proposal);
 
       if (decision === "execute" && this.resolveLiveMode(settings) === "auto-lockdown") {
+        const exclusivityKey = this.resolveExclusivityKey(proposal.target, settings);
+        if (this.hasConflictingUnitAction(exclusivityKey, settings)) {
+          continue;
+        }
         const claimed = this.store.claimProposal(
           proposal.id,
           proposal.revision,
           this.clock.now(),
+          exclusivityKey,
         );
         if (claimed) {
           this.observedWorkloads.delete(proposal.id);
@@ -971,8 +1022,18 @@ export class LockdownEngine {
       return false;
     }
 
+    const exclusivityKey = this.resolveExclusivityKey(proposal.target, settings);
+    if (this.hasConflictingUnitAction(exclusivityKey, settings)) {
+      return false;
+    }
+
     // SQLite atomic claim is the sole authorization to invoke adapter.apply().
-    const claimed = this.store.claimProposal(id, revision, this.clock.now());
+    const claimed = this.store.claimProposal(
+      id,
+      revision,
+      this.clock.now(),
+      exclusivityKey,
+    );
     if (!claimed) {
       return false;
     }
@@ -1619,21 +1680,76 @@ export function createUserWorkloadLockdownAdapter(
       }
       const { unit, timerUnit } = resolved;
 
+      const isConfirmedNotFrozen = async (): Promise<boolean> => {
+        const showRes = await exec(
+          [
+            systemctlPath,
+            "--user",
+            "show",
+            "--property=FreezerState,ActiveState,LoadState",
+            unit,
+          ],
+          { timeoutMs },
+        ).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
+        if (showRes.exitCode !== 0) {
+          return false;
+        }
+        const props = new Map<string, string>();
+        for (const rawLine of showRes.stdout.split(/\r?\n/)) {
+          const line = rawLine.trim();
+          const eq = line.indexOf("=");
+          if (eq <= 0) continue;
+          props.set(line.slice(0, eq).trim(), line.slice(eq + 1).trim().toLowerCase());
+        }
+        const freezer = props.get("FreezerState") ?? "";
+        const active = props.get("ActiveState") ?? "";
+        const load = props.get("LoadState") ?? "";
+
+        if (freezer === "frozen" || freezer === "freezing") {
+          return false;
+        }
+        if (freezer === "running") {
+          return true;
+        }
+        if (
+          active === "inactive" ||
+          active === "failed" ||
+          active === "deactivating"
+        ) {
+          return true;
+        }
+        if (load === "not-found") {
+          return true;
+        }
+        return false;
+      };
+
       const thawRes = await exec([systemctlPath, "--user", "thaw", unit], {
         timeoutMs,
       });
       if (thawRes.exitCode !== 0) {
-        return { state: "unknown" };
-      }
-
-      const stateRes = await exec(
-        [systemctlPath, "--user", "show", "-p", "FreezerState", "--value", unit],
-        { timeoutMs },
-      );
-      const freezerState =
-        stateRes.exitCode === 0 ? stateRes.stdout.trim().toLowerCase() : "";
-      if (freezerState !== "running") {
-        return { state: "unknown" };
+        if (thawRes.exitCode === 124) {
+          return { state: "unknown" };
+        }
+        if (!(await isConfirmedNotFrozen())) {
+          return { state: "unknown" };
+        }
+      } else {
+        const stateRes = await exec(
+          [systemctlPath, "--user", "show", "-p", "FreezerState", "--value", unit],
+          { timeoutMs },
+        );
+        const freezerState =
+          stateRes.exitCode === 0 ? stateRes.stdout.trim().toLowerCase() : "";
+        if (freezerState !== "running") {
+          if (
+            freezerState === "frozen" ||
+            freezerState === "freezing" ||
+            !(await isConfirmedNotFrozen())
+          ) {
+            return { state: "unknown" };
+          }
+        }
       }
 
       await exec([systemctlPath, "--user", "stop", `${timerUnit}.timer`], {

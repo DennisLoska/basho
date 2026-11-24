@@ -2729,7 +2729,7 @@ describe("Council round 1 regressions (F01, F07, F13, F18)", () => {
     expect(findingsFor(result, check).length).toBeGreaterThan(0);
   });
 
-  test("F18: falls back to /etc/ufw/ufw.conf when ufw_status fails in unprivileged mode", async () => {
+  test("R2-F05: unprivileged UFW fallback requires live ufw.service state alongside /etc/ufw/ufw.conf", async () => {
     const enabledFiles: Record<string, string | null> = {
       "ufw-conf": "# /etc/ufw/ufw.conf\nENABLED=yes\nLOGLEVEL=low\n",
       "ufw-default": UFW_DEFAULT_DROP,
@@ -2739,41 +2739,99 @@ describe("Council round 1 regressions (F01, F07, F13, F18)", () => {
       "pacman-log": DEFAULT_FILES["pacman-log"],
     };
 
-    const collector = new PostureCollector({
-      clock: { now: () => NOW },
-      runner: {
-        async run(request) {
-          if (request.kind === "ufw_status") return { status: "failed" };
-          if (request.kind === "sockets") {
-            return okResult(
-              ss(
-                "tcp   LISTEN 0      128    0.0.0.0:8188    0.0.0.0:*",
-                "tcp   LISTEN 0      128    0.0.0.0:7000    0.0.0.0:*",
-              ),
-            );
-          }
-          return DEFAULT_COMMANDS[request.kind] ?? UNAVAILABLE;
+    const makeCollector = (ufwUnitResult: CommandResult) =>
+      new PostureCollector({
+        clock: { now: () => NOW },
+        runner: {
+          async run(request) {
+            if (request.kind === "ufw_status") return { status: "failed" };
+            if (
+              request.kind === "unit" &&
+              request.name === "ufw.service" &&
+              request.scope === "system"
+            ) {
+              return ufwUnitResult;
+            }
+            if (request.kind === "sockets") {
+              return okResult(
+                ss(
+                  "tcp   LISTEN 0      128    0.0.0.0:8188    0.0.0.0:*",
+                  "tcp   LISTEN 0      128    0.0.0.0:7000    0.0.0.0:*",
+                ),
+              );
+            }
+            return DEFAULT_COMMANDS[request.kind] ?? UNAVAILABLE;
+          },
         },
-      },
-      files: {
-        async read(source) {
-          return enabledFiles[source] ?? null;
+        files: {
+          async read(source) {
+            return enabledFiles[source] ?? null;
+          },
+          async sshDropIns() {
+            return [];
+          },
         },
-        async sshDropIns() {
-          return [];
-        },
-      },
-    });
+      });
 
-    const result = await collector.collect("scan-f18-unprivileged-ufw", settings());
-    const fwCheck = checkById(result, "firewall_ufw");
-    expect(fwCheck.status).toBe("pass");
-    const fwEv = result.snapshot.evidence.find(
-      (ev) => ev.kind === "criterion" && (ev.facts.criterionId ?? ev.facts.criterion) === "firewall_ufw",
-    );
-    expect(fwEv?.facts.active).toBe(true);
+    // (a) ufw_status unavailable + ENABLED=yes + ufw.service ActiveState=active -> active: true
+    {
+      const collector = makeCollector(
+        okResult("ActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=0\n"),
+      );
+      const result = await collector.collect("scan-r2-f05-active", settings());
+      const fwCheck = checkById(result, "firewall_ufw");
+      expect(fwCheck.status).toBe("pass");
+      const fwEv = result.snapshot.evidence.find(
+        (ev) =>
+          ev.kind === "criterion" &&
+          (ev.facts.criterionId ?? ev.facts.criterion) === "firewall_ufw",
+      );
+      expect(fwEv?.facts.active).toBe(true);
+      expect(entryByPort(result, 8188).reachability).toBe("exposed_lan");
+      expect(entryByPort(result, 7000).reachability).toBe("blocked_by_ufw");
+    }
 
-    expect(entryByPort(result, 8188).reachability).toBe("exposed_lan");
-    expect(entryByPort(result, 7000).reachability).toBe("blocked_by_ufw");
+    // (b) ufw_status unavailable + ENABLED=yes + ufw.service ActiveState=inactive -> active: false
+    {
+      const collector = makeCollector(
+        okResult("ActiveState=inactive\nSubState=dead\nResult=success\nExecMainStatus=0\n"),
+      );
+      const result = await collector.collect("scan-r2-f05-inactive", settings());
+      const fwCheck = checkById(result, "firewall_ufw");
+      expect(fwCheck.status).toBe("fail");
+      const fwEv = result.snapshot.evidence.find(
+        (ev) =>
+          ev.kind === "criterion" &&
+          (ev.facts.criterionId ?? ev.facts.criterion) === "firewall_ufw",
+      );
+      expect(fwEv?.facts.active).toBe(false);
+      expect(entryByPort(result, 7000).reachability).toBe("exposed_lan");
+      expect(entryByPort(result, 7000).reachability).not.toBe("blocked_by_ufw");
+    }
+
+    // (c) ufw_status unavailable + ENABLED=yes + ufw.service unavailable -> active: null, unknown reachability
+    {
+      const collector = makeCollector(UNAVAILABLE);
+      const result = await collector.collect("scan-r2-f05-unknown", settings());
+      const fwCheck = checkById(result, "firewall_ufw");
+      expect(fwCheck.status).toBe("unknown");
+      expect(fwCheck.sourceCoverage.ufw_status).toBe("unavailable");
+      const fwEv = result.snapshot.evidence.find(
+        (ev) =>
+          ev.kind === "criterion" &&
+          (ev.facts.criterionId ?? ev.facts.criterion) === "firewall_ufw",
+      );
+      expect(fwEv?.facts.active).toBeNull();
+      expect(entryByPort(result, 7000).reachability).toBe("unknown");
+      expect(entryByPort(result, 7000).reachability).not.toBe("blocked_by_ufw");
+
+      // primeNetworkContext must apply the same live ufw.service check.
+      await collector.primeNetworkContext();
+      const primedEntries = collector.classifySockets(
+        parseListeners(ss("tcp   LISTEN 0      128    0.0.0.0:7000    0.0.0.0:*")),
+        [22, 6969],
+      );
+      expect(primedEntries[0]?.reachability).toBe("unknown");
+    }
   });
 });

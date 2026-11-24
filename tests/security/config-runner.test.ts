@@ -1006,6 +1006,20 @@ test("duplicate trimmed workload IDs are rejected in loadSecurityConfig", () => 
   ]);
 });
 
+test("R2-F06: duplicate workload unit names across distinct workload IDs are rejected in loadSecurityConfig", () => {
+  expect(() =>
+    loadSecurityConfig({
+      env: {},
+      fileConfig: {
+        workloads: [
+          { id: "comfy-a", unit: "comfyui.service" },
+          { id: "comfy-b", unit: "comfyui.service" },
+        ],
+      },
+    }),
+  ).toThrow(/duplicate.*unit/i);
+});
+
 test("non-journal command fails when a descendant holds stdout open past exit", async () => {
   const realSpawn = Bun.spawn.bind(Bun);
   const whichSpy = spyOn(Bun, "which").mockReturnValue("/bin/sh");
